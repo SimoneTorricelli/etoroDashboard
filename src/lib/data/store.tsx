@@ -33,6 +33,7 @@ import type {
   OrderResult,
   PnlSummary,
   Portfolio,
+  PriceAlert,
   Quote,
 } from './types';
 import {
@@ -43,9 +44,24 @@ import {
 } from '../settings';
 import type { AppSettings, Density, DisplayCurrency, LiveSettings } from '../settings';
 import { AgentEngine } from '../agent/engine';
+import { externalCryptoSymbol, fetchBinancePrices, openBinanceTickerStream } from './ExternalPriceProvider';
 
 const MAX_LOGS = 300;
 const SPARK_POINTS = 60;
+const PRICE_ALERTS_KEY = 'torino.price-alerts.v1';
+
+function loadPriceAlerts(): PriceAlert[] {
+  try {
+    const raw = localStorage.getItem(PRICE_ALERTS_KEY);
+    return raw ? (JSON.parse(raw) as PriceAlert[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function savePriceAlerts(alerts: PriceAlert[]) {
+  try { localStorage.setItem(PRICE_ALERTS_KEY, JSON.stringify(alerts)); } catch { /* storage bloccato: ignora */ }
+}
 
 export interface AppDataStore {
   /* impostazioni */
@@ -75,6 +91,7 @@ export interface AppDataStore {
   fxRate: FxRate | null;
   instruments: Instrument[];
   logs: LogEntry[];
+  priceAlerts: PriceAlert[];
 
   /* agent */
   agent: AgentEngine;
@@ -87,6 +104,9 @@ export interface AppDataStore {
   refresh(): Promise<void>;
   getCandles(instrumentId: number, interval: CandleInterval, count: number): Promise<Candle[]>;
   searchInstruments(query: string): Promise<Instrument[]>;
+  addPriceAlert(alert: Omit<PriceAlert, 'id' | 'createdAt' | 'triggeredAt'>): void;
+  removePriceAlert(id: string): void;
+  resetPriceAlert(id: string): void;
   /** Ultimi prezzi osservati per sparkline (max 60 punti). */
   sparkFor(instrumentId: number): number[];
 }
@@ -103,10 +123,14 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
   const [fxRate, setFxRate] = useState<FxRate | null>(null);
   const [instruments, setInstruments] = useState<Instrument[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [priceAlerts, setPriceAlerts] = useState<PriceAlert[]>(loadPriceAlerts);
   const [agentVersion, setAgentVersion] = useState(0);
 
   const providerRef = useRef<DataProvider | null>(null);
   const sparksRef = useRef<Map<number, number[]>>(new Map());
+  const priceAlertsRef = useRef(priceAlerts);
+  priceAlertsRef.current = priceAlerts;
+  const previousQuotesRef = useRef<Record<number, number>>({});
 
   const pushLog = useCallback((entry: LogEntry) => {
     setLogs((prev) => [entry, ...prev].slice(0, MAX_LOGS));
@@ -148,58 +172,154 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
 
     const offQuotes = provider.on('quotes', (qs) => {
       if (cancelled) return;
+      const fired: Array<{ alert: PriceAlert; quote: Quote }> = [];
+      const currentAlerts = priceAlertsRef.current;
+      for (const q of qs) {
+        const previous = previousQuotesRef.current[q.instrumentId];
+        if (previous == null) continue;
+        for (const alert of currentAlerts) {
+          if (alert.instrumentId !== q.instrumentId || alert.triggeredAt) continue;
+          const crossed = alert.direction === 'above'
+            ? previous < alert.threshold && q.last >= alert.threshold
+            : previous > alert.threshold && q.last <= alert.threshold;
+          if (crossed) fired.push({ alert, quote: q });
+        }
+      }
+      if (fired.length > 0) {
+        const firedIds = new Set(fired.map(({ alert }) => alert.id));
+        const now = Date.now();
+        const nextAlerts = currentAlerts.map((alert) =>
+          firedIds.has(alert.id) ? { ...alert, triggeredAt: now } : alert,
+        );
+        priceAlertsRef.current = nextAlerts;
+        setPriceAlerts(nextAlerts);
+        savePriceAlerts(nextAlerts);
+        for (const { alert, quote } of fired) {
+          const instrument = provider.listInstruments().find((i) => i.instrumentId === alert.instrumentId);
+          const symbol = instrument?.symbol ?? alert.symbol;
+          const direction = alert.direction === 'above' ? 'ha superato' : 'è sceso sotto';
+          pushLog({
+            id: `alert-${alert.id}-${now}`,
+            timestamp: now,
+            level: 'warn',
+            message: `Avviso prezzo: ${symbol} ${direction} ${alert.threshold} (ora ${quote.last}).`,
+          });
+          if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+            try { new Notification(`Torino — ${symbol}`, { body: `Prezzo ${direction} ${alert.threshold}: ${quote.last}` }); } catch { /* ignora */ }
+          }
+        }
+      }
       setQuotes((prevQuotes) => {
         const next = { ...prevQuotes };
         for (const q of qs) next[q.instrumentId] = q;
         return next;
       });
       for (const q of qs) {
+        previousQuotesRef.current[q.instrumentId] = q.last;
         let arr = sparksRef.current.get(q.instrumentId);
         if (!arr) { arr = []; sparksRef.current.set(q.instrumentId, arr); }
         arr.push(q.last);
         if (arr.length > SPARK_POINTS) arr.shift();
       }
       agent.handleQuotes(qs);
-      if (provider.mode === 'demo') setFxRate(provider.getFxRate());
+      setFxRate(provider.getFxRate());
     });
-    const offPortfolio = provider.on('portfolio', (p) => { if (!cancelled) setPortfolio(p); });
-    const offStatus = provider.on('status', (s) => { if (!cancelled) setStatus(s); });
+    const offPortfolio = provider.on('portfolio', (p) => {
+      if (cancelled) return;
+      setPortfolio(p);
+      // Il provider può aver appena risolto i metadati degli instrumentID live.
+      setInstruments(provider.listInstruments());
+    });
+    const offPnl = provider.on('pnl', (p) => {
+      if (!cancelled) setPnl(p);
+    });
+    const useLiveProvider = settings.mode === 'live' && Boolean(settings.live.apiKey && settings.live.userKey);
+    const offStatus = provider.on('status', (s) => {
+      if (cancelled) return;
+      setStatus(s);
+      if (useLiveProvider && (s === 'connected' || s === 'error')) setLoading(false);
+    });
     const offLog = provider.on('log', (l) => { if (!cancelled) pushLog(l); });
 
     setLoading(true);
     setInstruments(provider.listInstruments());
     provider.start();
-    void (async () => {
-      try {
-        const [pf, pnlData] = await Promise.all([provider.getPortfolio(), provider.getPnl()]);
-        if (cancelled) return;
-        setPortfolio(pf);
-        setPnl(pnlData);
-        setFxRate(provider.getFxRate());
-        const initialQuotes = await provider.getQuotes(provider.listInstruments().map((i) => i.instrumentId));
-        if (cancelled) return;
-        setQuotes(Object.fromEntries(initialQuotes.map((q) => [q.instrumentId, q])));
-        for (const q of initialQuotes) {
-          let arr = sparksRef.current.get(q.instrumentId);
-          if (!arr) { arr = []; sparksRef.current.set(q.instrumentId, arr); }
-          arr.push(q.last);
+    if (!useLiveProvider) {
+      void (async () => {
+        try {
+          const [pf, pnlData] = await Promise.all([provider.getPortfolio(), provider.getPnl()]);
+          if (cancelled) return;
+          setPortfolio(pf);
+          setPnl(pnlData);
+          setInstruments(provider.listInstruments());
+          // Non sovrascrivere un cambio live già arrivato dal bootstrap con il fallback iniziale.
+          setFxRate((previous) => previous ?? provider.getFxRate());
+          const initialQuotes = await provider.getQuotes(provider.listInstruments().map((i) => i.instrumentId));
+          if (cancelled) return;
+          setQuotes(Object.fromEntries(initialQuotes.map((q) => [q.instrumentId, q])));
+          for (const q of initialQuotes) {
+            let arr = sparksRef.current.get(q.instrumentId);
+            if (!arr) { arr = []; sparksRef.current.set(q.instrumentId, arr); }
+            arr.push(q.last);
+          }
+        } catch {
+          /* lo stato di errore arriva via evento 'status' */
+        } finally {
+          if (!cancelled) setLoading(false);
         }
-      } catch {
-        /* lo stato di errore arriva via evento 'status' */
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    })();
+      })();
+    }
 
     return () => {
       cancelled = true;
-      offQuotes(); offPortfolio(); offStatus(); offLog();
+      offQuotes(); offPortfolio(); offPnl(); offStatus(); offLog();
       provider.stop();
       providerRef.current = null;
+      previousQuotesRef.current = {};
     };
     // Re-istanzia solo quando cambia la configurazione rilevante
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [settings.mode, settings.live.apiKey, settings.live.userKey, settings.live.proxyUrl, settings.live.environment]);
+
+  /* Avvisi esterni opzionali: stream Binance per le crypto, separato dai dati
+   * eToro. Il prezzo esterno non aggiorna portafoglio, P&L o ordini. */
+  useEffect(() => {
+    const externalAlerts = priceAlerts.filter((alert) => alert.source === 'binance' && !alert.triggeredAt && externalCryptoSymbol(alert.symbol));
+    if (externalAlerts.length === 0) return undefined;
+    let cancelled = false;
+    const symbols = [...new Set(externalAlerts.map((alert) => alert.symbol.toUpperCase()))];
+    const evaluate = (symbol: string, price: number) => {
+      if (cancelled || !Number.isFinite(price) || price <= 0) return;
+      const current = priceAlertsRef.current;
+      const fired = current.filter((alert) => alert.source === 'binance' && !alert.triggeredAt && alert.symbol.toUpperCase() === symbol && (
+        alert.direction === 'above' ? price >= alert.threshold : price <= alert.threshold
+      ));
+      if (fired.length === 0) return;
+      const now = Date.now();
+      const ids = new Set(fired.map((alert) => alert.id));
+      const next = current.map((alert) => ids.has(alert.id) ? { ...alert, triggeredAt: now } : alert);
+      priceAlertsRef.current = next;
+      setPriceAlerts(next);
+      savePriceAlerts(next);
+      for (const alert of fired) {
+        const direction = alert.direction === 'above' ? 'ha superato' : 'è sceso sotto';
+        pushLog({ id: `external-alert-${alert.id}-${now}`, timestamp: now, level: 'warn', message: `Avviso esterno Binance: ${symbol} ${direction} ${alert.threshold} (ora ${price}).` });
+        if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+          try { new Notification(`Torino — ${symbol} (Binance)`, { body: `Prezzo ${direction} ${alert.threshold}: ${price}` }); } catch { /* ignora */ }
+        }
+      }
+    };
+    const stopStream = openBinanceTickerStream(symbols, evaluate);
+    const poll = async () => {
+      try {
+        const prices = await fetchBinancePrices(symbols);
+        for (const [symbol, price] of Object.entries(prices)) evaluate(symbol, price);
+      } catch { /* lo stream resta best effort */ }
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 15_000);
+    return () => { cancelled = true; stopStream(); window.clearInterval(timer); };
+  }, [priceAlerts, pushLog]);
 
   /* ── Azioni ──────────────────────────────────────────────────────── */
   const updateSettings = useCallback((patch: Partial<AppSettings>) => {
@@ -286,6 +406,33 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     [],
   );
 
+  const addPriceAlert = useCallback((alert: Omit<PriceAlert, 'id' | 'createdAt' | 'triggeredAt'>) => {
+    const next: PriceAlert[] = [
+      { ...alert, id: `alert-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, createdAt: Date.now() },
+      ...priceAlertsRef.current,
+    ];
+    priceAlertsRef.current = next;
+    setPriceAlerts(next);
+    savePriceAlerts(next);
+    if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
+      void Notification.requestPermission();
+    }
+  }, []);
+
+  const removePriceAlert = useCallback((id: string) => {
+    const next = priceAlertsRef.current.filter((alert) => alert.id !== id);
+    priceAlertsRef.current = next;
+    setPriceAlerts(next);
+    savePriceAlerts(next);
+  }, []);
+
+  const resetPriceAlert = useCallback((id: string) => {
+    const next = priceAlertsRef.current.map((alert) => alert.id === id ? { ...alert, triggeredAt: undefined } : alert);
+    priceAlertsRef.current = next;
+    setPriceAlerts(next);
+    savePriceAlerts(next);
+  }, []);
+
   const sparkFor = useCallback((instrumentId: number): number[] => {
     return sparksRef.current.get(instrumentId) ?? [];
   }, []);
@@ -313,6 +460,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     fxRate,
     instruments,
     logs,
+    priceAlerts,
     agent,
     agentVersion,
     placeOrder,
@@ -320,12 +468,15 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     refresh,
     getCandles,
     searchInstruments,
+    addPriceAlert,
+    removePriceAlert,
+    resetPriceAlert,
     sparkFor,
   }), [
     settings, updateSettings, updateLiveSettings, setMode, setDisplayCurrency, setDensity,
     fromUsd, realExecutionActive, status, loading, quotes, portfolio, pnl, fxRate,
-    instruments, logs, agent, agentVersion, placeOrder, closePosition, refresh,
-    getCandles, searchInstruments, sparkFor,
+    instruments, logs, priceAlerts, agent, agentVersion, placeOrder, closePosition, refresh,
+    getCandles, searchInstruments, addPriceAlert, removePriceAlert, resetPriceAlert, sparkFor,
   ]);
 
   return <AppDataContext.Provider value={value}>{children}</AppDataContext.Provider>;

@@ -62,8 +62,8 @@ export function ConnectionSection() {
     setTesting(true);
     setTestResult(null);
     const base = live.proxyUrl.replace(/\/+$/, '');
-    const envPrefix = live.environment === 'demo' ? 'demo/' : '';
-    const url = `${base}/api/v1/trading/info/${envPrefix}portfolio`;
+    const envPrefix = live.environment === 'demo' ? 'demo/' : 'real/';
+    const url = `${base}/api/v1/trading/info/${envPrefix}pnl`;
     const started = performance.now();
     try {
       const res = await fetch(url, {
@@ -79,7 +79,11 @@ export function ConnectionSection() {
         setTestResult({ ok: false, message: hintForStatus(res.status) });
       } else {
         const data = (await res.json()) as Record<string, unknown>;
-        const positions = (data['Positions'] ?? data['positions'] ?? []) as unknown[];
+        const nested = data['clientPortfolio'] ?? data['ClientPortfolio'] ?? data['portfolio'] ?? data['Portfolio'];
+        const account = nested && typeof nested === 'object' && !Array.isArray(nested)
+          ? nested as Record<string, unknown>
+          : data;
+        const positions = (account['Positions'] ?? account['positions'] ?? []) as unknown[];
         setTestResult({ ok: true, positions: positions.length, ms });
       }
     } catch {

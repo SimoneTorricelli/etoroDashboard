@@ -66,6 +66,8 @@ export interface Position {
   takeProfitRate?: number;
   /** Arricchiti dallo store con le quote live: */
   currentPrice?: number;
+  /** Valore corrente restituito dall'endpoint P&L (USD). */
+  currentValue?: number;
   /** P&L in USD. */
   pnl?: number;
   /** P&L % sull'investito. */
@@ -74,15 +76,38 @@ export interface Position {
 
 export interface Portfolio {
   positions: Position[];
+  /** Dettaglio dei copy portfolio / copy agent attivi. */
+  copyPortfolios?: CopyPortfolio[];
   /** Cash disponibile (USD). */
   cash: number;
   /** Totale investito nelle posizioni aperte (USD). */
   totalInvested: number;
   /** Valore corrente delle sole posizioni (USD). */
   positionsValue: number;
+  /** Valore corrente dei copy portfolio (USD). */
+  mirrorValue?: number;
+  /** Capitale investito nei copy portfolio (USD). */
+  mirrorInvested?: number;
   /** cash + positionsValue (USD). */
   totalValue: number;
   currency: 'USD';
+}
+
+export interface CopyPortfolio {
+  copyId: string;
+  name: string;
+  parentCID?: number;
+  parentUsername?: string;
+  isAgent?: boolean;
+  status?: string;
+  /** Capitale allocato al copy portfolio (USD). */
+  invested: number;
+  /** Valore corrente del copy portfolio (USD). */
+  value: number;
+  /** P&L corrente del copy portfolio (USD). */
+  pnl: number;
+  pnlPct: number;
+  positions: Position[];
 }
 
 export interface EquityPoint {
@@ -206,6 +231,8 @@ export interface PriceAlert {
   id: string;
   instrumentId: number;
   symbol: string;
+  /** eToro usa il prezzo del conto; Binance è un riferimento crypto esterno. */
+  source?: 'etoro' | 'binance';
   direction: 'above' | 'below';
   threshold: number;
   createdAt: number;

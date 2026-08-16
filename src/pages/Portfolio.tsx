@@ -8,7 +8,7 @@
  * ROW 5: Analisi & Suggerimenti + checklist | Heatmap P&L mensile
  */
 import { useEffect, useMemo, useState } from 'react';
-import { Link, useNavigate } from 'react-router';
+import { Link, useNavigate, useSearchParams } from 'react-router';
 import { motion } from 'framer-motion';
 import { Download, X } from 'lucide-react';
 import { Toaster, toast } from 'sonner';
@@ -35,6 +35,8 @@ import { PositionsTable } from '@/components/portfolio/PositionsTable';
 import { PositionDrawer } from '@/components/portfolio/PositionDrawer';
 import { SuggestionsCard } from '@/components/portfolio/SuggestionsCard';
 import { PnlHeatmap } from '@/components/portfolio/PnlHeatmap';
+import { CopyPortfolioDrawer, CopyPortfolioTable } from '@/components/portfolio/CopyPortfolioTable';
+import type { CopyPortfolio } from '@/lib/data/types';
 
 const PERIODS = [
   { key: '1M', days: 30 },
@@ -48,7 +50,7 @@ type PeriodKey = (typeof PERIODS)[number]['key'];
 
 const CLASS_COLORS: Record<string, string> = {
   stock: '#4C9AFF', etf: '#9B8CFF', crypto: '#F5A623', cash: '#5C6B7A',
-  fx: '#4CC9F0', index: '#A3E635', cfd: '#E879F9',
+  fx: '#4CC9F0', index: '#A3E635', cfd: '#E879F9', mirror: '#00C390',
 };
 const CURRENCY_COLORS = ['#4C9AFF', '#9B8CFF', '#4CC9F0', '#F5A623', '#A3E635', '#5C6B7A'];
 
@@ -60,6 +62,7 @@ const stagger = (i: number) => ({
 
 export default function Portfolio() {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const {
     portfolio, pnl, fxRate, loading, status, mode, setMode,
     displayCurrency, setDisplayCurrency, fromUsd,
@@ -70,12 +73,20 @@ export default function Portfolio() {
   const [period, setPeriod] = useState<PeriodKey>('1M');
   const [classFilter, setClassFilter] = useState<string | null>(null);
   const [drawerRow, setDrawerRow] = useState<PositionRow | null>(null);
+  const [copyDrawer, setCopyDrawer] = useState<CopyPortfolio | null>(null);
   const [now, setNow] = useState(() => Date.now());
+  const instrumentFilterId = Number(searchParams.get('instrument') ?? 0);
+  const copyFilterId = searchParams.get('copyId');
 
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 5000);
     return () => clearInterval(t);
   }, []);
+
+  useEffect(() => {
+    if (!copyFilterId || !portfolio?.copyPortfolios) return;
+    setCopyDrawer(portfolio.copyPortfolios.find((copy) => copy.copyId === copyFilterId) ?? null);
+  }, [copyFilterId, portfolio]);
 
   const fmt = (usd: number) => formatCurrency(fromUsd(usd), cur);
   const fmtSigned = (usd: number) => formatSignedCurrency(fromUsd(usd), cur);
@@ -85,9 +96,14 @@ export default function Portfolio() {
   /* ── Dati derivati ─────────────────────────────────────────────── */
   const rows = useMemo(() => (portfolio ? enrichPositions(portfolio) : []), [portfolio]);
 
+  const copyValue = useMemo(
+    () => portfolio?.copyPortfolios?.reduce((sum, copy) => sum + copy.value, 0) ?? portfolio?.mirrorValue ?? 0,
+    [portfolio],
+  );
+
   const score = useMemo(
-    () => computeDiversification(rows, portfolio?.cash ?? 0, portfolio?.totalValue ?? 0),
-    [rows, portfolio],
+    () => computeDiversification(rows, portfolio?.cash ?? 0, portfolio?.totalValue ?? 0, copyValue),
+    [rows, portfolio, copyValue],
   );
 
   const classSlices = useMemo(() => {
@@ -97,11 +113,16 @@ export default function Portfolio() {
       (r) => r.assetClass,
       (k) => CLASS_LABELS[k as keyof typeof CLASS_LABELS] ?? k,
       portfolio.totalValue,
-      portfolio.cash > 0
-        ? [{ key: 'cash', label: 'Cash', value: portfolio.cash, weight: portfolio.cash / portfolio.totalValue }]
-        : [],
+      [
+        ...(portfolio.cash > 0
+          ? [{ key: 'cash', label: 'Cash', value: portfolio.cash, weight: portfolio.cash / portfolio.totalValue }]
+          : []),
+        ...(copyValue
+          ? [{ key: 'mirror', label: 'Copy trading', value: copyValue, weight: copyValue / portfolio.totalValue }]
+          : []),
+      ],
     );
-  }, [rows, portfolio]);
+  }, [rows, portfolio, copyValue]);
 
   const currencySlices = useMemo(() => {
     if (!portfolio) return [];
@@ -110,20 +131,33 @@ export default function Portfolio() {
       (r) => r.currency,
       (k) => k,
       portfolio.totalValue,
-      portfolio.cash > 0
-        ? [{ key: 'USD', label: 'USD (cash)', value: portfolio.cash, weight: portfolio.cash / portfolio.totalValue }]
-        : [],
+      [
+        ...(portfolio.cash > 0
+          ? [{ key: 'USD', label: 'USD (cash)', value: portfolio.cash, weight: portfolio.cash / portfolio.totalValue }]
+          : []),
+        ...(copyValue
+          ? [{ key: 'USD', label: 'USD (copy trading)', value: copyValue, weight: copyValue / portfolio.totalValue }]
+          : []),
+      ],
     );
-  }, [rows, portfolio]);
+  }, [rows, portfolio, copyValue]);
 
   const sectorSlices = useMemo(() => {
     if (!portfolio) return [];
-    return allocate(rows, (r) => r.sector, (k) => k, portfolio.totalValue);
-  }, [rows, portfolio]);
+    return allocate(
+      rows,
+      (r) => r.sector,
+      (k) => k,
+      portfolio.totalValue,
+      copyValue
+        ? [{ key: 'Copy trading', label: 'Copy trading', value: copyValue, weight: copyValue / portfolio.totalValue }]
+        : [],
+    );
+  }, [rows, portfolio, copyValue]);
 
   const usdExposure = useMemo(
-    () => (portfolio?.cash ?? 0) + rows.filter((r) => r.currency === 'USD').reduce((s, r) => s + r.value, 0),
-    [rows, portfolio],
+    () => (portfolio?.cash ?? 0) + copyValue + rows.filter((r) => r.currency === 'USD').reduce((s, r) => s + r.value, 0),
+    [rows, portfolio, copyValue],
   );
   const usdExposurePct = portfolio && portfolio.totalValue > 0 ? usdExposure / portfolio.totalValue : 0;
 
@@ -172,8 +206,8 @@ export default function Portfolio() {
   }, [agent, agentVersion]);
 
   const filteredRows = useMemo(
-    () => (classFilter ? rows.filter((r) => r.assetClass === classFilter) : rows),
-    [rows, classFilter],
+    () => rows.filter((r) => (!classFilter || r.assetClass === classFilter) && (!instrumentFilterId || r.instrumentId === instrumentFilterId)),
+    [rows, classFilter, instrumentFilterId],
   );
 
   const sparkWindow = (arr: Array<{ value: number }> | undefined) => {
@@ -183,7 +217,7 @@ export default function Portfolio() {
     return sliced.map((p) => p.value);
   };
 
-  const unrealizedPnl = rows.reduce((s, r) => s + r.pnlUsd, 0);
+  const unrealizedPnl = pnl?.totalPnl ?? rows.reduce((s, r) => s + r.pnlUsd, 0);
   const unrealizedPct = portfolio && portfolio.totalInvested > 0
     ? (unrealizedPnl / portfolio.totalInvested) * 100
     : 0;
@@ -454,6 +488,12 @@ export default function Portfolio() {
 
       {/* ── ROW 4: Tabella posizioni ────────────────────────────── */}
       <motion.div {...stagger(6)} className="card-surface density-pad col-span-12 p-5">
+        {instrumentFilterId > 0 && (
+          <div className="mb-3 flex items-center justify-between rounded-lg border border-info/30 bg-info/5 px-3 py-2">
+            <span className="text-caption text-info">Dettaglio acquisti di {rows.find((row) => row.instrumentId === instrumentFilterId)?.symbol ?? `strumento #${instrumentFilterId}`} · {filteredRows.length} posizioni aperte</span>
+            <button type="button" onClick={() => navigate('/portfolio')} className="rounded-md px-2 py-1 text-micro text-text-1 hover:bg-bg-2">Mostra tutto</button>
+          </div>
+        )}
         <PositionsTable
           rows={filteredRows}
           fmtMoney={fmt}
@@ -464,6 +504,13 @@ export default function Portfolio() {
           onClose={handleClosePosition}
         />
       </motion.div>
+
+      {portfolio?.copyPortfolios && portfolio.copyPortfolios.length > 0 && (
+        <motion.div {...stagger(7)} className="card-surface density-pad col-span-12 p-5">
+          <div className="mb-3 flex items-center justify-between"><div><h2 className="text-title text-text-0">Copy trading e Copy Agent</h2><p className="text-caption text-text-2">Ogni riga apre il dettaglio delle posizioni acquistate dal copy.</p></div><span className="text-micro text-text-2">{portfolio.copyPortfolios.length} attivi</span></div>
+          <CopyPortfolioTable portfolios={portfolio.copyPortfolios} fmtMoney={fmt} fmtSignedMoney={fmtSigned} onSelect={setCopyDrawer} />
+        </motion.div>
+      )}
 
       {/* ── ROW 5: Suggerimenti + Storico ───────────────────────── */}
       <div className="grid grid-cols-12 gap-4">
@@ -484,6 +531,7 @@ export default function Portfolio() {
         sparkFor={sparkFor}
         onClosePosition={handleClosePosition}
       />
+      <CopyPortfolioDrawer portfolio={copyDrawer} onClose={() => setCopyDrawer(null)} fmtMoney={fmt} fmtSignedMoney={fmtSigned} />
     </div>
   );
 }

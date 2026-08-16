@@ -18,11 +18,12 @@ import type {
   Quote,
 } from './types';
 
-export type ProviderEvent = 'quotes' | 'portfolio' | 'status' | 'log';
+export type ProviderEvent = 'quotes' | 'portfolio' | 'pnl' | 'status' | 'log';
 
 export interface ProviderEventMap {
   quotes: Quote[];
   portfolio: Portfolio;
+  pnl: PnlSummary;
   status: ConnectionStatus;
   log: LogEntry;
 }

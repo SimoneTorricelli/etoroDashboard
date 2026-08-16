@@ -30,7 +30,9 @@ import { EmptyState } from '@/components/shared/EmptyState';
 import { StatusDot } from '@/components/shared/StatusDot';
 import { Skeleton } from '@/components/shared/Skeleton';
 import { TickValue } from '@/components/shared/TickValue';
-import type { Position } from '@/lib/data/types';
+import { CopyPortfolioTable } from '@/components/portfolio/CopyPortfolioTable';
+import type { Position, PriceAlert } from '@/lib/data/types';
+import { externalCryptoSymbol } from '@/lib/data/ExternalPriceProvider';
 
 const WATCHLIST_IDS = [1001, 1003, 1301, 1201, 1401, 1007];
 const TIMEFRAMES = [
@@ -209,6 +211,17 @@ export default function Overview() {
           </button>
         </div>
         <PositionsTable />
+        {portfolio?.copyPortfolios && portfolio.copyPortfolios.length > 0 && (
+          <div className="mt-5 border-t border-hairline pt-4">
+            <div className="mb-2 flex items-center justify-between"><h3 className="text-body-strong text-text-0">Copy trading e Copy Agent</h3><span className="text-micro text-text-2">{portfolio.copyPortfolios.length} attivi</span></div>
+            <CopyPortfolioTable
+              portfolios={portfolio.copyPortfolios}
+              fmtMoney={(usd) => formatCurrency(fromUsd(usd), displayCurrency)}
+              fmtSignedMoney={(usd) => formatSignedCurrency(fromUsd(usd), displayCurrency)}
+              onSelect={(copy) => navigate(`/portfolio?copyId=${encodeURIComponent(copy.copyId)}`)}
+            />
+          </div>
+        )}
       </motion.div>
 
       <AlertsCard />
@@ -671,11 +684,45 @@ const ASSET_BADGE: Record<string, string> = {
   stock: 'Azione', etf: 'ETF', crypto: 'Crypto', fx: 'FX', index: 'Indice', cfd: 'CFD',
 };
 
+interface OverviewPosition extends Position {
+  purchaseCount: number;
+}
+
 function PositionsTable() {
   const navigate = useNavigate();
   const { portfolio, fromUsd, displayCurrency, sparkFor } = useAppData();
 
-  const columns: DataTableColumn<Position>[] = useMemo(() => [
+  const groupedRows = useMemo<OverviewPosition[]>(() => {
+    if (!portfolio) return [];
+    const map = new Map<number, OverviewPosition>();
+    for (const position of portfolio.positions) {
+      const value = position.currentValue ?? position.invested + (position.pnl ?? 0);
+      const current = map.get(position.instrumentId);
+      if (!current) {
+        map.set(position.instrumentId, {
+          ...position,
+          positionId: -position.instrumentId,
+          currentValue: value,
+          pnl: position.pnl ?? 0,
+          purchaseCount: 1,
+        });
+        continue;
+      }
+      const previousUnits = current.units;
+      const units = previousUnits + position.units;
+      const invested = current.invested + position.invested;
+      current.units = units;
+      current.invested = invested;
+      current.currentValue = (current.currentValue ?? 0) + value;
+      current.pnl = (current.pnl ?? 0) + (position.pnl ?? 0);
+      current.pnlPct = invested > 0 ? ((current.pnl ?? 0) / invested) * 100 : 0;
+      current.openPrice = units > 0 ? (current.openPrice * previousUnits + position.openPrice * position.units) / units : current.openPrice;
+      current.purchaseCount += 1;
+    }
+    return [...map.values()];
+  }, [portfolio]);
+
+  const columns: DataTableColumn<OverviewPosition>[] = useMemo(() => [
     {
       key: 'instrument', header: 'Strumento', sticky: true,
       sortValue: (p) => p.symbol,
@@ -684,7 +731,7 @@ function PositionsTable() {
           <InstrumentAvatar symbol={p.symbol} size={28} />
           <div>
             <div className="font-mono text-ticker text-text-0">{p.symbol}</div>
-            <div className="max-w-32 truncate text-micro text-text-2">{p.name}</div>
+            <div className="max-w-32 truncate text-micro text-text-2">{p.name} · {p.purchaseCount} acquisti</div>
           </div>
         </div>
       ),
@@ -718,6 +765,11 @@ function PositionsTable() {
       ),
     },
     {
+      key: 'value', header: 'Valore', align: 'right',
+      sortValue: (p) => p.currentValue ?? 0,
+      cell: (p) => <span className="font-medium text-text-0">{formatCurrency(fromUsd(p.currentValue ?? 0), displayCurrency)}</span>,
+    },
+    {
       key: 'pnl', header: 'P&L', align: 'right',
       sortValue: (p) => p.pnl ?? 0,
       cell: (p) => (
@@ -743,10 +795,10 @@ function PositionsTable() {
     <DataTable
       className="mt-3"
       columns={columns}
-      rows={portfolio.positions}
+      rows={groupedRows}
       rowKey={(p) => p.positionId}
       defaultSortKey="pnl"
-      onRowClick={() => navigate('/portfolio')}
+      onRowClick={(p) => navigate(`/portfolio?instrument=${p.instrumentId}`)}
       emptyMessage="Nessuna posizione aperta."
     />
   );
@@ -758,28 +810,37 @@ interface AlertItem {
   timestamp: number;
   text: string;
   kind: 'price' | 'agent' | 'system';
+  priceAlert?: PriceAlert;
 }
 
-/** Timestamp di riferimento calcolato una sola volta al caricamento del modulo. */
-const MODULE_LOAD_TS = Date.now();
-
 function AlertsCard() {
-  const { logs, instruments } = useAppData();
-  const [alerts, setAlerts] = useState<AlertItem[]>([
-    { id: 'a1', timestamp: MODULE_LOAD_TS - 3600_000, text: 'BTC sopra $ 95.000 — avviso prezzo attivato', kind: 'price' },
-    { id: 'a2', timestamp: MODULE_LOAD_TS - 7200_000, text: 'Regola "Compra i cali" in cooldown fino alle 18:00', kind: 'agent' },
-  ]);
+  const { logs, instruments, priceAlerts, addPriceAlert, removePriceAlert, resetPriceAlert } = useAppData();
   const [dialogOpen, setDialogOpen] = useState(false);
-  const [newSymbol, setNewSymbol] = useState('AAPL');
+  const [newInstrumentId, setNewInstrumentId] = useState(1001);
   const [newThreshold, setNewThreshold] = useState('');
+  const [newDirection, setNewDirection] = useState<'above' | 'below'>('above');
+  const [newSource, setNewSource] = useState<'etoro' | 'binance'>('etoro');
+  const selectedInstrument = instruments.find((instrument) => instrument.instrumentId === newInstrumentId);
 
   const items = useMemo<AlertItem[]>(() => {
+    const fromPriceAlerts: AlertItem[] = priceAlerts.map((alert) => {
+      const instrument = instruments.find((item) => item.instrumentId === alert.instrumentId);
+      const symbol = instrument?.symbol ?? alert.symbol;
+      const direction = alert.direction === 'above' ? 'sopra' : 'sotto';
+      return {
+        id: alert.id,
+        timestamp: alert.triggeredAt ?? alert.createdAt,
+        text: `${alert.triggeredAt ? 'Avviso scattato' : 'Avviso attivo'}: ${symbol} ${direction} ${formatPrice(alert.threshold)}${alert.source === 'binance' ? ' · Binance' : ''}`,
+        kind: 'price',
+        priceAlert: alert,
+      };
+    });
     const fromLogs: AlertItem[] = logs
-      .filter((l) => l.level === 'agent' || l.level === 'warn' || l.level === 'error')
+      .filter((l) => l.level === 'agent' || l.level === 'error' || (l.level === 'warn' && !l.message.startsWith('Avviso prezzo:')))
       .slice(0, 6)
       .map((l) => ({ id: l.id, timestamp: l.timestamp, text: l.message, kind: l.level === 'agent' ? 'agent' : 'system' }));
-    return [...alerts, ...fromLogs].sort((a, b) => b.timestamp - a.timestamp).slice(0, 8);
-  }, [alerts, logs]);
+    return [...fromPriceAlerts, ...fromLogs].sort((a, b) => b.timestamp - a.timestamp).slice(0, 8);
+  }, [instruments, logs, priceAlerts]);
 
   const KIND_COLOR: Record<AlertItem['kind'], string> = {
     price: 'text-info', agent: 'text-agent', system: 'text-warn',
@@ -809,6 +870,26 @@ function AlertsCard() {
               <div className="text-caption text-text-0">{a.text}</div>
               <div className="font-mono text-micro text-text-2">{formatTime(a.timestamp)}</div>
             </div>
+            {a.priceAlert && (
+              <div className="ml-auto flex shrink-0 items-center gap-1">
+                {a.priceAlert.triggeredAt && (
+                  <button
+                    type="button"
+                    onClick={() => resetPriceAlert(a.priceAlert!.id)}
+                    className="rounded-md px-1.5 py-1 text-micro text-info hover:bg-info/10"
+                  >
+                    Ri-arma
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => removePriceAlert(a.priceAlert!.id)}
+                  className="rounded-md px-1.5 py-1 text-micro text-text-2 hover:bg-bg-2 hover:text-loss"
+                >
+                  Elimina
+                </button>
+              </div>
+            )}
           </motion.div>
         ))}
       </div>
@@ -824,14 +905,26 @@ function AlertsCard() {
               <label className="block">
                 <span className="overline">Strumento</span>
                 <select
-                  value={newSymbol}
-                  onChange={(e) => setNewSymbol(e.target.value)}
+                  value={newInstrumentId}
+                  onChange={(e) => { const id = Number(e.target.value); const nextInstrument = instruments.find((item) => item.instrumentId === id); setNewInstrumentId(id); if (nextInstrument?.assetClass !== 'crypto' || !externalCryptoSymbol(nextInstrument?.symbol ?? '')) setNewSource('etoro'); }}
                   className="mt-1 w-full rounded-lg border border-hairline bg-bg-3 px-3 py-2 text-body text-text-0 outline-none focus:border-hairline-strong"
                 >
-                  {instruments.slice(0, 30).map((i) => (
-                    <option key={i.instrumentId} value={i.symbol}>{i.symbol} — {i.name}</option>
+                  {instruments.map((i) => (
+                    <option key={i.instrumentId} value={i.instrumentId}>{i.symbol} — {i.name}</option>
                   ))}
                 </select>
+              </label>
+              <label className="block">
+                <span className="overline">Fonte prezzo</span>
+                <select
+                  value={newSource}
+                  onChange={(e) => setNewSource(e.target.value as 'etoro' | 'binance')}
+                  className="mt-1 w-full rounded-lg border border-hairline bg-bg-3 px-3 py-2 text-body text-text-0 outline-none focus:border-hairline-strong"
+                >
+                  <option value="etoro">eToro · WebSocket</option>
+                  <option value="binance" disabled={selectedInstrument?.assetClass !== 'crypto' || !externalCryptoSymbol(selectedInstrument?.symbol ?? '')}>Binance · stream esterno crypto</option>
+                </select>
+                {newSource === 'binance' && <span className="mt-1 block text-micro text-warn">Prezzo di mercato esterno: non coincide necessariamente con spread e prezzo di esecuzione eToro.</span>}
               </label>
               <label className="block">
                 <span className="overline">Soglia prezzo</span>
@@ -843,6 +936,24 @@ function AlertsCard() {
                   className="mt-1 w-full rounded-lg border border-hairline bg-bg-3 px-3 py-2 font-mono text-ticker text-text-0 outline-none placeholder:text-text-2 focus:border-hairline-strong"
                 />
               </label>
+              <div>
+                <span className="overline">Direzione</span>
+                <div className="mt-1 grid grid-cols-2 gap-1 rounded-lg border border-hairline bg-bg-3 p-1">
+                  {(['above', 'below'] as const).map((direction) => (
+                    <button
+                      key={direction}
+                      type="button"
+                      onClick={() => setNewDirection(direction)}
+                      className={cn(
+                        'rounded-md py-1.5 text-caption font-medium transition-colors',
+                        newDirection === direction ? 'bg-info/20 text-info' : 'text-text-2 hover:text-text-1',
+                      )}
+                    >
+                      {direction === 'above' ? 'Sopra la soglia' : 'Sotto la soglia'}
+                    </button>
+                  ))}
+                </div>
+              </div>
             </div>
             <div className="mt-5 flex justify-end gap-2">
               <button
@@ -854,12 +965,17 @@ function AlertsCard() {
               <button
                 onClick={() => {
                   if (newThreshold) {
-                    setAlerts((prev) => [{
-                      id: `a-${Date.now()}`,
-                      timestamp: Date.now(),
-                      text: `Avviso creato: ${newSymbol} soglia ${newThreshold}`,
-                      kind: 'price',
-                    }, ...prev]);
+                    const instrument = instruments.find((item) => item.instrumentId === newInstrumentId);
+                    const threshold = Number(newThreshold.replace(',', '.'));
+                    if (instrument && Number.isFinite(threshold) && threshold > 0) {
+                      addPriceAlert({
+                        instrumentId: instrument.instrumentId,
+                        symbol: instrument.symbol,
+                        source: newSource,
+                        direction: newDirection,
+                        threshold,
+                      });
+                    }
                   }
                   setDialogOpen(false);
                   setNewThreshold('');

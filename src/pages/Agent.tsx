@@ -50,6 +50,7 @@ import { RuleBuilder } from '@/components/agent/RuleBuilder';
 import { GroupEditor } from '@/components/agent/GroupEditor';
 import { KillSwitchDialog } from '@/components/agent/KillSwitchDialog';
 import { BacktestCard } from '@/components/agent/BacktestCard';
+import { StrategyPortfolioStudio } from '@/components/agent/StrategyPortfolioStudio';
 import {
   DEFAULT_SLTP, conditionChip, hasAutoAck, loadGroupMeta, loadSlTpMap, saveGroupMeta, setAutoAck,
 } from '@/components/agent/agent-utils';
@@ -374,6 +375,14 @@ export default function Agent() {
         pnl={agentPnl}
         fromUsd={fromUsd}
         cur={cur}
+      />
+
+      {/* ── Portafogli strategici reali ───────────────────────────── */}
+      <StrategyPortfolioStudio
+        fromUsd={fromUsd}
+        toUsd={toUsd}
+        displayCurrency={cur}
+        realExecutionActive={realExecutionActive}
       />
 
       {/* ── ROW 2: Gruppi (span 5) ──────────────────────────────────── */}

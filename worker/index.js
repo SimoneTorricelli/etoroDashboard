@@ -1,4 +1,7 @@
-const ETORO_BASE = 'https://public-api.etoro.com/api/v1';
+const ETORO_BASES = {
+  v1: 'https://public-api.etoro.com/api/v1',
+  v2: 'https://public-api.etoro.com/api/v2',
+};
 const PASS_HEADERS = ['x-api-key', 'x-user-key', 'x-request-id', 'content-type'];
 
 const CORS_HEADERS = {
@@ -26,7 +29,7 @@ export default {
 
     // Wrangler routes /api/* to this handler first. All other requests are
     // served by the dashboard static assets.
-    if (!url.pathname.startsWith('/api/v1/')) {
+    if (!url.pathname.startsWith('/api/v1/') && !url.pathname.startsWith('/api/v2/')) {
       return env.ASSETS.fetch(request);
     }
 
@@ -34,7 +37,8 @@ export default {
       return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
 
-    const path = url.pathname.replace(/^\/api\/v1\//, '');
+    const version = url.pathname.startsWith('/api/v2/') ? 'v2' : 'v1';
+    const path = url.pathname.replace(/^\/api\/v[12]\//, '');
     const headers = new Headers();
     for (const name of PASS_HEADERS) {
       const value = request.headers.get(name);
@@ -42,7 +46,7 @@ export default {
     }
 
     try {
-      const response = await fetch(`${ETORO_BASE}/${path}${url.search}`, {
+      const response = await fetch(`${ETORO_BASES[version]}/${path}${url.search}`, {
         method: request.method,
         headers,
         body: ['GET', 'HEAD'].includes(request.method) ? undefined : request.body,

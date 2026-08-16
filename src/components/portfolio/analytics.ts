@@ -69,7 +69,7 @@ export interface PositionRow extends Position {
 export function enrichPositions(portfolio: Portfolio): PositionRow[] {
   return portfolio.positions.map((p) => {
     const price = p.currentPrice ?? p.openPrice;
-    const value = p.units * price * p.leverage;
+    const value = p.currentValue ?? p.units * price * p.leverage;
     const pnlUsd = p.pnl ?? value - p.invested - p.fees;
     return {
       ...p,
@@ -103,14 +103,22 @@ export function allocate(
   extra?: AllocationSlice[],
 ): AllocationSlice[] {
   const map = new Map<string, number>();
-  for (const r of rows) map.set(keyOf(r), (map.get(keyOf(r)) ?? 0) + r.value);
+  const labels = new Map<string, string>();
+  for (const r of rows) {
+    const key = keyOf(r);
+    map.set(key, (map.get(key) ?? 0) + r.value);
+    labels.set(key, labelOf(key));
+  }
+  for (const item of extra ?? []) {
+    map.set(item.key, (map.get(item.key) ?? 0) + item.value);
+    if (!labels.has(item.key)) labels.set(item.key, item.label);
+  }
   const slices: AllocationSlice[] = [...map.entries()].map(([key, value]) => ({
     key,
-    label: labelOf(key),
+    label: labels.get(key) ?? labelOf(key),
     value,
     weight: total > 0 ? value / total : 0,
   }));
-  if (extra) slices.push(...extra);
   return slices.sort((a, b) => b.value - a.value);
 }
 
@@ -148,19 +156,26 @@ function distributionScore(weights: number[], targetCount: number): number {
   return Math.round(Math.max(0, Math.min(100, raw)));
 }
 
-export function computeDiversification(rows: PositionRow[], cash: number, totalValue: number): DiversificationScore {
-  const invested = rows.reduce((s, r) => s + r.value, 0);
+export function computeDiversification(rows: PositionRow[], cash: number, totalValue: number, copyValue = 0): DiversificationScore {
+  const invested = rows.reduce((s, r) => s + r.value, 0) + copyValue;
   const cashWeight = totalValue > 0 ? cash / totalValue : 0;
+  const copySlice = copyValue > 0 ? [{ key: 'copy', label: 'Copy trading', value: copyValue, weight: copyValue / Math.max(totalValue, 1) }] : [];
 
   const classW = allocate(rows, (r) => r.assetClass, (k) => k, totalValue,
-    cash > 0 ? [{ key: 'cash', label: 'Cash', value: cash, weight: cashWeight }] : [])
+    [
+      ...(cash > 0 ? [{ key: 'cash', label: 'Cash', value: cash, weight: cashWeight }] : []),
+      ...copySlice,
+    ])
     .map((s) => s.weight);
-  const sectorW = allocate(rows, (r) => r.sector, (k) => k, totalValue).map((s) => s.weight);
-  const geoW = allocate(rows, (r) => r.geo, (k) => k, totalValue).map((s) => s.weight);
+  const sectorW = allocate(rows, (r) => r.sector, (k) => k, totalValue, copySlice.map((s) => ({ ...s, key: 'Copy trading' }))).map((s) => s.weight);
+  const geoW = allocate(rows, (r) => r.geo, (k) => k, totalValue, copyValue > 0 ? [{ key: 'copy-geo', label: 'Copy trading', value: copyValue, weight: copyValue / Math.max(totalValue, 1) }] : []).map((s) => s.weight);
   const curW = allocate(rows, (r) => r.currency, (k) => k, totalValue,
-    cash > 0 ? [{ key: 'USD', label: 'USD', value: cash, weight: cashWeight }] : [])
+    [
+      ...(cash > 0 ? [{ key: 'USD', label: 'USD', value: cash, weight: cashWeight }] : []),
+      ...(copyValue > 0 ? [{ key: 'USD-copy', label: 'USD copy', value: copyValue, weight: copyValue / Math.max(totalValue, 1) }] : []),
+    ])
     .map((s) => s.weight);
-  const posW = rows.map((r) => (invested > 0 ? r.value / invested : 0));
+  const posW = [...rows.map((r) => (invested > 0 ? r.value / invested : 0)), ...(copyValue > 0 ? [copyValue / invested] : [])];
 
   const classScore = distributionScore(classW, 4);
   const sectorScore = distributionScore(sectorW, 6);
