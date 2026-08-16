@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="it">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Torino — eToro Command Center</title>
+    <!-- SPA redirect per GitHub Pages: preserva la route nel query string e ricarica index.html -->
+    <script>
+      (function () {
+        var l = window.location;
+        var base = l.pathname.replace(/\/[^/]*$/, '/');
+        var redirect = base + 'index.html?/' +
+          l.pathname.slice(base.length).replace(/&/g, '~and~').replace(/\?/g, '~q~') +
+          (l.search ? '&' + l.search.slice(1).replace(/&/g, '~and~') : '') +
+          l.hash;
+        l.replace(redirect);
+      })();
+    </script>
+  </head>
+  <body></body>
+</html>

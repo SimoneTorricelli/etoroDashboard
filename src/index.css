@@ -1,0 +1,101 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  /* Dark-only theme (design.md): shadcn tokens mapped to the Torino palette */
+  :root {
+    --background: 214 32% 6%;        /* #0A0E13 */
+    --foreground: 208 33% 96%;       /* #F2F5F8 */
+    --card: 215 29% 8%;              /* #0F141B */
+    --card-foreground: 208 33% 96%;
+    --popover: 215 29% 8%;
+    --popover-foreground: 208 33% 96%;
+    --primary: 165 100% 38%;         /* #00C390 */
+    --primary-foreground: 214 32% 6%;
+    --secondary: 214 26% 12%;        /* #151C26 */
+    --secondary-foreground: 208 33% 96%;
+    --muted: 214 26% 12%;
+    --muted-foreground: 212 15% 65%; /* #9AA7B4 */
+    --accent: 214 29% 15%;           /* #1C2530 */
+    --accent-foreground: 208 33% 96%;
+    --destructive: 352 89% 65%;      /* #F4556B */
+    --destructive-foreground: 0 0% 98%;
+    --border: 0 0% 100% / 0.08;      /* hairline #FFFFFF14 */
+    --input: 214 29% 15%;
+    --ring: 165 100% 38%;
+    --radius: 12px;
+    --sidebar-background: 214 32% 6%;
+    --sidebar-foreground: 212 15% 65%;
+    --sidebar-primary: 165 100% 38%;
+    --sidebar-primary-foreground: 214 32% 6%;
+    --sidebar-accent: 214 29% 15%;
+    --sidebar-accent-foreground: 208 33% 96%;
+    --sidebar-border: 0 0% 100% / 0.08;
+    --sidebar-ring: 165 100% 38%;
+  }
+
+  html {
+    color-scheme: dark;
+  }
+
+  body {
+    @apply bg-bg-0 text-text-0 font-sans text-body antialiased;
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1, "cv05" 1;
+  }
+
+  ::selection {
+    background: #00C39033;
+  }
+
+  /* Thin dark scrollbars */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: #1C2530 transparent;
+  }
+  *::-webkit-scrollbar { width: 8px; height: 8px; }
+  *::-webkit-scrollbar-thumb { background: #1C2530; border-radius: 4px; }
+  *::-webkit-scrollbar-track { background: transparent; }
+}
+
+@layer components {
+  /* Card surface per design.md: bg-1, hairline border, 12px radius */
+  .card-surface {
+    @apply rounded-xl border border-hairline bg-bg-1;
+  }
+
+  /* Overline label: uppercase, tracking +0.04em */
+  .overline {
+    @apply text-label font-medium uppercase tracking-[0.04em] text-text-2;
+  }
+
+  /* Live tick flash: 300ms background tint (green on uptick, red on downtick) */
+  .tick-flash-up {
+    animation: tick-up 300ms ease-out;
+  }
+  .tick-flash-down {
+    animation: tick-down 300ms ease-out;
+  }
+
+  /* Density toggle: Compatta shrinks rows/padding */
+  .density-compact .density-row { height: 34px; }
+  .density-compact .density-pad { padding: 14px; }
+  .density-comfy .density-row { height: 44px; }
+  .density-comfy .density-pad { padding: 20px; }
+}
+
+@keyframes tick-up {
+  0% { background-color: #00C39026; }
+  100% { background-color: transparent; }
+}
+@keyframes tick-down {
+  0% { background-color: #F4556B26; }
+  100% { background-color: transparent; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tick-flash-up, .tick-flash-down { animation: none; }
+}

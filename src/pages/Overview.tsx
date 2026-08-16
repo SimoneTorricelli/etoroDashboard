@@ -1,0 +1,877 @@
+/**
+ * Panoramica (/) — command dashboard (design/overview.md).
+ * ROW 0: RiskBanner condizionale
+ * ROW 1: Hero Valore Portafoglio (span 5) + KpiCards P&L Oggi / Totale / Cash
+ * ROW 2: Grafico P&L (span 8, lightweight-charts) + Suggerimenti (span 4)
+ * ROW 3: Watchlist live (span 5) + Agent status (span 4) + Valute (span 3)
+ * ROW 4: Posizioni aperte (span 8) + Avvisi (span 4)
+ */
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { useNavigate } from 'react-router';
+import { motion } from 'framer-motion';
+import { createChart, AreaSeries, LineSeries } from 'lightweight-charts';
+import type { IChartApi, ISeriesApi, UTCTimestamp } from 'lightweight-charts';
+import {
+  ArrowRight, Bell, Bot, CircleAlert, Lightbulb, Pencil, Plus, TrendingUp,
+} from 'lucide-react';
+import { cn } from '@/lib/utils';
+import { useAppData } from '@/lib/data/store';
+import {
+  formatCurrency, formatFxRate, formatPercent, formatPrice, formatSignedCurrency, formatTime, formatUnits,
+} from '@/lib/format';
+import { KpiCard } from '@/components/shared/KpiCard';
+import { DeltaChip } from '@/components/shared/DeltaChip';
+import { Sparkline } from '@/components/shared/Sparkline';
+import { DataTable } from '@/components/shared/DataTable';
+import type { DataTableColumn } from '@/components/shared/DataTable';
+import { InstrumentAvatar } from '@/components/shared/InstrumentAvatar';
+import { RiskBanner } from '@/components/shared/RiskBanner';
+import { EmptyState } from '@/components/shared/EmptyState';
+import { StatusDot } from '@/components/shared/StatusDot';
+import { Skeleton } from '@/components/shared/Skeleton';
+import { TickValue } from '@/components/shared/TickValue';
+import type { Position } from '@/lib/data/types';
+
+const WATCHLIST_IDS = [1001, 1003, 1301, 1201, 1401, 1007];
+const TIMEFRAMES = [
+  { key: '1G', days: 1 }, { key: '1S', days: 7 }, { key: '1M', days: 30 },
+  { key: '3M', days: 90 }, { key: '1A', days: 365 }, { key: 'TUTTO', days: 365 },
+] as const;
+
+const stagger = (i: number) => ({
+  initial: { opacity: 0, y: 12 },
+  animate: { opacity: 1, y: 0 },
+  transition: { duration: 0.28, delay: i * 0.05, ease: [0.2, 0.8, 0.2, 1] as [number, number, number, number] },
+});
+
+export default function Overview() {
+  const navigate = useNavigate();
+  const {
+    portfolio, pnl, loading, status, mode, setMode,
+    displayCurrency, fromUsd, realExecutionActive,
+  } = useAppData();
+
+  const cur = displayCurrency;
+  const [timeframe, setTimeframe] = useState<(typeof TIMEFRAMES)[number]['key']>('1M');
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 5000);
+    return () => clearInterval(t);
+  }, []);
+
+  /* ── Empty state: Live senza connessione e nessun dato ──────────── */
+  if (!loading && !portfolio && mode === 'live') {
+    return (
+      <EmptyState
+        headline="Il tuo terminale è pronto"
+        copy="Collega il tuo account eToro o esplora la modalità Demo con dati simulati."
+        actionLabel="Attiva modalità Demo"
+        onAction={() => setMode('demo')}
+        secondaryLabel="Configura le chiavi API"
+        onSecondary={() => navigate('/impostazioni')}
+      />
+    );
+  }
+
+  return (
+    <div className="grid grid-cols-12 gap-4">
+      {/* ROW 0 — RiskBanner */}
+      {realExecutionActive && (
+        <div className="col-span-12">
+          <RiskBanner
+            variant="danger"
+            message="Esecuzione reale attiva — l'Agent può inviare ordini con denaro reale."
+          />
+        </div>
+      )}
+      {mode === 'live' && (status === 'error' || status === 'disconnected') && (
+        <div className="col-span-12">
+          <RiskBanner
+            variant="warn"
+            message="Connessione a eToro assente — verifica proxy e chiavi in Impostazioni."
+            actionLabel="Vai a Impostazioni"
+            onAction={() => navigate('/impostazioni')}
+          />
+        </div>
+      )}
+
+      {/* ROW 1 — Hero KPI strip */}
+      <motion.div {...stagger(0)} className="card-surface density-pad col-span-12 p-5 lg:col-span-5">
+        <div className="flex items-center justify-between">
+          <span className="overline">Valore portafoglio</span>
+          <span className="flex items-center gap-1.5 text-caption text-text-2">
+            <StatusDot variant={status === 'connected' || status === 'demo' ? 'live' : 'idle'} />
+            aggiornato {formatTime(now)}
+          </span>
+        </div>
+        {portfolio ? (
+          <>
+            <HeroNumber value={fromUsd(portfolio.totalValue)} currency={cur} />
+            <div className="mt-2">
+              <DeltaChip
+                value={pnl?.dailyPnlPct ?? 0}
+                absoluteValue={pnl ? fromUsd(pnl.dailyPnl) : 0}
+                currency={cur}
+              />
+            </div>
+          </>
+        ) : (
+          <Skeleton className="mt-3 h-11 w-56" />
+        )}
+      </motion.div>
+
+      <div className="col-span-12 grid grid-cols-1 gap-4 sm:grid-cols-3 lg:col-span-7">
+        <KpiCard
+          label="P&L Oggi"
+          value={pnl ? formatSignedCurrency(fromUsd(pnl.dailyPnl), cur) : '—'}
+          deltaPct={pnl?.dailyPnlPct}
+          currency={cur}
+          sparkData={pnl?.equityHistory.slice(-30).map((p) => p.value)}
+          sparkLive
+          status={pnl && pnl.dailyPnl >= 0 ? 'ok' : 'error'}
+        />
+        <KpiCard
+          label="P&L Totale"
+          value={pnl ? formatSignedCurrency(fromUsd(pnl.totalPnl), cur) : '—'}
+          deltaPct={pnl?.totalPnlPct}
+          currency={cur}
+          sparkData={pnl?.equityHistory.slice(-90).map((p) => p.value)}
+        />
+        <KpiCard
+          label="Cash disponibile"
+          value={portfolio ? formatCurrency(fromUsd(portfolio.cash), cur) : '—'}
+          currency={cur}
+          sparkData={pnl?.equityHistory.slice(-30).map((p) => p.value * 0.13)}
+        />
+      </div>
+
+      {/* ROW 2 — P&L chart + Suggerimenti */}
+      <motion.div {...stagger(1)} className="card-surface density-pad col-span-12 p-5 lg:col-span-8">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h2 className="text-title text-text-0">Andamento portafoglio</h2>
+          <div className="flex rounded-lg border border-hairline bg-bg-0 p-0.5">
+            {TIMEFRAMES.map((tf) => (
+              <button
+                key={tf.key}
+                onClick={() => setTimeframe(tf.key)}
+                className={cn(
+                  'rounded-md px-2.5 py-1 text-micro font-medium transition-colors',
+                  timeframe === tf.key ? 'bg-bg-3 text-text-0' : 'text-text-2 hover:text-text-1',
+                )}
+              >
+                {tf.key}
+              </button>
+            ))}
+          </div>
+        </div>
+        <PnlChart
+          data={pnl?.equityHistory ?? []}
+          days={TIMEFRAMES.find((t) => t.key === timeframe)!.days}
+          fromUsd={fromUsd}
+        />
+        <PnlStats history={pnl?.equityHistory ?? []} />
+      </motion.div>
+
+      <SuggestionsCard />
+
+      {/* ROW 3 — Watchlist + Agent + Valute */}
+      <motion.div {...stagger(2)} className="card-surface density-pad col-span-12 p-5 md:col-span-6 lg:col-span-5">
+        <div className="flex items-center justify-between">
+          <h2 className="text-title text-text-0">Watchlist</h2>
+          <button aria-label="Modifica watchlist" className="rounded-md p-1.5 text-text-2 transition-colors hover:bg-bg-2 hover:text-text-1">
+            <Pencil className="h-4 w-4" aria-hidden />
+          </button>
+        </div>
+        <div className="mt-3 divide-y divide-hairline">
+          {WATCHLIST_IDS.map((id) => (
+            <WatchlistRow key={id} instrumentId={id} />
+          ))}
+        </div>
+      </motion.div>
+
+      <AgentStatusCard />
+
+      <motion.div {...stagger(4)} className="card-surface density-pad col-span-12 p-5 md:col-span-6 lg:col-span-3">
+        <h2 className="text-title text-text-0">Valute</h2>
+        <CurrencyExposure />
+      </motion.div>
+
+      {/* ROW 4 — Posizioni + Avvisi */}
+      <motion.div {...stagger(5)} className="card-surface density-pad col-span-12 p-5 lg:col-span-8">
+        <div className="flex items-center justify-between">
+          <h2 className="text-title text-text-0">Posizioni aperte</h2>
+          <button
+            onClick={() => navigate('/portfolio')}
+            className="flex items-center gap-1 text-caption text-info transition-colors hover:text-info/80"
+          >
+            Tutte le posizioni <ArrowRight className="h-3.5 w-3.5" aria-hidden />
+          </button>
+        </div>
+        <PositionsTable />
+      </motion.div>
+
+      <AlertsCard />
+    </div>
+  );
+}
+
+/* ── Hero number con count-up 900ms ────────────────────────────────── */
+function HeroNumber({ value, currency }: { value: number; currency: 'EUR' | 'USD' }) {
+  const [display, setDisplay] = useState(0);
+  const firstRef = useRef(true);
+
+  useEffect(() => {
+    const duration = firstRef.current ? 900 : 400;
+    firstRef.current = false;
+    const from = display;
+    const start = performance.now();
+    let raf = 0;
+    const step = (now: number) => {
+      const t = Math.min(1, (now - start) / duration);
+      const eased = 1 - Math.pow(1 - t, 3);
+      setDisplay(from + (value - from) * eased);
+      if (t < 1) raf = requestAnimationFrame(step);
+    };
+    raf = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(raf);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value]);
+
+  return (
+    <div className="mt-2 font-display text-display-xl text-text-0 tabular-nums">
+      {formatCurrency(display, currency)}
+    </div>
+  );
+}
+
+/* ── Grafico P&L (lightweight-charts area) ─────────────────────────── */
+function PnlChart({ data, days, fromUsd }: { data: { time: number; value: number }[]; days: number; fromUsd(n: number): number }) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const chartRef = useRef<IChartApi | null>(null);
+  const seriesRef = useRef<ISeriesApi<'Area'> | null>(null);
+  const benchRef = useRef<ISeriesApi<'Line'> | null>(null);
+  const [showBenchmark, setShowBenchmark] = useState(false);
+  /* ref per evitare il rebuild della serie a ogni tick FX */
+  const fromUsdRef = useRef(fromUsd);
+  fromUsdRef.current = fromUsd;
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const chart = createChart(el, {
+      height: 260,
+      layout: { background: { color: 'transparent' }, textColor: '#5C6B7A', fontFamily: 'JetBrains Mono' },
+      grid: { vertLines: { color: '#FFFFFF0A' }, horzLines: { color: '#FFFFFF0A' } },
+      crosshair: {
+        vertLine: { color: '#5C6B7A', style: 2 },
+        horzLine: { color: '#5C6B7A', style: 2 },
+      },
+      rightPriceScale: { borderColor: '#FFFFFF14' },
+      timeScale: { borderColor: '#FFFFFF14', timeVisible: true },
+    });
+    chartRef.current = chart;
+    const ro = new ResizeObserver(() => chart.applyOptions({ width: el.clientWidth }));
+    ro.observe(el);
+    return () => { ro.disconnect(); chart.remove(); chartRef.current = null; seriesRef.current = null; benchRef.current = null; };
+  }, []);
+
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart || data.length < 2) return;
+    const cutoff = Date.now() / 1000 - days * 86400;
+    const filtered = data.filter((p) => p.time >= cutoff);
+    const positive = filtered[filtered.length - 1].value >= filtered[0].value;
+    const color = positive ? '#00C390' : '#F4556B';
+
+    if (seriesRef.current) chart.removeSeries(seriesRef.current);
+    const series = chart.addSeries(AreaSeries, {
+      lineColor: color,
+      topColor: `${color}1F`,
+      bottomColor: `${color}00`,
+      lineWidth: 2,
+      priceFormat: { type: 'price', precision: 0, minMove: 1 },
+    });
+    series.setData(filtered.map((p) => ({ time: p.time as UTCTimestamp, value: fromUsdRef.current(p.value) })));
+    seriesRef.current = series;
+    chart.timeScale().fitContent();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data, days]);
+
+  /* Benchmark SPX (linea dashed text-2) */
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart || data.length < 2) return;
+    if (benchRef.current) { chart.removeSeries(benchRef.current); benchRef.current = null; }
+    if (!showBenchmark) return;
+    const cutoff = Date.now() / 1000 - days * 86400;
+    const filtered = data.filter((p) => p.time >= cutoff);
+    const base = filtered[0].value;
+    const line = chart.addSeries(LineSeries, { color: '#5C6B7A', lineWidth: 1, lineStyle: 2, priceLineVisible: false });
+    // benchmark sintetico: stessa shape smorzata al 60%
+    line.setData(filtered.map((p) => ({ time: p.time as UTCTimestamp, value: fromUsdRef.current(base + (p.value - base) * 0.6) })));
+    benchRef.current = line;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showBenchmark, data, days]);
+
+  return (
+    <div className="mt-3">
+      <div ref={containerRef} className="w-full" />
+      <label className="mt-1 flex cursor-pointer items-center gap-2 text-caption text-text-2">
+        <input
+          type="checkbox"
+          checked={showBenchmark}
+          onChange={(e) => setShowBenchmark(e.target.checked)}
+          className="h-3.5 w-3.5 accent-[#00C390]"
+        />
+        Confronta con benchmark (SPX)
+      </label>
+    </div>
+  );
+}
+
+/* ── Footer stats del grafico: max drawdown, volatilità, Sharpe ────── */
+function PnlStats({ history }: { history: { time: number; value: number }[] }) {
+  const stats = useMemo(() => {
+    if (history.length < 30) return null;
+    const values = history.map((p) => p.value);
+    let peak = values[0];
+    let maxDd = 0;
+    for (const v of values) {
+      peak = Math.max(peak, v);
+      maxDd = Math.min(maxDd, (v - peak) / peak);
+    }
+    const returns: number[] = [];
+    for (let i = 1; i < values.length; i++) returns.push((values[i] - values[i - 1]) / values[i - 1]);
+    const mean = returns.reduce((s, r) => s + r, 0) / returns.length;
+    const variance = returns.reduce((s, r) => s + (r - mean) ** 2, 0) / returns.length;
+    const vol = Math.sqrt(variance) * Math.sqrt(252) * 100;
+    const sharpe = vol > 0 ? (mean * 252 * 100) / vol : 0;
+    return { maxDd: maxDd * 100, vol, sharpe };
+  }, [history]);
+
+  if (!stats) return null;
+  return (
+    <div className="mt-3 flex flex-wrap gap-x-6 gap-y-1 border-t border-hairline pt-3 text-caption text-text-2">
+      <span>Max drawdown <span className="text-loss tabular-nums">{formatPercent(stats.maxDd, 1, false)}</span></span>
+      <span>Volatilità ann. <span className="text-text-1 tabular-nums">{formatPercent(stats.vol, 1, false)}</span></span>
+      <span>Sharpe semplice <span className="text-text-1 tabular-nums">{stats.sharpe.toFixed(2)}</span></span>
+    </div>
+  );
+}
+
+/* ── Suggerimenti & Next Step ──────────────────────────────────────── */
+interface Insight {
+  id: string;
+  severity: 'info' | 'warn' | 'opportunity';
+  title: string;
+  detail: string;
+  to: string;
+}
+
+const SEVERITY_STYLE: Record<Insight['severity'], string> = {
+  info: 'border-l-info',
+  warn: 'border-l-warn',
+  opportunity: 'border-l-gain',
+};
+
+function SuggestionsCard() {
+  const navigate = useNavigate();
+  const { portfolio, pnl, fxRate, settings, agent, fromUsd, displayCurrency } = useAppData();
+
+  const insights = useMemo<Insight[]>(() => {
+    const out: Insight[] = [];
+    if (portfolio && portfolio.positions.length > 0) {
+      // Concentrazione per asset class
+      const byClass = new Map<string, number>();
+      for (const p of portfolio.positions) {
+        const v = (p.units * (p.currentPrice ?? p.openPrice)) || p.invested;
+        byClass.set(p.assetClass, (byClass.get(p.assetClass) ?? 0) + v);
+      }
+      const total = portfolio.positionsValue || 1;
+      const [topClass, topValue] = [...byClass.entries()].sort((a, b) => b[1] - a[1])[0];
+      const pct = (topValue / total) * 100;
+      if (pct > 30) {
+        out.push({
+          id: 'concentration', severity: 'warn',
+          title: 'Concentrazione elevata',
+          detail: `Il ${pct.toFixed(0)}% del portafoglio è su "${topClass}". Valuta un ribilanciamento.`,
+          to: '/portfolio',
+        });
+      }
+      // Cash drag
+      const cashPct = (portfolio.cash / portfolio.totalValue) * 100;
+      if (cashPct > 10) {
+        const budget = agent.getRemainingBudget();
+        out.push({
+          id: 'cash-drag', severity: 'info',
+          title: 'Cash drag',
+          detail: `${formatCurrency(fromUsd(portfolio.cash), displayCurrency)} (${cashPct.toFixed(0)}%) fermi. I gruppi Agent hanno ${formatCurrency(fromUsd(budget), displayCurrency)} di budget non allocato.`,
+          to: '/agent',
+        });
+      }
+      // Peggiore di oggi + regola
+      const worst = [...portfolio.positions].sort((a, b) => (a.pnlPct ?? 0) - (b.pnlPct ?? 0))[0];
+      if (worst && (worst.pnlPct ?? 0) < -3) {
+        out.push({
+          id: 'worst', severity: 'opportunity',
+          title: `${worst.symbol} ${formatPercent(worst.pnlPct ?? 0)} dall'apertura`,
+          detail: 'La regola "Compra i cali" potrebbe attivarsi se il calo continua.',
+          to: '/agent',
+        });
+      }
+    }
+    if (fxRate && fxRate.rate > settings.fxTargetRate) {
+      out.push({
+        id: 'fx', severity: 'opportunity',
+        title: `EUR/USD a ${formatFxRate(fxRate.rate)}`,
+        detail: `Sopra la tua soglia target ${formatFxRate(settings.fxTargetRate, 2)}. Monitora per la conversione USD→EUR.`,
+        to: '/fx',
+      });
+    }
+    if (pnl && pnl.dailyPnlPct > 1.5) {
+      out.push({
+        id: 'good-day', severity: 'info',
+        title: 'Giornata positiva',
+        detail: `Il portafoglio è ${formatPercent(pnl.dailyPnlPct)} oggi. Valuta prese di profitto parziali.`,
+        to: '/portfolio',
+      });
+    }
+    return out.slice(0, 6);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [portfolio, pnl, fxRate, settings.fxTargetRate, displayCurrency]);
+
+  const ICONS = { info: Lightbulb, warn: CircleAlert, opportunity: TrendingUp };
+
+  return (
+    <motion.div {...stagger(2)} className="card-surface density-pad col-span-12 p-5 lg:col-span-4">
+      <h2 className="text-title text-text-0">Suggerimenti</h2>
+      <div className="mt-3 space-y-2.5">
+        {insights.length === 0 && (
+          <p className="text-caption text-text-2">Nessun suggerimento al momento — il portafoglio è bilanciato.</p>
+        )}
+        {insights.map((ins, i) => {
+          const Icon = ICONS[ins.severity];
+          return (
+            <motion.button
+              key={ins.id}
+              initial={{ opacity: 0, y: -8 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.24, delay: i * 0.06 }}
+              onClick={() => navigate(ins.to)}
+              className={cn(
+                'block w-full rounded-lg border border-hairline border-l-2 bg-bg-0 p-3 text-left transition-colors hover:bg-bg-2',
+                SEVERITY_STYLE[ins.severity],
+              )}
+            >
+              <div className="flex items-start gap-2.5">
+                <Icon className="mt-0.5 h-4 w-4 shrink-0 text-text-1" aria-hidden />
+                <div className="min-w-0">
+                  <div className="text-body-strong text-text-0">{ins.title}</div>
+                  <div className="mt-0.5 text-caption text-text-1">{ins.detail}</div>
+                  <div className="mt-1 flex items-center gap-1 text-micro font-medium text-info">
+                    Vai <ArrowRight className="h-3 w-3" aria-hidden />
+                  </div>
+                </div>
+              </div>
+            </motion.button>
+          );
+        })}
+      </div>
+    </motion.div>
+  );
+}
+
+/* ── Watchlist row ─────────────────────────────────────────────────── */
+function WatchlistRow({ instrumentId }: { instrumentId: number }) {
+  const navigate = useNavigate();
+  const { quotes, instruments, sparkFor } = useAppData();
+  const quote = quotes[instrumentId];
+  const inst = instruments.find((i) => i.instrumentId === instrumentId);
+  if (!inst) return null;
+
+  return (
+    <button
+      onClick={() => navigate(`/mercati?instrument=${instrumentId}`)}
+      className="flex w-full items-center gap-3 py-2.5 text-left transition-colors hover:bg-bg-2/50"
+    >
+      <InstrumentAvatar symbol={inst.symbol} size={32} />
+      <div className="min-w-0 flex-1">
+        <div className="font-mono text-ticker text-text-0">{inst.symbol}</div>
+        <div className="truncate text-caption text-text-2">{inst.name}</div>
+      </div>
+      <Sparkline data={sparkFor(instrumentId)} width={60} height={20} live />
+      <div className="w-24 text-right">
+        {quote ? (
+          <>
+            <TickValue value={quote.last} className="block text-body-strong text-text-0">
+              {formatPrice(quote.last)}
+            </TickValue>
+            <span className={cn('text-micro tabular-nums', quote.changePct >= 0 ? 'text-gain' : 'text-loss')}>
+              {formatPercent(quote.changePct)}
+            </span>
+          </>
+        ) : (
+          <Skeleton className="ml-auto h-4 w-16" />
+        )}
+      </div>
+    </button>
+  );
+}
+
+/* ── Agent status card ─────────────────────────────────────────────── */
+function AgentStatusCard() {
+  const navigate = useNavigate();
+  const { agent, fromUsd, displayCurrency, agentVersion } = useAppData();
+  // agentVersion forza il re-render a ogni update dell'engine
+  const rules = useMemo(() => agent.getRules(), [agent, agentVersion]);
+  const pending = useMemo(() => agent.getPendingConfirmations(), [agent, agentVersion]);
+
+  return (
+    <motion.div {...stagger(3)} className="card-surface density-pad col-span-12 border-l-2 border-l-agent p-5 md:col-span-6 lg:col-span-4">
+      <div className="flex items-center justify-between">
+        <h2 className="flex items-center gap-2 text-title text-text-0">
+          <Bot className="h-4 w-4 text-agent" aria-hidden />
+          eToro Agent
+        </h2>
+        <button
+          role="switch"
+          aria-checked={agent.masterEnabled}
+          onClick={() => agent.setMasterEnabled(!agent.masterEnabled)}
+          className={cn(
+            'relative h-5 w-9 rounded-full transition-colors',
+            agent.masterEnabled ? 'bg-agent' : 'bg-bg-3',
+          )}
+        >
+          <span
+            className={cn(
+              'absolute top-0.5 h-4 w-4 rounded-full bg-white transition-transform',
+              agent.masterEnabled ? 'translate-x-4' : 'translate-x-0.5',
+            )}
+          />
+        </button>
+      </div>
+
+      <div className="mt-3 grid grid-cols-3 gap-2">
+        {[
+          { label: 'Regole attive', value: String(agent.getActiveRulesCount()) },
+          { label: 'Eseguiti oggi', value: `${agent.getExecutionsToday()}/${agent.maxOrdersPerDay}` },
+          { label: 'Budget residuo', value: formatCurrency(fromUsd(agent.getRemainingBudget()), displayCurrency, 0) },
+        ].map((s) => (
+          <div key={s.label} className="rounded-lg border border-hairline bg-bg-0 p-2.5">
+            <div className="text-micro text-text-2">{s.label}</div>
+            <div className="mt-0.5 text-body-strong text-text-0 tabular-nums">{s.value}</div>
+          </div>
+        ))}
+      </div>
+
+      <div className="mt-3 space-y-2">
+        {rules.slice(0, 3).map((rule) => (
+          <div key={rule.id} className="flex items-center gap-2 rounded-lg border border-hairline bg-bg-0 px-3 py-2">
+            <StatusDot variant={rule.enabled ? 'ok' : 'idle'} />
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-body-strong text-text-0">{rule.name}</div>
+              <div className="truncate text-micro text-text-2">
+                {rule.enabled ? `Cooldown ${rule.cooldownMinutes}m · ${rule.instrumentIds.length} strumenti` : 'In pausa'}
+              </div>
+            </div>
+          </div>
+        ))}
+        {pending.slice(0, 2).map((exec) => (
+          <div
+            key={exec.id}
+            className="rounded-lg border border-warn/40 bg-warn/10 px-3 py-2 motion-safe:animate-[pending-ring_1.6s_ease-in-out_infinite]"
+          >
+            <div className="flex items-center gap-2">
+              <StatusDot variant="warn" />
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-body-strong text-text-0">{exec.symbol} — conferma richiesta</div>
+                <div className="truncate text-micro text-text-1">{exec.ruleName} · {formatCurrency(exec.amount, 'USD', 0)}</div>
+              </div>
+            </div>
+            <div className="mt-2 flex gap-2">
+              <button
+                onClick={() => void agent.confirmExecution(exec.id)}
+                className="rounded-md bg-warn px-2.5 py-1 text-micro font-semibold text-bg-0 transition-colors hover:bg-warn/90"
+              >
+                Conferma
+              </button>
+              <button
+                onClick={() => agent.ignoreExecution(exec.id)}
+                className="rounded-md border border-hairline-strong px-2.5 py-1 text-micro font-medium text-text-1 transition-colors hover:bg-bg-2"
+              >
+                Ignora
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <button
+        onClick={() => navigate('/agent')}
+        className="mt-3 flex items-center gap-1 text-caption font-medium text-agent transition-colors hover:text-agent/80"
+      >
+        Apri Agent <ArrowRight className="h-3.5 w-3.5" aria-hidden />
+      </button>
+      <style>{`@keyframes pending-ring { 0%,100% { box-shadow: 0 0 0 0 #F5A62300; } 50% { box-shadow: 0 0 0 3px #F5A62333; } }`}</style>
+    </motion.div>
+  );
+}
+
+/* ── Esposizione valuta ────────────────────────────────────────────── */
+function CurrencyExposure() {
+  const { portfolio } = useAppData();
+
+  const exposure = useMemo(() => {
+    if (!portfolio) return [];
+    const byCcy = new Map<string, number>();
+    byCcy.set('USD', portfolio.cash);
+    for (const p of portfolio.positions) {
+      const v = p.units * (p.currentPrice ?? p.openPrice);
+      byCcy.set(p.currency, (byCcy.get(p.currency) ?? 0) + v);
+    }
+    const total = [...byCcy.values()].reduce((s, v) => s + v, 0) || 1;
+    return [...byCcy.entries()]
+      .map(([ccy, v]) => ({ ccy, pct: (v / total) * 100 }))
+      .sort((a, b) => b.pct - a.pct);
+  }, [portfolio]);
+
+  const COLORS: Record<string, string> = { USD: '#4C9AFF', EUR: '#00C390', GBP: '#9B8CFF', CHF: '#F5A623', JPY: '#F4556B' };
+  const usdPct = exposure.find((e) => e.ccy === 'USD')?.pct ?? 0;
+
+  return (
+    <div className="mt-3">
+      <div className="flex h-3 w-full overflow-hidden rounded-full">
+        {exposure.map((e) => (
+          <div
+            key={e.ccy}
+            style={{ width: `${e.pct}%`, backgroundColor: COLORS[e.ccy] ?? '#5C6B7A' }}
+            title={`${e.ccy} ${e.pct.toFixed(0)}%`}
+          />
+        ))}
+      </div>
+      <div className="mt-3 space-y-1.5">
+        {exposure.map((e) => (
+          <div key={e.ccy} className="flex items-center gap-2 text-caption">
+            <span className="h-2 w-2 rounded-sm" style={{ backgroundColor: COLORS[e.ccy] ?? '#5C6B7A' }} />
+            <span className="font-mono text-ticker text-text-1">{e.ccy}</span>
+            <span className="ml-auto text-text-0 tabular-nums">{e.pct.toFixed(0)}%</span>
+          </div>
+        ))}
+      </div>
+      {usdPct > 60 && (
+        <p className="mt-3 text-caption text-warn">Esposizione USD elevata — vedi modulo FX.</p>
+      )}
+    </div>
+  );
+}
+
+/* ── Tabella posizioni ─────────────────────────────────────────────── */
+const ASSET_BADGE: Record<string, string> = {
+  stock: 'Azione', etf: 'ETF', crypto: 'Crypto', fx: 'FX', index: 'Indice', cfd: 'CFD',
+};
+
+function PositionsTable() {
+  const navigate = useNavigate();
+  const { portfolio, fromUsd, displayCurrency, sparkFor } = useAppData();
+
+  const columns: DataTableColumn<Position>[] = useMemo(() => [
+    {
+      key: 'instrument', header: 'Strumento', sticky: true,
+      sortValue: (p) => p.symbol,
+      cell: (p) => (
+        <div className="flex items-center gap-2.5">
+          <InstrumentAvatar symbol={p.symbol} size={28} />
+          <div>
+            <div className="font-mono text-ticker text-text-0">{p.symbol}</div>
+            <div className="max-w-32 truncate text-micro text-text-2">{p.name}</div>
+          </div>
+        </div>
+      ),
+    },
+    {
+      key: 'type', header: 'Tipo', align: 'center',
+      sortValue: (p) => p.assetClass,
+      cell: (p) => (
+        <span className="rounded-md bg-bg-2 px-1.5 py-0.5 text-micro font-medium text-text-1">
+          {ASSET_BADGE[p.assetClass] ?? p.assetClass}
+        </span>
+      ),
+    },
+    {
+      key: 'units', header: 'Quantità', align: 'right',
+      sortValue: (p) => p.units,
+      cell: (p) => <span className="text-text-1">{formatUnits(p.units)}</span>,
+    },
+    {
+      key: 'open', header: 'Prezzo medio', align: 'right',
+      sortValue: (p) => p.openPrice,
+      cell: (p) => <span className="text-text-1">{formatPrice(p.openPrice)}</span>,
+    },
+    {
+      key: 'last', header: 'Ultimo', align: 'right',
+      sortValue: (p) => p.currentPrice ?? 0,
+      cell: (p) => (
+        <TickValue value={p.currentPrice ?? p.openPrice} className="text-text-0">
+          {formatPrice(p.currentPrice ?? p.openPrice)}
+        </TickValue>
+      ),
+    },
+    {
+      key: 'pnl', header: 'P&L', align: 'right',
+      sortValue: (p) => p.pnl ?? 0,
+      cell: (p) => (
+        <span className={cn('font-medium', (p.pnl ?? 0) >= 0 ? 'text-gain' : 'text-loss')}>
+          {formatSignedCurrency(fromUsd(p.pnl ?? 0), displayCurrency)}
+        </span>
+      ),
+    },
+    {
+      key: 'pnlpct', header: 'P&L %', align: 'right',
+      sortValue: (p) => p.pnlPct ?? 0,
+      cell: (p) => <DeltaChip value={p.pnlPct ?? 0} size="sm" />,
+    },
+    {
+      key: 'spark', header: '7g', align: 'right',
+      cell: (p) => <Sparkline data={sparkFor(p.instrumentId)} width={60} height={20} />,
+    },
+  ], [fromUsd, displayCurrency, sparkFor]);
+
+  if (!portfolio) return <Skeleton className="mt-3 h-48 w-full" />;
+
+  return (
+    <DataTable
+      className="mt-3"
+      columns={columns}
+      rows={portfolio.positions}
+      rowKey={(p) => p.positionId}
+      defaultSortKey="pnl"
+      onRowClick={() => navigate('/portfolio')}
+      emptyMessage="Nessuna posizione aperta."
+    />
+  );
+}
+
+/* ── Avvisi ────────────────────────────────────────────────────────── */
+interface AlertItem {
+  id: string;
+  timestamp: number;
+  text: string;
+  kind: 'price' | 'agent' | 'system';
+}
+
+/** Timestamp di riferimento calcolato una sola volta al caricamento del modulo. */
+const MODULE_LOAD_TS = Date.now();
+
+function AlertsCard() {
+  const { logs, instruments } = useAppData();
+  const [alerts, setAlerts] = useState<AlertItem[]>([
+    { id: 'a1', timestamp: MODULE_LOAD_TS - 3600_000, text: 'BTC sopra $ 95.000 — avviso prezzo attivato', kind: 'price' },
+    { id: 'a2', timestamp: MODULE_LOAD_TS - 7200_000, text: 'Regola "Compra i cali" in cooldown fino alle 18:00', kind: 'agent' },
+  ]);
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const [newSymbol, setNewSymbol] = useState('AAPL');
+  const [newThreshold, setNewThreshold] = useState('');
+
+  const items = useMemo<AlertItem[]>(() => {
+    const fromLogs: AlertItem[] = logs
+      .filter((l) => l.level === 'agent' || l.level === 'warn' || l.level === 'error')
+      .slice(0, 6)
+      .map((l) => ({ id: l.id, timestamp: l.timestamp, text: l.message, kind: l.level === 'agent' ? 'agent' : 'system' }));
+    return [...alerts, ...fromLogs].sort((a, b) => b.timestamp - a.timestamp).slice(0, 8);
+  }, [alerts, logs]);
+
+  const KIND_COLOR: Record<AlertItem['kind'], string> = {
+    price: 'text-info', agent: 'text-agent', system: 'text-warn',
+  };
+
+  return (
+    <motion.div {...stagger(6)} className="card-surface density-pad col-span-12 p-5 lg:col-span-4">
+      <div className="flex items-center justify-between">
+        <h2 className="text-title text-text-0">Avvisi</h2>
+        <button
+          onClick={() => setDialogOpen(true)}
+          className="flex items-center gap-1 rounded-lg border border-hairline px-2 py-1 text-micro font-medium text-text-1 transition-colors hover:bg-bg-2"
+        >
+          <Plus className="h-3.5 w-3.5" aria-hidden /> Nuovo avviso
+        </button>
+      </div>
+      <div className="mt-3 space-y-2">
+        {items.map((a) => (
+          <motion.div
+            key={a.id}
+            initial={{ opacity: 0, x: -8 }}
+            animate={{ opacity: 1, x: 0 }}
+            className="flex items-start gap-2.5 rounded-lg border border-hairline bg-bg-0 px-3 py-2"
+          >
+            <Bell className={cn('mt-0.5 h-3.5 w-3.5 shrink-0', KIND_COLOR[a.kind])} aria-hidden />
+            <div className="min-w-0">
+              <div className="text-caption text-text-0">{a.text}</div>
+              <div className="font-mono text-micro text-text-2">{formatTime(a.timestamp)}</div>
+            </div>
+          </motion.div>
+        ))}
+      </div>
+
+      {dialogOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => setDialogOpen(false)}>
+          <div
+            className="w-full max-w-sm rounded-xl border border-hairline-strong bg-bg-1 p-5"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className="text-title text-text-0">Nuovo avviso prezzo</h3>
+            <div className="mt-4 space-y-3">
+              <label className="block">
+                <span className="overline">Strumento</span>
+                <select
+                  value={newSymbol}
+                  onChange={(e) => setNewSymbol(e.target.value)}
+                  className="mt-1 w-full rounded-lg border border-hairline bg-bg-3 px-3 py-2 text-body text-text-0 outline-none focus:border-hairline-strong"
+                >
+                  {instruments.slice(0, 30).map((i) => (
+                    <option key={i.instrumentId} value={i.symbol}>{i.symbol} — {i.name}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="block">
+                <span className="overline">Soglia prezzo</span>
+                <input
+                  value={newThreshold}
+                  onChange={(e) => setNewThreshold(e.target.value)}
+                  placeholder="es. 250"
+                  inputMode="decimal"
+                  className="mt-1 w-full rounded-lg border border-hairline bg-bg-3 px-3 py-2 font-mono text-ticker text-text-0 outline-none placeholder:text-text-2 focus:border-hairline-strong"
+                />
+              </label>
+            </div>
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                onClick={() => setDialogOpen(false)}
+                className="rounded-lg border border-hairline-strong px-3 py-1.5 text-body-strong text-text-1 hover:bg-bg-2"
+              >
+                Annulla
+              </button>
+              <button
+                onClick={() => {
+                  if (newThreshold) {
+                    setAlerts((prev) => [{
+                      id: `a-${Date.now()}`,
+                      timestamp: Date.now(),
+                      text: `Avviso creato: ${newSymbol} soglia ${newThreshold}`,
+                      kind: 'price',
+                    }, ...prev]);
+                  }
+                  setDialogOpen(false);
+                  setNewThreshold('');
+                }}
+                className="rounded-lg bg-gain px-3 py-1.5 text-body-strong text-bg-0 hover:bg-gain/90"
+              >
+                Crea avviso
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </motion.div>
+  );
+}

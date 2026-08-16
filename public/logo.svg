@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <!-- Torino logo: rounded-square outline + upward zig-zag pulse ending in arrow tip (design.md / Assets) -->
+  <rect x="6" y="6" width="52" height="52" rx="14" stroke="#00C390" stroke-width="2"/>
+  <path d="M16 40 L26 40 L31 28 L37 44 L42 34 L48 34" stroke="#00C390" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M44 28 L50 34 L44 40" stroke="#00C390" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

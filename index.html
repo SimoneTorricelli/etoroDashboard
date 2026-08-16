@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="it" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/svg+xml" href="./logo.svg" />
+    <meta name="description" content="Torino — terminale di comando per eToro: portfolio, mercati in tempo reale, Agent automatizzato e modulo EUR/USD." />
+    <title>Torino — eToro Command Center</title>
+    <!-- SPA redirect (companion di public/404.html): ripristina la route da ?/... per GitHub Pages -->
+    <script>
+      (function () {
+        var l = window.location;
+        var q = l.search.slice(1).split('&')[0];
+        if (q.charAt(0) === '/') {
+          var decoded = q.slice(1).replace(/~and~/g, '&').replace(/~q~/g, '?');
+          var rest = l.search.slice(1).split('&').slice(1).join('&').replace(/~and~/g, '&');
+          window.history.replaceState(null, '',
+            l.pathname.replace(/index\.html$/, '') + decoded + (rest ? '?' + rest : '') + l.hash);
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
