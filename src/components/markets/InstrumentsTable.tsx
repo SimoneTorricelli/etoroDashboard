@@ -4,9 +4,10 @@
  * Cap./Mercato | Azioni (watchlist, avviso, regola Agent, dettagli).
  * Prezzi con tick-flash live; hover riga collegato alla heatmap.
  */
-import { useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { Bell, ChevronRight, Star, Zap } from 'lucide-react';
+import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
 import { formatCompact, formatPercent, formatPrice } from '@/lib/format';
 import { DataTable } from '@/components/shared/DataTable';
@@ -15,6 +16,8 @@ import { InstrumentAvatar } from '@/components/shared/InstrumentAvatar';
 import { Sparkline } from '@/components/shared/Sparkline';
 import { TickValue } from '@/components/shared/TickValue';
 import type { MarketRow } from './meta';
+import { useAppData } from '@/lib/data/store';
+import { loadEtoroDataHubSnapshot, updateEtoroWatchlistItem } from '@/lib/data/EtoroDataHub';
 
 export interface InstrumentsTableProps {
   rows: MarketRow[];
@@ -32,8 +35,11 @@ function pctCell(value: number | null) {
 
 export function InstrumentsTable({ rows, onSelect }: InstrumentsTableProps) {
   const navigate = useNavigate();
-  const [watchlist, setWatchlist] = useState<Set<number>>(() => new Set());
-  const [alerts, setAlerts] = useState<Set<number>>(() => new Set());
+  const { settings } = useAppData();
+  const [hubSnapshot] = useState(() => loadEtoroDataHubSnapshot());
+  const [watchlist, setWatchlist] = useState<Set<number>>(() => new Set(hubSnapshot?.watchlistInstrumentIds ?? []));
+  const [alerts, setAlerts] = useState<Set<number>>(() => new Set(hubSnapshot?.priceAlerts.map((alert) => alert.instrumentId) ?? []));
+  const [watchlistPending, setWatchlistPending] = useState<Set<number>>(() => new Set());
 
   const toggle = (set: Set<number>, id: number, apply: (next: Set<number>) => void) => {
     const next = new Set(set);
@@ -41,6 +47,31 @@ export function InstrumentsTable({ rows, onSelect }: InstrumentsTableProps) {
     else next.add(id);
     apply(next);
   };
+
+  const toggleRemoteWatchlist = useCallback(async (id: number, symbol: string) => {
+    const watchlistId = hubSnapshot?.watchlists.find((item) => item.isDefault)?.id ?? hubSnapshot?.watchlists[0]?.id;
+    if (!watchlistId) {
+      toast.error('Watchlist eToro non sincronizzata', { description: 'Apri Impostazioni → Dati eToro e premi “Sincronizza ora”.' });
+      return;
+    }
+    const add = !watchlist.has(id);
+    const confirmed = window.confirm(`${add ? 'Aggiungere' : 'Rimuovere'} ${symbol} ${add ? 'alla' : 'dalla'} watchlist eToro?`);
+    if (!confirmed) return;
+    setWatchlistPending((current) => new Set(current).add(id));
+    try {
+      await updateEtoroWatchlistItem(settings.live, watchlistId, id, add);
+      setWatchlist((current) => {
+        const next = new Set(current);
+        if (next.has(id)) next.delete(id); else next.add(id);
+        return next;
+      });
+      toast.success(`${symbol} ${add ? 'aggiunto alla' : 'rimosso dalla'} watchlist eToro`);
+    } catch (error) {
+      toast.error('Watchlist non aggiornata', { description: error instanceof Error ? error.message : 'Permesso non disponibile.' });
+    } finally {
+      setWatchlistPending((current) => { const next = new Set(current); next.delete(id); return next; });
+    }
+  }, [hubSnapshot, settings.live, watchlist]);
 
   const columns = useMemo<DataTableColumn<MarketRow>[]>(() => [
     {
@@ -131,8 +162,9 @@ export function InstrumentsTable({ rows, onSelect }: InstrumentsTableProps) {
             <button
               aria-label={watchlist.has(id) ? 'Rimuovi dalla watchlist' : 'Aggiungi alla watchlist'}
               title="Watchlist"
-              onClick={() => toggle(watchlist, id, setWatchlist)}
-              className={cn(btn, watchlist.has(id) && 'text-warn')}
+              onClick={() => void toggleRemoteWatchlist(id, r.instrument.symbol)}
+              disabled={watchlistPending.has(id)}
+              className={cn(btn, watchlist.has(id) && 'text-warn', watchlistPending.has(id) && 'animate-pulse opacity-50')}
             >
               <Star className="h-4 w-4" fill={watchlist.has(id) ? 'currentColor' : 'none'} aria-hidden />
             </button>
@@ -164,7 +196,7 @@ export function InstrumentsTable({ rows, onSelect }: InstrumentsTableProps) {
         );
       },
     },
-  ], [watchlist, alerts, navigate, onSelect]);
+  ], [watchlist, alerts, watchlistPending, navigate, onSelect, toggleRemoteWatchlist]);
 
   return (
     <div>

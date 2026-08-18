@@ -254,12 +254,14 @@ export class LiveDataProvider implements DataProvider {
     const parentCID = Number(raw['parentCID'] ?? raw['ParentCID'] ?? raw['parentCid'] ?? raw['CID'] ?? raw['cid'] ?? 0);
     const rawId = raw['copyId'] ?? raw['CopyID'] ?? raw['copyID'] ?? raw['id'] ?? raw['ID'];
     const copyId = String(rawId ?? (parentCID > 0 ? parentCID : `copy-${index + 1}`));
+    const mirrorId = Number(raw['mirrorId'] ?? raw['MirrorId'] ?? raw['mirrorID'] ?? raw['MirrorID'] ?? rawId ?? 0);
     const parentUsername = String(raw['parentUsername'] ?? raw['ParentUsername'] ?? raw['username'] ?? raw['Username'] ?? raw['parentName'] ?? raw['ParentName'] ?? '');
     const name = String(raw['name'] ?? raw['Name'] ?? raw['displayName'] ?? raw['DisplayName'] ?? raw['parentName'] ?? raw['ParentName'] ?? (parentUsername ? `Copy · ${parentUsername}` : `Copy portfolio ${index + 1}`));
     const type = String(raw['type'] ?? raw['Type'] ?? raw['portfolioType'] ?? raw['PortfolioType'] ?? '').toLowerCase();
     const isAgent = Boolean(raw['isAgent'] ?? raw['IsAgent'] ?? raw['isAgentPortfolio'] ?? raw['IsAgentPortfolio'] ?? raw['agentPortfolioId'] ?? raw['AgentPortfolioId'] ?? raw['agentPortfolioGcid'] ?? raw['AgentPortfolioGcid'] ?? raw['agent'] ?? raw['Agent']) || type.includes('agent');
     return {
       copyId,
+      mirrorId: Number.isFinite(mirrorId) && mirrorId > 0 ? mirrorId : undefined,
       name,
       parentCID: parentCID > 0 ? parentCID : undefined,
       parentUsername: parentUsername || undefined,
@@ -1031,7 +1033,10 @@ export class LiveDataProvider implements DataProvider {
   }
 
   async getTradeHistory(): Promise<ClosedTrade[]> {
-    const data = await this.api<unknown>('api/v1/trading/info/trade/history', undefined, { ttlMs: 15 * 60 * 1000, priority: 'history' });
+    const from = new Date();
+    from.setUTCDate(from.getUTCDate() - 364);
+    const minDate = from.toISOString().slice(0, 10);
+    const data = await this.api<unknown>(`api/v1/trading/info/trade/history?minDate=${minDate}&page=1&pageSize=500`, undefined, { ttlMs: 15 * 60 * 1000, priority: 'history' });
     const rows = Array.isArray(data) ? this.recordList(data) : this.recordList((data as Record<string, unknown>)['items']);
     this.closedTrades = rows.map((row) => ({
       positionId: Number(row['positionId'] ?? row['PositionId'] ?? row['PositionID'] ?? 0),
@@ -1043,6 +1048,7 @@ export class LiveDataProvider implements DataProvider {
       openTimestamp: String(row['openTimestamp'] ?? row['OpenTimestamp'] ?? '') || undefined,
       closeTimestamp: String(row['closeTimestamp'] ?? row['CloseTimestamp'] ?? '') || undefined,
       socialTradeId: Number(row['socialTradeId'] ?? row['SocialTradeId'] ?? 0) || undefined,
+      mirrorId: Number(row['mirrorId'] ?? row['MirrorId'] ?? row['mirrorID'] ?? row['MirrorID'] ?? 0) || undefined,
     }));
     return this.closedTrades;
   }
@@ -1104,23 +1110,25 @@ export class LiveDataProvider implements DataProvider {
       return { ok: false, message: 'Chiavi in sola lettura — abilita i permessi di scrittura in Impostazioni.' };
     }
     const body = {
-      InstrumentID: req.instrumentId,
-      IsBuy: req.isBuy,
-      Leverage: req.leverage ?? 1,
-      Amount: req.amount,
-      ...(req.stopLossRate != null ? { StopLossRate: req.stopLossRate } : {}),
-      ...(req.takeProfitRate != null ? { TakeProfitRate: req.takeProfitRate } : {}),
+      action: 'open',
+      transaction: req.isBuy ? 'buy' : 'sellShort',
+      instrumentId: req.instrumentId,
+      orderType: 'mkt',
+      leverage: req.leverage ?? 1,
+      amount: req.amount,
+      orderCurrency: 'usd',
+      ...(req.stopLossRate != null ? { stopLossRate: req.stopLossRate, stopLossType: 'fixed' } : {}),
+      ...(req.takeProfitRate != null ? { takeProfitRate: req.takeProfitRate } : {}),
     };
     try {
       const data = await this.api<Record<string, unknown>>(
-        `api/v1/trading/execution/${this.envPrefix()}market-open-orders/by-amount`.replace('//', '/'),
+        'api/v2/trading/execution/orders',
         { method: 'POST', body: JSON.stringify(body) },
       );
       this.log('success', `Ordine inviato a eToro: ${req.isBuy ? 'BUY' : 'SELL'} #${req.instrumentId} · $${req.amount}`);
       return {
         ok: true,
-        orderId: String(data['OrderID'] ?? data['TokenForReference'] ?? ''),
-        positionId: data['PositionID'] != null ? Number(data['PositionID']) : undefined,
+        orderId: String(data['orderId'] ?? data['OrderId'] ?? data['token'] ?? ''),
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

@@ -15,6 +15,7 @@ import { ConnectionSection } from '@/components/settings/ConnectionSection';
 import { ProxySection } from '@/components/settings/ProxySection';
 import { CsvImportSection } from '@/components/settings/CsvImportSection';
 import { ExternalDataSection } from '@/components/settings/ExternalDataSection';
+import { EtoroDataHubSection } from '@/components/settings/EtoroDataHubSection';
 import { PreferencesSection } from '@/components/settings/PreferencesSection';
 import { RiskSection } from '@/components/settings/RiskSection';
 
@@ -23,6 +24,7 @@ const NAV = [
   { id: 'proxy', label: 'Proxy CORS' },
   { id: 'import', label: 'Import CSV' },
   { id: 'dati-esterni', label: 'Dati esterni' },
+  { id: 'dati-etoro', label: 'Dati eToro' },
   { id: 'preferenze', label: 'Preferenze' },
   { id: 'rischio', label: 'Rischio e privacy' },
 ] as const;
@@ -137,6 +139,7 @@ export default function Settings() {
         <ProxySection />
         <CsvImportSection />
         <ExternalDataSection />
+        <EtoroDataHubSection />
         <PreferencesSection />
         <RiskSection />
       </motion.div>

@@ -42,6 +42,7 @@ export function CopyPortfolioTable({ portfolios, fmtMoney, fmtSignedMoney, onSel
     { key: 'activePnl', header: 'P&L attivo', align: 'right', sortValue: (p) => p.activeUnrealizedPnl, cell: (p) => <PnlValue value={p.activeUnrealizedPnl} format={fmtSignedMoney} /> },
     { key: 'closedPnl', header: 'P&L chiuso', align: 'right', sortValue: (p) => p.closedRealizedPnl, cell: (p) => <PnlValue value={p.closedRealizedPnl} format={fmtSignedMoney} /> },
     { key: 'totalPnl', header: 'P&L totale', align: 'right', sortValue: (p) => p.totalPnl, cell: (p) => <PnlValue value={p.totalPnl} format={fmtSignedMoney} /> },
+    { key: 'winRate', header: 'Operazioni +', align: 'right', sortValue: (p) => p.winRatePct ?? -1, cell: (p) => <span className={p.winRatePct == null ? 'text-text-2' : p.winRatePct >= 50 ? 'text-gain' : 'text-warn'}>{p.winRatePct == null ? 'N/D' : `${p.winRatePct.toFixed(1).replace('.', ',')}% · ${p.winningClosedTrades}/${p.closedTradesCount}`}</span> },
   ];
   return <DataTable columns={columns} rows={portfolios} rowKey={(p) => p.copyId} defaultSortKey="totalPnl" onRowClick={onSelect} emptyMessage="Nessun copy portfolio attivo." />;
 }
@@ -71,6 +72,7 @@ export function CopyPortfolioDrawer({ portfolio, onClose, fmtMoney, fmtSignedMon
                 <Metric label="P&L attivo" value={fmtSignedMoney(portfolio.activeUnrealizedPnl)} tone={portfolio.activeUnrealizedPnl >= 0 ? 'gain' : 'loss'} />
                 <Metric label="P&L chiuso" value={fmtSignedMoney(portfolio.closedRealizedPnl)} tone={portfolio.closedRealizedPnl >= 0 ? 'gain' : 'loss'} />
                 <Metric label="P&L totale" value={fmtSignedMoney(portfolio.totalPnl)} tone={portfolio.totalPnl >= 0 ? 'gain' : 'loss'} />
+                <Metric label="Operazioni positive" value={portfolio.winRatePct == null ? 'Non attribuibili' : `${portfolio.winRatePct.toFixed(1).replace('.', ',')}% · ${portfolio.winningClosedTrades}/${portfolio.closedTradesCount}`} tone={portfolio.winRatePct == null ? undefined : portfolio.winRatePct >= 50 ? 'gain' : 'loss'} />
                 <Metric label="Inizio copy" value={portfolio.startDate ? new Date(portfolio.startDate).toLocaleDateString('it-IT') : 'Non disponibile'} />
               </div>
               <div className="mt-5 flex items-center justify-between"><h3 className="text-body-strong text-text-0">Acquisti del copy</h3><span className="text-micro text-text-2">Aggiornati con eToro</span></div>

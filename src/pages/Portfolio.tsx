@@ -10,7 +10,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router';
 import { motion } from 'framer-motion';
-import { CalendarDays, Download, Loader2, ReceiptText, RefreshCw, X } from 'lucide-react';
+import { CalendarDays, Download, Landmark, Loader2, ReceiptText, RefreshCw, X } from 'lucide-react';
 import { Toaster, toast } from 'sonner';
 import { cn } from '@/lib/utils';
 import { useAppData } from '@/lib/data/store';
@@ -36,10 +36,11 @@ import { PositionDrawer } from '@/components/portfolio/PositionDrawer';
 import { SuggestionsCard } from '@/components/portfolio/SuggestionsCard';
 import { PnlHeatmap } from '@/components/portfolio/PnlHeatmap';
 import { CopyPortfolioDrawer, CopyPortfolioTable } from '@/components/portfolio/CopyPortfolioTable';
-import type { CopyPortfolio } from '@/lib/data/types';
+import type { ClosedTrade, CopyPortfolio } from '@/lib/data/types';
 import type { DividendRecord } from '@/lib/data/CsvImporter';
 import { fetchDeclaredDividends, loadDeclaredDividends } from '@/lib/data/DividendProvider';
 import type { DeclaredDividend } from '@/lib/data/DividendProvider';
+import { loadEtoroDataHubSnapshot } from '@/lib/data/EtoroDataHub';
 
 const PERIODS = [
   { key: '1M', days: 30 },
@@ -69,7 +70,7 @@ export default function Portfolio() {
   const {
     portfolio, pnl, fxRate, loading, status,
     displayCurrency, setDisplayCurrency, fromUsd,
-    sparkFor, agent, agentVersion, closePosition, settings,
+    sparkFor, agent, agentVersion, closePosition, getTradeHistory, settings,
   } = useAppData();
 
   const cur = displayCurrency;
@@ -85,15 +86,32 @@ export default function Portfolio() {
     } catch { return []; }
   });
   const [declaredDividends, setDeclaredDividends] = useState<DeclaredDividend[]>([]);
+  const [advancedSnapshot] = useState(() => loadEtoroDataHubSnapshot());
+  const [closedTrades, setClosedTrades] = useState<ClosedTrade[]>([]);
   const [dividendLoading, setDividendLoading] = useState(false);
   const [dividendError, setDividendError] = useState<string | null>(null);
   const instrumentFilterId = Number(searchParams.get('instrument') ?? 0);
   const copyFilterId = searchParams.get('copyId');
+  const cashDividendTransactions = useMemo(
+    () => advancedSnapshot?.cashTransactions.filter((transaction) => transaction.isPotentialDividend) ?? [],
+    [advancedSnapshot],
+  );
+  const cashDividendUsd = useMemo(
+    () => cashDividendTransactions.reduce((sum, transaction) => transaction.currency === 'USD' ? sum + transaction.amount : sum, 0),
+    [cashDividendTransactions],
+  );
 
   useEffect(() => {
     if (!copyFilterId || !portfolio?.copyPortfolios) return;
     setCopyDrawer(portfolio.copyPortfolios.find((copy) => copy.copyId === copyFilterId) ?? null);
   }, [copyFilterId, portfolio]);
+
+  useEffect(() => {
+    if (!(portfolio?.copyPortfolios?.length)) return;
+    let cancelled = false;
+    void getTradeHistory().then((items) => { if (!cancelled) setClosedTrades(items); }).catch(() => { /* tabella resta utilizzabile senza storico */ });
+    return () => { cancelled = true; };
+  }, [getTradeHistory, portfolio?.copyPortfolios?.length]);
 
   const fmt = (usd: number) => formatCurrency(fromUsd(usd), cur);
   const fmtSigned = (usd: number) => formatSignedCurrency(fromUsd(usd), cur);
@@ -103,6 +121,12 @@ export default function Portfolio() {
   /* ── Dati derivati ─────────────────────────────────────────────── */
   const rows = useMemo(() => (portfolio ? enrichPositions(portfolio) : []), [portfolio]);
   const lookThroughRows = useMemo(() => (portfolio ? enrichLookThroughPositions(portfolio) : []), [portfolio]);
+  const enrichedCopyPortfolios = useMemo(() => (portfolio?.copyPortfolios ?? []).map((copy) => {
+    const ids = new Set([Number(copy.copyId), copy.mirrorId, copy.parentCID].filter((value): value is number => Number.isFinite(value) && Number(value) > 0));
+    const related = closedTrades.filter((trade) => [trade.socialTradeId, trade.mirrorId].some((value) => value != null && ids.has(value)));
+    const winners = related.filter((trade) => trade.netProfit > 0).length;
+    return { ...copy, closedTradesCount: related.length, winningClosedTrades: winners, winRatePct: related.length ? winners / related.length * 100 : undefined };
+  }), [closedTrades, portfolio?.copyPortfolios]);
   const dividendSymbols = useMemo(
     () => lookThroughRows.filter((row) => row.assetClass === 'stock' || row.assetClass === 'etf').map((row) => row.symbol.toUpperCase()).sort(),
     [lookThroughRows],
@@ -465,7 +489,7 @@ export default function Portfolio() {
             </div>
             <div className="mt-2 flex items-center justify-between gap-2">
               <span className="text-caption text-text-2">
-                Dividendi YTD: <span className="text-text-1">{dividendsYtd.length > 0 ? fmt(dividendsYtdUsd) : 'non esposti dalla Public API'}</span>
+                Dividendi YTD: <span className="text-text-1">{dividendsYtd.length > 0 ? fmt(dividendsYtdUsd) : cashDividendTransactions.length > 0 ? `${fmt(cashDividendUsd)} cash API` : 'da riconciliare'}</span>
               </span>
               <span className="text-micro text-text-2">
                 {portfolio ? fmtWeight(portfolio.cash / Math.max(portfolio.totalValue, 0.01)) : ''} del totale
@@ -554,10 +578,10 @@ export default function Portfolio() {
         />
       </motion.div>
 
-      {portfolio?.copyPortfolios && portfolio.copyPortfolios.length > 0 && (
+      {enrichedCopyPortfolios.length > 0 && (
         <motion.div {...stagger(7)} className="card-surface density-pad col-span-12 p-5">
-          <div className="mb-3 flex items-center justify-between"><div><h2 className="text-title text-text-0">Copy trading e Copy Agent</h2><p className="text-caption text-text-2">Ogni riga apre il dettaglio delle posizioni acquistate dal copy.</p></div><span className="text-micro text-text-2">{portfolio.copyPortfolios.length} attivi</span></div>
-          <CopyPortfolioTable portfolios={portfolio.copyPortfolios} fmtMoney={fmt} fmtSignedMoney={fmtSigned} onSelect={setCopyDrawer} />
+          <div className="mb-3 flex items-center justify-between"><div><h2 className="text-title text-text-0">Copy trading e Copy Agent</h2><p className="text-caption text-text-2">P&amp;L aperto, chiuso e totale; lo storico attribuibile calcola anche la percentuale di operazioni positive.</p></div><span className="text-micro text-text-2">{enrichedCopyPortfolios.length} attivi</span></div>
+          <CopyPortfolioTable portfolios={enrichedCopyPortfolios} fmtMoney={fmt} fmtSignedMoney={fmtSigned} onSelect={setCopyDrawer} />
         </motion.div>
       )}
 
@@ -571,11 +595,15 @@ export default function Portfolio() {
           </div>
           <span className="rounded-full border border-warn/35 bg-warn/10 px-2.5 py-1 text-micro font-medium text-warn">Fonte parziale</span>
         </div>
-        <div className="mt-4 grid gap-3 md:grid-cols-2">
+        <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
           <div className="rounded-xl border border-hairline bg-bg-1 p-4">
             <div className="flex items-center gap-2 text-body-strong text-text-0"><ReceiptText className="h-4 w-4 text-gain" aria-hidden /> Dividendi ricevuti</div>
             {dividendsYtd.length > 0 ? <><div className="mt-2 font-display text-display-md text-gain">{fmt(dividendsYtdUsd)}</div><p className="text-micro text-text-2">{dividendsYtd.length} accrediti trovati nell’Account Statement · USD ed EUR convertiti nella valuta di visualizzazione{unsupportedDividendCurrencies.length > 0 ? ` · esclusi dal totale: ${unsupportedDividendCurrencies.join(', ')}` : ''}</p><div className="mt-3 space-y-1.5">{dividendsYtd.slice(0, 4).map((dividend) => <div key={dividend.id} className="flex items-center justify-between gap-3 text-caption"><span className="min-w-0 truncate text-text-1">{dividend.symbol ?? dividend.description}</span><span className="shrink-0 font-mono text-gain">{new Intl.NumberFormat('it-IT', { style: 'currency', currency: dividend.currency }).format(dividend.amount)}</span></div>)}</div></> : <p className="mt-2 text-caption leading-relaxed text-text-2">La Public API eToro documenta saldi e transazioni dei conti cash, ma non un registro dividendi del conto Trading. Il dato verificabile resta l’Account Statement.</p>}
             <Link to="/impostazioni#import" className="mt-3 inline-flex items-center text-caption font-medium text-info hover:text-text-0">Importa l’Account Statement →</Link>
+          </div>
+          <div className="rounded-xl border border-hairline bg-bg-1 p-4">
+            <div className="flex items-center gap-2 text-body-strong text-text-0"><Landmark className="h-4 w-4 text-agent" aria-hidden /> Movimenti cash eToro</div>
+            {cashDividendTransactions.length > 0 ? <><div className="mt-2 font-display text-display-md text-agent">{fmt(cashDividendUsd)}</div><p className="text-micro text-text-2">{cashDividendTransactions.length} movimenti classificati come dividendo/distribuzione dall’API Cash Transactions.</p><div className="mt-3 max-h-40 space-y-1.5 overflow-y-auto">{cashDividendTransactions.slice(0, 6).map((transaction) => <div key={transaction.id} className="flex items-center justify-between gap-2 text-caption"><span className="min-w-0 truncate text-text-1">{transaction.subtype || transaction.type}</span><span className="shrink-0 font-mono text-agent">{new Intl.NumberFormat('it-IT', { style: 'currency', currency: transaction.currency }).format(transaction.amount)}</span></div>)}</div></> : <><p className="mt-2 text-caption leading-relaxed text-text-2">Nessun movimento cash riconosciuto come dividendo nell’ultima sincronizzazione. Questo non prova che il conto Trading non ne abbia ricevuti.</p><Link to="/impostazioni#dati-etoro" className="mt-3 inline-flex text-caption font-medium text-agent hover:text-text-0">Sincronizza dati eToro →</Link></>}
           </div>
           <div className="rounded-xl border border-hairline bg-bg-1 p-4">
             <div className="flex flex-wrap items-center justify-between gap-2">

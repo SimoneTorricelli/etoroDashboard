@@ -111,6 +111,8 @@ export interface Portfolio {
 
 export interface CopyPortfolio {
   copyId: string;
+  /** Identificativo della relazione mirror usato anche nello storico operazioni. */
+  mirrorId?: number;
   name: string;
   parentCID?: number;
   parentUsername?: string;
@@ -131,6 +133,10 @@ export interface CopyPortfolio {
   closedRealizedPnl: number;
   /** activeUnrealizedPnl + closedRealizedPnl. */
   totalPnl: number;
+  /** Statistiche delle operazioni chiuse attribuibili al socialTradeId. */
+  closedTradesCount?: number;
+  winningClosedTrades?: number;
+  winRatePct?: number;
   startDate?: string;
   avatarUrl?: string;
   positions: Position[];
@@ -179,6 +185,7 @@ export interface ClosedTrade {
   openTimestamp?: string;
   closeTimestamp?: string;
   socialTradeId?: number;
+  mirrorId?: number;
 }
 
 export interface FxRate {

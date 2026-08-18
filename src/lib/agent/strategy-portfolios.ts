@@ -2,7 +2,7 @@ export type StrategyRisk = 'basso' | 'medio' | 'alto' | 'molto-alto';
 
 export type StrategyRebalance = 'giornaliero' | 'settimanale' | 'mensile';
 
-export type StrategyPortfolioStatus = 'bozza' | 'pronto' | 'simulato' | 'attivo' | 'in pausa';
+export type StrategyPortfolioStatus = 'bozza' | 'pronto' | 'simulato' | 'da inizializzare' | 'attivo' | 'in pausa';
 
 export interface StrategyAllocation {
   symbol: string;
@@ -48,6 +48,10 @@ export interface StrategyPortfolioConfig {
   virtualBalanceUsd?: number;
   tokenAvailable?: boolean;
   activatedAt?: number;
+  initializedAt?: number;
+  /** Ricevute non sensibili: servono a verificare eseguiti e residui dopo un refresh. */
+  initializationOrders?: StrategyOrderReceipt[];
+  lastInitializationCheckAt?: number;
   simulation?: {
     /** Versione del resolver e del modello di ribilanciamento usati. */
     modelVersion?: number;
@@ -75,6 +79,21 @@ export interface StrategyPortfolioConfig {
   };
   createdAt: number;
   updatedAt: number;
+}
+
+export type StrategyOrderReceiptStatus = 'accepted' | 'pending' | 'partially-filled' | 'filled' | 'rejected' | 'failed';
+
+export interface StrategyOrderReceipt {
+  symbol: string;
+  instrumentId: number;
+  requestedVirtualAmountUsd: number;
+  orderId?: number;
+  referenceId: string;
+  status: StrategyOrderReceiptStatus;
+  statusLabel: string;
+  filledVirtualAmountUsd: number;
+  positionIds: number[];
+  error?: string;
 }
 
 export interface StrategyValidation {
@@ -214,24 +233,112 @@ export function loadStrategyPortfolios(): StrategyPortfolioConfig[] {
     if (!Array.isArray(parsed)) return [];
     return (parsed as StrategyPortfolioConfig[]).map((portfolio) => {
       const simulation = portfolio.simulation;
-      if (!simulation) return portfolio;
+      const migratedPortfolio = portfolio.status === 'attivo' && portfolio.etoroAgentPortfolioId && !portfolio.initializedAt
+        ? { ...portfolio, status: 'da inizializzare' as const }
+        : portfolio;
+      if (!simulation) return migratedPortfolio;
       const migratedCurrent = simulation.modelVersion == null
         && simulation.observations >= 500
         && !(simulation.assets ?? []).some((asset) => asset.status === 'non-trovato');
       if (simulation.modelVersion === STRATEGY_SIMULATION_MODEL_VERSION || migratedCurrent) {
-        return { ...portfolio, simulation: { ...simulation, modelVersion: STRATEGY_SIMULATION_MODEL_VERSION } };
+        return { ...migratedPortfolio, simulation: { ...simulation, modelVersion: STRATEGY_SIMULATION_MODEL_VERSION } };
       }
       // Non mostrare esiti salvati con un resolver o un modello precedente:
       // un vecchio "strumento non trovato" non deve sopravvivere agli aggiornamenti.
       return {
-        ...portfolio,
-        status: portfolio.status === 'attivo' ? 'attivo' : 'pronto',
+        ...migratedPortfolio,
+        status: migratedPortfolio.status === 'attivo' || migratedPortfolio.status === 'da inizializzare' ? migratedPortfolio.status : 'pronto',
         simulation: undefined,
       };
     });
   } catch {
     return [];
   }
+}
+
+export interface StrategyOrderPlanItem {
+  symbol: string;
+  weightPct: number;
+  instrumentId: number;
+  /** Importo sul saldo virtuale dell'Agent Portfolio. */
+  virtualAmountUsd: number;
+  /** Impatto stimato sul capitale reale collegato dall'utente. */
+  mirrorAmountUsd: number;
+  chunks: number[];
+}
+
+export interface StrategyOrderPlan {
+  virtualBalanceUsd: number;
+  mirrorBudgetUsd: number;
+  scale: number;
+  cashReservePct: number;
+  virtualCashReserveUsd: number;
+  mirrorCashReserveUsd: number;
+  orders: StrategyOrderPlanItem[];
+  unresolvedSymbols: string[];
+  totalOrders: number;
+  generatedAt: number;
+}
+
+/**
+ * Costruisce un piano iniziale senza side effect. I limiti min/max configurati
+ * sono espressi sul capitale reale copiato e vengono scalati sul saldo virtuale
+ * dell'Agent Portfolio, come richiesto dal modello mirror di eToro.
+ */
+export function buildStrategyOrderPlan(
+  config: StrategyPortfolioConfig,
+  virtualBalanceUsd: number,
+  resolvedInstruments: Record<string, number>,
+): StrategyOrderPlan {
+  const template = getStrategyTemplate(config.templateId);
+  const mirrorBudgetUsd = Math.max(0, config.budgetUsd);
+  const safeVirtualBalance = Math.max(0, virtualBalanceUsd);
+  const scale = mirrorBudgetUsd > 0 ? safeVirtualBalance / mirrorBudgetUsd : 0;
+  const templateCashPct = template.allocations.find((allocation) => allocation.symbol === 'Cash')?.weightPct ?? 0;
+  const cashReservePct = Math.max(config.cashReservePct, templateCashPct);
+  const investablePct = Math.max(0, 100 - cashReservePct);
+  const investableAllocations = template.allocations.filter((allocation) => allocation.symbol !== 'Cash' && allocation.weightPct > 0);
+  const sourceWeight = investableAllocations.reduce((sum, allocation) => sum + allocation.weightPct, 0);
+  const unresolvedSymbols: string[] = [];
+  const orders = investableAllocations.flatMap<StrategyOrderPlanItem>((allocation) => {
+    const instrumentId = resolvedInstruments[allocation.symbol.toUpperCase()] ?? 0;
+    if (instrumentId <= 0 || sourceWeight <= 0 || scale <= 0) {
+      unresolvedSymbols.push(allocation.symbol);
+      return [];
+    }
+    const normalizedWeightPct = allocation.weightPct / sourceWeight * investablePct;
+    const mirrorAmountUsd = mirrorBudgetUsd * normalizedWeightPct / 100;
+    const virtualAmountUsd = mirrorAmountUsd * scale;
+    const virtualMin = config.minOrderUsd * scale;
+    const virtualMax = Math.max(virtualMin, config.maxOrderUsd * scale);
+    if (virtualAmountUsd + 0.005 < virtualMin) return [];
+    const chunkCount = Math.max(1, Math.ceil(virtualAmountUsd / virtualMax));
+    const chunk = Math.round(virtualAmountUsd / chunkCount * 100) / 100;
+    const chunks = Array.from({ length: chunkCount }, (_, index) => {
+      const assigned = chunk * (chunkCount - 1);
+      return index === chunkCount - 1 ? Math.round((virtualAmountUsd - assigned) * 100) / 100 : chunk;
+    }).filter((amount) => amount >= virtualMin - 0.01);
+    return [{
+      symbol: allocation.symbol,
+      weightPct: normalizedWeightPct,
+      instrumentId,
+      virtualAmountUsd: Math.round(virtualAmountUsd * 100) / 100,
+      mirrorAmountUsd: Math.round(mirrorAmountUsd * 100) / 100,
+      chunks,
+    }];
+  });
+  return {
+    virtualBalanceUsd: safeVirtualBalance,
+    mirrorBudgetUsd,
+    scale,
+    cashReservePct,
+    virtualCashReserveUsd: Math.round(safeVirtualBalance * cashReservePct) / 100,
+    mirrorCashReserveUsd: Math.round(mirrorBudgetUsd * cashReservePct) / 100,
+    orders,
+    unresolvedSymbols,
+    totalOrders: orders.reduce((sum, item) => sum + item.chunks.length, 0),
+    generatedAt: Date.now(),
+  };
 }
 
 export function saveStrategyPortfolios(portfolios: StrategyPortfolioConfig[]): void {

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { ChangeEvent, ReactNode } from 'react';
 import {
   Check, ChevronRight, CircleDollarSign, CloudDownload, ExternalLink, Info, Loader2,
-  LockKeyhole, Play, RefreshCw, ShieldCheck, SlidersHorizontal, Sparkles, Target, WalletCards,
+  KeyRound, ListChecks, LockKeyhole, Play, RefreshCw, Send, ShieldCheck, SlidersHorizontal, Sparkles, Target, WalletCards,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { Checkbox } from '@/components/ui/checkbox';
@@ -13,13 +13,16 @@ import { cn } from '@/lib/utils';
 import { hasLiveCredentials } from '@/lib/settings';
 import type { DisplayCurrency } from '@/lib/settings';
 import { useAppData } from '@/lib/data/store';
-import { createAgentPortfolio, listAgentPortfolios } from '@/lib/agent/etoro-agent-api';
-import type { RemoteAgentPortfolio } from '@/lib/agent/etoro-agent-api';
 import {
-  allocationPreview, createStrategyDraft, getStrategyTemplate, loadStrategyPortfolios, saveStrategyPortfolios,
+  clearAgentSessionToken, createAgentPortfolio, createAgentUserToken, executeAgentAllocationPlan, listAgentPortfolios,
+  loadAgentSessionToken, summarizeAgentOrderReceipts, validateAgentAllocationPlan, verifyAgentOrderExecutions,
+} from '@/lib/agent/etoro-agent-api';
+import type { AgentOrderExecutionResult, AgentPlanValidation, RemoteAgentPortfolio } from '@/lib/agent/etoro-agent-api';
+import {
+  allocationPreview, buildStrategyOrderPlan, createStrategyDraft, getStrategyTemplate, loadStrategyPortfolios, saveStrategyPortfolios,
   STRATEGY_SIMULATION_MODEL_VERSION, STRATEGY_TEMPLATES, validateStrategyPortfolio,
 } from '@/lib/agent/strategy-portfolios';
-import type { StrategyPortfolioConfig, StrategyTemplate } from '@/lib/agent/strategy-portfolios';
+import type { StrategyOrderPlan, StrategyPortfolioConfig, StrategyTemplate } from '@/lib/agent/strategy-portfolios';
 import { logReturnStats, projectPercentiles } from '@/lib/finance/scenario';
 
 const riskLabel: Record<StrategyTemplate['risk'], string> = {
@@ -41,6 +44,7 @@ const statusClasses: Record<StrategyPortfolioConfig['status'], string> = {
   bozza: 'bg-bg-2 text-text-2',
   pronto: 'bg-info/10 text-info',
   simulato: 'bg-agent/10 text-agent',
+  'da inizializzare': 'bg-warn/10 text-warn',
   attivo: 'bg-gain/10 text-gain',
   'in pausa': 'bg-warn/10 text-warn',
 };
@@ -150,6 +154,18 @@ export function StrategyPortfolioStudio({
   const [remoteLoading, setRemoteLoading] = useState(false);
   const [remoteChecked, setRemoteChecked] = useState(false);
   const [simulatingId, setSimulatingId] = useState<string | null>(null);
+  const [planningId, setPlanningId] = useState<string | null>(null);
+  const [planPortfolio, setPlanPortfolio] = useState<StrategyPortfolioConfig | null>(null);
+  const [orderPlan, setOrderPlan] = useState<StrategyOrderPlan | null>(null);
+  const [ackToken, setAckToken] = useState(false);
+  const [ackOrders, setAckOrders] = useState(false);
+  const [tokenBusy, setTokenBusy] = useState(false);
+  const [executingId, setExecutingId] = useState<string | null>(null);
+  const [validatingPlan, setValidatingPlan] = useState(false);
+  const [checkingOrders, setCheckingOrders] = useState(false);
+  const [planValidation, setPlanValidation] = useState<AgentPlanValidation | null>(null);
+  const [executionResult, setExecutionResult] = useState<AgentOrderExecutionResult | null>(null);
+  const [remoteBindings, setRemoteBindings] = useState<Record<string, string>>({});
 
   useEffect(() => saveStrategyPortfolios(portfolios), [portfolios]);
 
@@ -189,6 +205,15 @@ export function StrategyPortfolioStudio({
     try {
       const result = await listAgentPortfolios(settings.live);
       setRemote(result);
+      setPortfolios((current) => current.map((portfolio) => {
+        if (!portfolio.etoroAgentPortfolioId) return portfolio;
+        const match = result.find((item) => item.id === portfolio.etoroAgentPortfolioId);
+        return match ? {
+          ...portfolio,
+          virtualBalanceUsd: match.virtualBalanceUsd ?? portfolio.virtualBalanceUsd,
+          tokenAvailable: match.tokenAvailable || portfolio.tokenAvailable,
+        } : portfolio;
+      }));
       setRemoteChecked(true);
       if (showFeedback) toast.success(`${result.length} Agent Portfolio trovati su eToro`);
     } catch (error) {
@@ -300,7 +325,7 @@ export function StrategyPortfolioStudio({
       const created = await createAgentPortfolio(settings.live, confirming);
       setPortfolios((current) => current.map((item) => item.id === confirming.id ? {
         ...item,
-        status: 'attivo',
+        status: 'da inizializzare',
         etoroAgentPortfolioId: created.id,
         mirrorId: created.mirrorId,
         virtualBalanceUsd: created.virtualBalanceUsd,
@@ -313,13 +338,180 @@ export function StrategyPortfolioStudio({
       setConfirming(null);
       setAckReal(false);
       toast.success(`${confirming.name} creato su eToro`, {
-        description: 'Budget reale collegato. Il token è stato ricevuto ma non viene salvato nel browser.',
+        description: 'Budget collegato. Nessun asset è ancora stato acquistato: ora prepara e conferma il piano iniziale.',
       });
     } catch (error) {
       toast.error('Creazione Agent Portfolio non riuscita', { description: error instanceof Error ? error.message : 'Errore del proxy o di eToro' });
     } finally {
       setCreatingId(null);
     }
+  };
+
+  const prepareInitialPlan = async (portfolio: StrategyPortfolioConfig) => {
+    const template = getStrategyTemplate(portfolio.templateId);
+    const remoteMatch = remote.find((item) => item.id === portfolio.etoroAgentPortfolioId);
+    const virtualBalanceUsd = portfolio.virtualBalanceUsd ?? remoteMatch?.virtualBalanceUsd ?? 0;
+    if (!(virtualBalanceUsd > 0)) {
+      toast.error('Saldo virtuale Agent non disponibile', { description: 'Premi “Leggi da eToro” e riprova.' });
+      return;
+    }
+    setPlanningId(portfolio.id);
+    try {
+      const symbols = template.allocations.filter((allocation) => allocation.symbol !== 'Cash').map((allocation) => allocation.symbol);
+      const resolvedEntries = await Promise.all(symbols.map(async (symbol) => {
+        const local = instruments.find((item) => item.symbol.toUpperCase() === symbol.toUpperCase());
+        const candidates = local ? [local] : await searchInstruments(symbol);
+        const exact = candidates.find((item) => item.symbol.toUpperCase() === symbol.toUpperCase());
+        return [symbol.toUpperCase(), exact?.instrumentId ?? 0] as const;
+      }));
+      const plan = buildStrategyOrderPlan(portfolio, virtualBalanceUsd, Object.fromEntries(resolvedEntries));
+      setPlanPortfolio(portfolio);
+      setOrderPlan(plan);
+      setPlanValidation(null);
+      setExecutionResult(portfolio.initializationOrders?.length
+        ? summarizeAgentOrderReceipts(portfolio.initializationOrders, plan.scale)
+        : null);
+      setAckToken(false);
+      setAckOrders(false);
+      const token = loadAgentSessionToken(portfolio.etoroAgentPortfolioId ?? '');
+      if (token && !portfolio.initializationOrders?.length && plan.orders.length > 0) {
+        setValidatingPlan(true);
+        try {
+          setPlanValidation(await validateAgentAllocationPlan(settings.live, plan, token));
+        } catch (error) {
+          toast.error('Controllo pre-ordine non disponibile', { description: error instanceof Error ? error.message : 'Verifica eToro non riuscita.' });
+        } finally {
+          setValidatingPlan(false);
+        }
+      }
+    } catch (error) {
+      toast.error('Piano iniziale non disponibile', { description: error instanceof Error ? error.message : 'Impossibile risolvere gli strumenti.' });
+    } finally {
+      setPlanningId(null);
+    }
+  };
+
+  const generateSessionToken = async () => {
+    if (!planPortfolio?.etoroAgentPortfolioId || !orderPlan || !ackToken || tokenBusy) return;
+    setTokenBusy(true);
+    try {
+      const token = await createAgentUserToken(settings.live, planPortfolio.etoroAgentPortfolioId, `${planPortfolio.name}-torino`);
+      setPortfolios((current) => current.map((item) => item.id === planPortfolio.id ? { ...item, tokenAvailable: true, updatedAt: Date.now() } : item));
+      setPlanPortfolio((current) => current ? { ...current, tokenAvailable: true } : current);
+      setAckToken(false);
+      setValidatingPlan(true);
+      toast.success('Token operativo creato', { description: 'È custodito solo nella sessione di questa scheda.' });
+      try {
+        const validation = await validateAgentAllocationPlan(settings.live, orderPlan, token);
+        setPlanValidation(validation);
+        if (!validation.ok) toast.error('Il piano ha controlli bloccanti', { description: validation.blockingIssues[0] });
+      } catch (error) {
+        setPlanValidation(null);
+        toast.error('Token creato, controllo pre-ordine non disponibile', { description: error instanceof Error ? error.message : 'Verifica eToro non riuscita.' });
+      }
+    } catch (error) {
+      toast.error('Token Agent non creato', { description: error instanceof Error ? error.message : 'Errore eToro.' });
+    } finally {
+      setValidatingPlan(false);
+      setTokenBusy(false);
+    }
+  };
+
+  const checkCurrentPlan = async () => {
+    if (!planPortfolio?.etoroAgentPortfolioId || !orderPlan || validatingPlan) return;
+    const token = loadAgentSessionToken(planPortfolio.etoroAgentPortfolioId);
+    if (!token) return;
+    setValidatingPlan(true);
+    setAckOrders(false);
+    try {
+      const validation = await validateAgentAllocationPlan(settings.live, orderPlan, token);
+      setPlanValidation(validation);
+      if (validation.ok) toast.success('Piano verificato', { description: 'Strumenti negoziabili e importi sopra i minimi eToro.' });
+      else toast.error('Piano non inviabile', { description: validation.blockingIssues[0] });
+    } catch (error) {
+      setPlanValidation(null);
+      toast.error('Controllo pre-ordine non disponibile', { description: error instanceof Error ? error.message : 'Verifica eToro non riuscita.' });
+    } finally {
+      setValidatingPlan(false);
+    }
+  };
+
+  const persistExecutionResult = (portfolio: StrategyPortfolioConfig, result: AgentOrderExecutionResult) => {
+    const checkedAt = Date.now();
+    setExecutionResult(result);
+    setPortfolios((current) => current.map((item) => item.id === portfolio.id ? {
+      ...item,
+      status: result.ok ? 'attivo' : 'da inizializzare',
+      initializedAt: result.ok ? (item.initializedAt ?? checkedAt) : item.initializedAt,
+      initializationOrders: result.receipts,
+      lastInitializationCheckAt: checkedAt,
+      updatedAt: checkedAt,
+    } : item));
+    setPlanPortfolio((current) => current?.id === portfolio.id ? {
+      ...current,
+      status: result.ok ? 'attivo' : 'da inizializzare',
+      initializedAt: result.ok ? (current.initializedAt ?? checkedAt) : current.initializedAt,
+      initializationOrders: result.receipts,
+      lastInitializationCheckAt: checkedAt,
+    } : current);
+  };
+
+  const executeInitialPlan = async () => {
+    if (!planPortfolio?.etoroAgentPortfolioId || !orderPlan || !ackOrders || executingId) return;
+    const token = loadAgentSessionToken(planPortfolio.etoroAgentPortfolioId);
+    if (!token) {
+      toast.error('Token operativo non disponibile in questa sessione');
+      return;
+    }
+    setExecutingId(planPortfolio.id);
+    try {
+      const result = await executeAgentAllocationPlan(settings.live, orderPlan, token, planPortfolio.maxOrdersPerDay);
+      persistExecutionResult(planPortfolio, result);
+      setAckOrders(false);
+      if (result.ok) toast.success('Allocazione iniziale eseguita', { description: `${result.filled} ordini verificati come eseguiti da eToro.` });
+      else if (result.pending > 0) toast.warning('Ordini accettati, esecuzione da verificare', { description: `${result.filled} eseguiti · ${result.partial} parziali · ${result.pending} in attesa · ${result.failed} non riusciti.` });
+      else toast.error('Allocazione iniziale incompleta', { description: `${result.filled} eseguiti · ${result.partial} parziali · ${result.failed} non riusciti · residuo stimato ${money(result.residualMirrorUsd, 'USD')}.` });
+    } catch (error) {
+      toast.error('Allocazione iniziale incompleta', { description: error instanceof Error ? error.message : 'Controlla gli ordini su eToro.' });
+    } finally {
+      setExecutingId(null);
+    }
+  };
+
+  const checkExecutionStatus = async () => {
+    if (!planPortfolio?.etoroAgentPortfolioId || !orderPlan || !executionResult || checkingOrders) return;
+    const token = loadAgentSessionToken(planPortfolio.etoroAgentPortfolioId);
+    if (!token) {
+      toast.error('Token operativo non disponibile in questa sessione');
+      return;
+    }
+    setCheckingOrders(true);
+    try {
+      const result = await verifyAgentOrderExecutions(settings.live, executionResult.receipts, token, orderPlan.scale);
+      persistExecutionResult(planPortfolio, result);
+      if (result.ok) toast.success('Tutti gli acquisti risultano eseguiti');
+      else toast.info('Stato ordini aggiornato', { description: `${result.filled} eseguiti · ${result.partial} parziali · ${result.pending} in attesa · ${result.failed} non riusciti.` });
+    } catch (error) {
+      toast.error('Verifica ordini non riuscita', { description: error instanceof Error ? error.message : 'Errore eToro.' });
+    } finally {
+      setCheckingOrders(false);
+    }
+  };
+
+  const bindRemotePortfolio = (remotePortfolio: RemoteAgentPortfolio) => {
+    const localId = remoteBindings[remotePortfolio.id];
+    if (!localId) return;
+    setPortfolios((current) => current.map((item) => item.id === localId ? {
+      ...item,
+      status: 'da inizializzare',
+      etoroAgentPortfolioId: remotePortfolio.id,
+      mirrorId: remotePortfolio.mirrorId,
+      virtualBalanceUsd: remotePortfolio.virtualBalanceUsd,
+      tokenAvailable: remotePortfolio.tokenAvailable,
+      activatedAt: item.activatedAt ?? Date.now(),
+      updatedAt: Date.now(),
+    } : item));
+    toast.success(`${remotePortfolio.name} associato alla strategia locale`, { description: 'L’associazione è locale e non invia ordini.' });
   };
 
   const draftPreview = useMemo(() => editing ? allocationPreview(editing) : null, [editing]);
@@ -403,7 +595,9 @@ export function StrategyPortfolioStudio({
                     <div>
                       <div className="flex items-center gap-2">
                         <h4 className="text-body-strong text-text-0">{portfolio.name}</h4>
-                        <span className={cn('rounded-full px-2 py-0.5 text-micro', statusClasses[portfolio.status])}>{portfolio.status}</span>
+                        <span className={cn('max-w-[280px] rounded-full px-2 py-0.5 text-micro', statusClasses[portfolio.status])}>
+                          {portfolio.status === 'da inizializzare' ? 'Creato · capitale allocato · in attesa di inizializzazione' : portfolio.status}
+                        </span>
                       </div>
                       <p className="mt-1 text-caption text-text-2">{template.name} · {template.tagline}</p>
                     </div>
@@ -423,8 +617,8 @@ export function StrategyPortfolioStudio({
                   <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-hairline pt-3">
                     <span className="flex items-center gap-1.5 text-micro text-text-2"><Target className="h-3.5 w-3.5 text-agent" aria-hidden /> Fino a {preview.affordablePositions} posizioni finanziabili ai minimi impostati</span>
                     <div className="flex gap-2">
-                      {portfolio.status !== 'attivo' ? <button type="button" onClick={() => void simulateStrategy(portfolio)} disabled={simulatingId === portfolio.id} className="flex items-center gap-1.5 rounded-lg border border-agent/40 px-2.5 py-1.5 text-micro text-agent hover:bg-agent/10 disabled:opacity-50">{simulatingId === portfolio.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Play className="h-3.5 w-3.5" aria-hidden />} Simula</button> : null}
-                      {portfolio.status !== 'attivo' && (
+                      {portfolio.status !== 'attivo' && portfolio.status !== 'da inizializzare' ? <button type="button" onClick={() => void simulateStrategy(portfolio)} disabled={simulatingId === portfolio.id} className="flex items-center gap-1.5 rounded-lg border border-agent/40 px-2.5 py-1.5 text-micro text-agent hover:bg-agent/10 disabled:opacity-50">{simulatingId === portfolio.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Play className="h-3.5 w-3.5" aria-hidden />} Simula</button> : null}
+                      {portfolio.status !== 'attivo' && portfolio.status !== 'da inizializzare' && (
                         <button
                           type="button"
                           onClick={() => openEditor(portfolio.templateId)}
@@ -433,7 +627,17 @@ export function StrategyPortfolioStudio({
                           Modifica limiti
                         </button>
                       )}
-                      {portfolio.status !== 'attivo' ? (
+                      {portfolio.status === 'da inizializzare' ? (
+                        <button
+                          type="button"
+                          onClick={() => void prepareInitialPlan(portfolio)}
+                          disabled={planningId === portfolio.id}
+                          className="flex items-center gap-1.5 rounded-lg bg-warn px-2.5 py-1.5 text-micro font-medium text-bg-0 transition-colors hover:bg-warn/90 disabled:opacity-50"
+                        >
+                          {planningId === portfolio.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <ListChecks className="h-3.5 w-3.5" aria-hidden />}
+                          Prepara acquisti
+                        </button>
+                      ) : portfolio.status !== 'attivo' ? (
                         <button
                           type="button"
                           onClick={() => { if (portfolio.status === 'simulato' && portfolio.simulation && portfolio.simulation.coveragePct >= 80) { setAckReal(false); setConfirming(portfolio); } }}
@@ -443,7 +647,7 @@ export function StrategyPortfolioStudio({
                           <Play className="h-3.5 w-3.5" aria-hidden /> {portfolio.status === 'simulato' && (portfolio.simulation?.coveragePct ?? 0) >= 80 ? 'Attiva su eToro' : portfolio.simulation ? 'Copertura insufficiente' : 'Simula prima'}
                         </button>
                       ) : (
-                        <span className="flex items-center gap-1.5 rounded-lg bg-gain/10 px-2.5 py-1.5 text-micro text-gain"><Check className="h-3.5 w-3.5" aria-hidden /> Collegato</span>
+                        <span className="flex items-center gap-1.5 rounded-lg bg-gain/10 px-2.5 py-1.5 text-micro text-gain"><Check className="h-3.5 w-3.5" aria-hidden /> Investito · esecuzioni verificate</span>
                       )}
                     </div>
                   </div>
@@ -470,9 +674,9 @@ export function StrategyPortfolioStudio({
           ) : (
             <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
               {remote.map((item) => (
-                <div key={item.id} className="flex items-center justify-between gap-3 rounded-lg border border-hairline bg-bg-1 px-3 py-3">
-                  <div className="min-w-0"><p className="truncate text-caption font-medium text-text-0">{item.name}</p><p className="font-mono text-micro text-text-2">ID {item.id}</p></div>
-                  <span className="shrink-0 rounded-full bg-gain/10 px-2 py-1 text-micro text-gain">Collegato</span>
+                <div key={item.id} className="rounded-lg border border-hairline bg-bg-1 px-3 py-3">
+                  <div className="flex items-start justify-between gap-3"><div className="min-w-0"><p className="truncate text-caption font-medium text-text-0">{item.name}</p><p className="truncate font-mono text-micro text-text-2">ID {item.id}</p>{item.virtualBalanceUsd ? <p className="mt-1 text-micro text-text-2">Saldo virtuale {money(item.virtualBalanceUsd, 'USD')}</p> : null}{item.createdAt ? <p className="mt-1 text-micro text-text-2">Creato {new Date(item.createdAt).toLocaleString('it-IT')}</p> : null}</div><span className="shrink-0 rounded-full bg-gain/10 px-2 py-1 text-micro text-gain">Su eToro</span></div>
+                  {portfolios.some((portfolio) => portfolio.etoroAgentPortfolioId === item.id) ? <p className="mt-2 flex items-center gap-1.5 text-micro text-gain"><Check className="h-3.5 w-3.5" aria-hidden /> Associato a Torino</p> : <div className="mt-3 flex gap-2"><select aria-label={`Strategia locale da associare a ${item.name}`} value={remoteBindings[item.id] ?? ''} onChange={(event) => setRemoteBindings((current) => ({ ...current, [item.id]: event.target.value }))} className="min-w-0 flex-1 rounded-md border border-hairline-strong bg-bg-0 px-2 py-1.5 text-micro text-text-1"><option value="">Associa a…</option>{portfolios.filter((portfolio) => !portfolio.etoroAgentPortfolioId).map((portfolio) => <option key={portfolio.id} value={portfolio.id}>{portfolio.name} · {getStrategyTemplate(portfolio.templateId).name}</option>)}</select><button type="button" disabled={!remoteBindings[item.id]} onClick={() => bindRemotePortfolio(item)} className="rounded-md border border-agent/40 px-2 py-1.5 text-micro font-medium text-agent hover:bg-agent/10 disabled:opacity-40">Collega</button></div>}
                 </div>
               ))}
             </div>
@@ -554,6 +758,73 @@ export function StrategyPortfolioStudio({
               <button type="button" disabled={!realExecutionActive || !ackReal || Boolean(creatingId)} onClick={() => void activateRemote()} className="flex items-center gap-2 rounded-lg bg-loss px-4 py-2 text-body-strong text-bg-0 transition-colors hover:bg-loss/90 disabled:cursor-not-allowed disabled:opacity-40">
                 {creatingId ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <ExternalLink className="h-4 w-4" aria-hidden />} Crea portafoglio reale
               </button>
+            </DialogFooter>
+          </>}
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={Boolean(planPortfolio && orderPlan)} onOpenChange={(open) => { if (!open && !executingId && !tokenBusy && !checkingOrders) { setPlanPortfolio(null); setOrderPlan(null); setPlanValidation(null); setExecutionResult(null); setAckOrders(false); setAckToken(false); } }}>
+        <DialogContent className="max-h-[92vh] overflow-y-auto sm:max-w-[720px]">
+          {planPortfolio && orderPlan && <>
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2"><ListChecks className="h-5 w-5 text-warn" aria-hidden /> Allocazione iniziale · {planPortfolio.name}</DialogTitle>
+              <DialogDescription>Anteprima reale degli acquisti. Aprire l’Agent Portfolio ha allocato il capitale, ma fino a questa conferma non compra alcun asset.</DialogDescription>
+            </DialogHeader>
+            <div className="grid gap-2 sm:grid-cols-4">
+              <Metric label="Capitale collegato" value={money(fromUsd(orderPlan.mirrorBudgetUsd), displayCurrency)} />
+              <Metric label="Saldo virtuale Agent" value={money(orderPlan.virtualBalanceUsd, 'USD')} />
+              <Metric label="Scala mirror" value={`${orderPlan.scale.toLocaleString('it-IT', { maximumFractionDigits: 1 })}×`} />
+              <Metric label="Liquidità prevista" value={`${orderPlan.cashReservePct}%`} />
+            </div>
+            <div className="overflow-x-auto rounded-xl border border-hairline bg-bg-1">
+              <div className="grid min-w-[640px] grid-cols-[1.1fr_auto_auto_1fr] gap-3 border-b border-hairline px-3 py-2 text-micro uppercase tracking-wide text-text-2"><span>Asset / peso</span><span>Impatto reale</span><span>Ordini virtuali</span><span>Controllo eToro</span></div>
+              {orderPlan.orders.map((item) => {
+                const check = planValidation?.checks.find((candidate) => candidate.instrumentId === item.instrumentId);
+                return (
+                  <div key={item.symbol} className="grid min-w-[640px] grid-cols-[1.1fr_auto_auto_1fr] items-center gap-3 border-b border-hairline px-3 py-3 last:border-b-0">
+                    <div><p className="font-mono text-caption font-medium text-text-0">{item.symbol} · {item.weightPct.toFixed(1).replace('.', ',')}%</p><p className="text-micro text-text-2">Instrument ID {item.instrumentId}</p></div>
+                    <span className="font-mono text-caption text-text-0">{money(fromUsd(item.mirrorAmountUsd), displayCurrency)}</span>
+                    <span className="text-right font-mono text-caption text-agent">{item.chunks.length} · {money(item.virtualAmountUsd, 'USD')}</span>
+                    <div className={cn('text-micro', !check ? 'text-text-2' : check.eligible ? 'text-gain' : 'text-loss')}>
+                      {validatingPlan && !check ? 'Verifica…' : check ? check.detail : 'Da verificare'}
+                      {check && check.minPositionExposureUsd > 0 ? <span className="block text-text-2">Minimo {money(check.minPositionExposureUsd, 'USD')}</span> : null}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            {orderPlan.unresolvedSymbols.length > 0 && <div className="rounded-lg border border-loss/35 bg-loss/5 p-3 text-caption text-loss">Strumenti non risolti: {orderPlan.unresolvedSymbols.join(', ')}. Nessun ordine può essere inviato finché il piano non è completo.</div>}
+            {orderPlan.totalOrders > planPortfolio.maxOrdersPerDay && <div className="rounded-lg border border-warn/35 bg-warn/5 p-3 text-caption text-warn">Il piano richiede {orderPlan.totalOrders} ordini, ma il limite giornaliero è {planPortfolio.maxOrdersPerDay}. Aumenta il limite o il massimo per singola entrata prima di procedere.</div>}
+            <div className="rounded-xl border border-info/25 bg-info/5 p-3 text-caption text-text-1">
+              <p className="font-medium text-info">Perché gli importi virtuali sono grandi?</p>
+              <p className="mt-1 leading-relaxed">eToro assegna all’Agent un saldo virtuale fisso. Il tuo investimento reale lo copia in proporzione: per esempio, un acquisto virtuale del 25% produce circa il 25% anche sui {money(fromUsd(planPortfolio.budgetUsd), displayCurrency)} collegati.</p>
+            </div>
+            {!loadAgentSessionToken(planPortfolio.etoroAgentPortfolioId ?? '') ? (
+              <div className="space-y-2 rounded-xl border border-warn/30 bg-warn/5 p-3">
+                <div className="flex items-start gap-2"><KeyRound className="mt-0.5 h-4 w-4 shrink-0 text-warn" aria-hidden /><div><p className="text-caption font-medium text-text-0">Serve un nuovo token operativo</p><p className="text-micro text-text-2">Quello restituito alla creazione precedente non è recuperabile. Il nuovo segreto resterà solo in questa sessione e non finirà in localStorage.</p></div></div>
+                <label className="flex cursor-pointer items-start gap-2 text-caption text-text-1"><Checkbox checked={ackToken} onCheckedChange={(value) => setAckToken(value === true)} /><span>Autorizzo la creazione di un token Agent con lettura e scrittura reali.</span></label>
+                <button type="button" onClick={() => void generateSessionToken()} disabled={!ackToken || tokenBusy} className="inline-flex items-center gap-2 rounded-lg border border-warn/50 px-3 py-2 text-caption font-medium text-warn hover:bg-warn/10 disabled:opacity-40">{tokenBusy ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <KeyRound className="h-4 w-4" aria-hidden />} Genera token per questa sessione</button>
+              </div>
+            ) : <div className="space-y-2 rounded-xl border border-gain/25 bg-gain/5 p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-start gap-2"><ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-gain" aria-hidden /><div><p className="text-caption font-medium text-text-0">Token del {planPortfolio.name} pronto in questa scheda</p><p className="text-micro text-text-2">Non viene esportato né salvato permanentemente. Lo stesso token verrà riutilizzato per verifiche e futuri ribilanciamenti durante questa sessione.</p></div></div>
+                <div className="flex shrink-0 gap-1.5">{!executionResult ? <button type="button" onClick={() => void checkCurrentPlan()} disabled={validatingPlan} className="inline-flex items-center gap-1.5 rounded-lg border border-gain/40 px-2.5 py-1.5 text-micro text-gain hover:bg-gain/10 disabled:opacity-50">{validatingPlan ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <RefreshCw className="h-3.5 w-3.5" aria-hidden />} Controlla minimi e mercati</button> : null}<button type="button" onClick={() => { clearAgentSessionToken(planPortfolio.etoroAgentPortfolioId ?? ''); setPlanValidation(null); setAckOrders(false); setPlanPortfolio((current) => current ? { ...current } : current); toast.success('Token rimosso da questa sessione'); }} disabled={Boolean(executingId) || checkingOrders} className="rounded-lg border border-hairline-strong px-2.5 py-1.5 text-micro text-text-2 hover:bg-bg-2 hover:text-text-0 disabled:opacity-40">Dimentica token</button></div>
+              </div>
+              {planValidation ? <div className={cn('rounded-lg px-2.5 py-2 text-micro', planValidation.ok ? 'bg-gain/10 text-gain' : 'bg-loss/10 text-loss')}>{planValidation.ok ? 'Piano verificato: strumenti negoziabili e importi sopra i minimi eToro.' : planValidation.blockingIssues.join(' · ')}</div> : null}
+            </div>}
+            {loadAgentSessionToken(planPortfolio.etoroAgentPortfolioId ?? '') && !executionResult && planValidation?.ok ? (
+              <label className="flex cursor-pointer items-start gap-2.5 rounded-xl border border-loss/40 bg-loss/5 p-3"><Checkbox checked={ackOrders} onCheckedChange={(value) => setAckOrders(value === true)} className="mt-0.5" /><span className="text-caption text-text-0">Ho verificato strumenti, pesi, minimi e importi. Confermo separatamente l’invio di {orderPlan.totalOrders} ordini REALI attraverso l’Agent Portfolio.</span></label>
+            ) : null}
+            {executionResult ? <div className="space-y-3 rounded-xl border border-hairline bg-bg-1 p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2"><div><p className="text-caption font-medium text-text-0">Esito inizializzazione</p><p className="text-micro text-text-2">{executionResult.filled} eseguiti · {executionResult.partial} parziali · {executionResult.pending} in attesa · {executionResult.failed} non riusciti · residuo reale stimato {money(fromUsd(executionResult.residualMirrorUsd), displayCurrency)}</p></div><button type="button" onClick={() => void checkExecutionStatus()} disabled={checkingOrders || executionResult.ok} className="inline-flex items-center gap-1.5 rounded-lg border border-info/40 px-2.5 py-1.5 text-micro text-info hover:bg-info/10 disabled:opacity-40">{checkingOrders ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <RefreshCw className="h-3.5 w-3.5" aria-hidden />} Ricontrolla esecuzioni</button></div>
+              <div className="divide-y divide-hairline rounded-lg border border-hairline bg-bg-0">
+                {executionResult.receipts.map((receipt, index) => <div key={`${receipt.referenceId}-${index}`} className="grid gap-1 px-3 py-2 text-micro sm:grid-cols-[1fr_auto]"><div><span className="font-mono font-medium text-text-0">{receipt.symbol}</span><span className="ml-2 text-text-2">{receipt.orderId ? `Ordine #${receipt.orderId}` : receipt.statusLabel}</span>{receipt.error ? <p className="mt-0.5 text-loss">{receipt.error}</p> : null}</div><div className={cn('font-mono', receipt.status === 'filled' ? 'text-gain' : receipt.status === 'pending' || receipt.status === 'accepted' || receipt.status === 'partially-filled' ? 'text-warn' : 'text-loss')}>{money(receipt.filledVirtualAmountUsd, 'USD')} / {money(receipt.requestedVirtualAmountUsd, 'USD')} · {receipt.statusLabel}</div></div>)}
+              </div>
+              {executionResult.ok ? <p className="flex items-center gap-1.5 text-caption text-gain"><Check className="h-4 w-4" aria-hidden /> Inizializzazione completata: il portafoglio è ora attivo.</p> : <p className="text-micro text-warn">Il portafoglio resta “in attesa di inizializzazione”. Non vengono reinviati automaticamente gli ordini residui: prima controlla l’esito su eToro.</p>}
+            </div> : null}
+            <DialogFooter>
+              <button type="button" disabled={Boolean(executingId) || tokenBusy || checkingOrders} onClick={() => { setPlanPortfolio(null); setOrderPlan(null); setPlanValidation(null); setExecutionResult(null); }} className="rounded-lg border border-hairline-strong px-4 py-2 text-body-strong text-text-1 hover:bg-bg-2">{executionResult ? 'Chiudi' : 'Chiudi senza comprare'}</button>
+              {!executionResult ? <button type="button" onClick={() => void executeInitialPlan()} disabled={!realExecutionActive || !ackOrders || !planValidation?.ok || !loadAgentSessionToken(planPortfolio.etoroAgentPortfolioId ?? '') || orderPlan.unresolvedSymbols.length > 0 || orderPlan.totalOrders === 0 || orderPlan.totalOrders > planPortfolio.maxOrdersPerDay || Boolean(executingId)} className="inline-flex items-center gap-2 rounded-lg bg-loss px-4 py-2 text-body-strong text-bg-0 hover:bg-loss/90 disabled:cursor-not-allowed disabled:opacity-40">{executingId ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Send className="h-4 w-4" aria-hidden />} Conferma e invia acquisti</button> : null}
             </DialogFooter>
           </>}
         </DialogContent>
