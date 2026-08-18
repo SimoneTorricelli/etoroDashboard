@@ -24,6 +24,7 @@ export interface ConversionQuote {
 
 /** USD → EUR: divide per il tasso e applica il costo in pips. */
 export function convertUsdToEur(usd: number, rate: number, pips = DEFAULT_CONVERSION_PIPS): ConversionQuote {
+  if (!Number.isFinite(usd) || !Number.isFinite(rate) || rate <= 0) return { grossAmount: Number.NaN, fee: Number.NaN, netAmount: Number.NaN, effectiveRate: Number.NaN };
   const effectiveRate = rate + pips * PIP_SIZE; // tasso peggiore per chi compra EUR
   const netAmount = usd / effectiveRate;
   const grossAmount = usd / rate;
@@ -32,6 +33,7 @@ export function convertUsdToEur(usd: number, rate: number, pips = DEFAULT_CONVER
 
 /** EUR → USD: moltiplica per il tasso meno i pips. */
 export function convertEurToUsd(eur: number, rate: number, pips = DEFAULT_CONVERSION_PIPS): ConversionQuote {
+  if (!Number.isFinite(eur) || !Number.isFinite(rate) || rate <= 0) return { grossAmount: Number.NaN, fee: Number.NaN, netAmount: Number.NaN, effectiveRate: Number.NaN };
   const effectiveRate = rate - pips * PIP_SIZE;
   const netAmount = eur * effectiveRate;
   const grossAmount = eur * rate;
@@ -88,5 +90,6 @@ export function withdrawalAdvisor(fx: FxRate, targetRate: number): WithdrawalAdv
 
 /** Costo % effettivo della conversione dato un livello di pips. */
 export function conversionCostPct(rate: number, pips = DEFAULT_CONVERSION_PIPS): number {
+  if (!Number.isFinite(rate) || rate <= 0) return Number.NaN;
   return ((pips * PIP_SIZE) / rate) * 100;
 }

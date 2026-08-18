@@ -31,7 +31,7 @@ export function MoversCard({ rows, onSelect }: { rows: MarketRow[]; onSelect(id:
     const sorted = [...withQuote].sort((a, b) => {
       if (tab === 'up') return (b.quote!.changePct) - (a.quote!.changePct);
       if (tab === 'down') return (a.quote!.changePct) - (b.quote!.changePct);
-      return b.volume - a.volume;
+      return (b.volume ?? -Infinity) - (a.volume ?? -Infinity);
     });
     return sorted.slice(0, MAX_ROWS);
   }, [rows, tab]);
@@ -69,7 +69,7 @@ export function MoversCard({ rows, onSelect }: { rows: MarketRow[]; onSelect(id:
               transition={{ type: 'spring', duration: 0.3 }}
               className="flex w-full items-center gap-2.5 py-2 text-left transition-colors hover:bg-bg-2"
             >
-              <InstrumentAvatar symbol={r.instrument.symbol} size={28} />
+              <InstrumentAvatar symbol={r.instrument.symbol} size={28} imageUrl={r.instrument.imageUrl} backgroundColor={r.instrument.imageBackgroundColor} textColor={r.instrument.imageTextColor} />
               <div className="min-w-0 flex-1">
                 <div className="truncate font-mono text-ticker text-text-0">{r.instrument.symbol}</div>
                 <div className="truncate text-micro text-text-2">{r.instrument.name}</div>

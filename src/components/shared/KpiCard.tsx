@@ -9,11 +9,16 @@ import { DeltaChip } from './DeltaChip';
 import { Sparkline } from './Sparkline';
 import { StatusDot } from './StatusDot';
 import type { StatusDotVariant } from './StatusDot';
+import { Info } from 'lucide-react';
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 
 export interface KpiCardProps {
   label: string;
   /** Valore già formattato (es. "€ 12.480,32"). */
   value: string;
+  /** Valore numerico opzionale: evita di riparsare stringhe valuta localizzate. */
+  numericValue?: number;
+  formatValue?: (value: number) => string;
   /** Delta % in punti percentuali; se omesso niente chip. */
   deltaPct?: number;
   deltaAbsolute?: number;
@@ -22,10 +27,11 @@ export interface KpiCardProps {
   sparkLive?: boolean;
   status?: StatusDotVariant;
   className?: string;
+  info?: string;
 }
 
 export function KpiCard({
-  label, value, deltaPct, deltaAbsolute, currency = 'EUR', sparkData, sparkLive, status, className,
+  label, value, numericValue, formatValue, deltaPct, deltaAbsolute, currency = 'EUR', sparkData, sparkLive, status, className, info,
 }: KpiCardProps) {
   return (
     <motion.div
@@ -35,11 +41,21 @@ export function KpiCard({
       className={cn('card-surface density-pad p-5', className)}
     >
       <div className="flex items-center justify-between">
-        <span className="overline">{label}</span>
+        <span className="inline-flex items-center gap-1.5 overline">
+          {label}
+          {info ? (
+            <TooltipProvider delayDuration={180}>
+              <Tooltip>
+                <TooltipTrigger asChild><button type="button" className="text-text-2 hover:text-text-1" aria-label={`Informazioni su ${label}`}><Info className="h-3.5 w-3.5" aria-hidden /></button></TooltipTrigger>
+                <TooltipContent className="max-w-72"><p className="normal-case tracking-normal text-caption">{info}</p></TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          ) : null}
+        </span>
         {status && <StatusDot variant={status} />}
       </div>
       <div className="mt-2 font-display text-display-md text-text-0 tabular-nums">
-        <TweenedValue value={value} />
+        <TweenedValue value={value} numericValue={numericValue} formatValue={formatValue} />
       </div>
       <div className="mt-2 flex items-end justify-between gap-2">
         {deltaPct != null ? (
@@ -52,15 +68,16 @@ export function KpiCard({
 }
 
 /** Tween 400ms sul cambio di valore numerico; se il valore non è parsabile mostra il testo così com'è. */
-function TweenedValue({ value }: { value: string }) {
+function TweenedValue({ value, numericValue, formatValue }: { value: string; numericValue?: number; formatValue?: (value: number) => string }) {
   const [display, setDisplay] = useState(value);
-  const prevRef = useRef(value);
+  const prevRef = useRef<number | null>(numericValue ?? parseLocaleNumber(value));
+  const formatRef = useRef(formatValue);
+  useEffect(() => { formatRef.current = formatValue; }, [formatValue]);
 
   useEffect(() => {
-    const prev = prevRef.current;
-    prevRef.current = value;
-    const from = parseLocaleNumber(prev);
-    const to = parseLocaleNumber(value);
+    const from = prevRef.current;
+    const to = numericValue ?? parseLocaleNumber(value);
+    prevRef.current = to;
     if (from == null || to == null || from === to) {
       const raf = requestAnimationFrame(() => setDisplay(value));
       return () => cancelAnimationFrame(raf);
@@ -72,12 +89,12 @@ function TweenedValue({ value }: { value: string }) {
       const t = Math.min(1, (now - start) / duration);
       const eased = 1 - Math.pow(1 - t, 3);
       const current = from + (to - from) * eased;
-      setDisplay(rebuildString(value, current));
+      setDisplay(formatRef.current ? formatRef.current(current) : rebuildString(value, current));
       if (t < 1) raf = requestAnimationFrame(step);
     };
     raf = requestAnimationFrame(step);
     return () => cancelAnimationFrame(raf);
-  }, [value]);
+  }, [value, numericValue]);
 
   return <>{display}</>;
 }

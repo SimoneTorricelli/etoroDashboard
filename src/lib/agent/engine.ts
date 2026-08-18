@@ -5,7 +5,6 @@
  *   prezzo, RSI-14 semplice.
  * - Vincoli: limite di capitale per gruppo, cooldown per regola, max ordini/giorno,
  *   kill switch globale.
- * - Demo: esegue ordini simulati via provider (aggiorna il portfolio demo).
  * - Live + Write: invia ordini reali via provider. Live read-only o senza
  *   auto-esecuzione: crea esecuzioni `pending_confirm` da confermare a mano.
  * - Scrive sul log condiviso (livello 'agent').
@@ -26,7 +25,7 @@ const PRICE_WINDOW = 64; // campioni per media/RSI
 const DEFAULT_MAX_ORDERS_PER_DAY = 5;
 
 export interface AgentEngineHooks {
-  getProvider(): DataProvider;
+  getProvider(): DataProvider | null;
   getMode(): DataMode;
   /** true solo in Live con permessi write. */
   canWrite(): boolean;
@@ -63,46 +62,19 @@ export function computeRsi(prices: number[], period = 14): number | null {
 }
 
 function defaultState(): PersistedState {
-  const groups: AgentGroup[] = [
-    { id: 'grp-importantissimo', name: 'Importantissimo', capitalLimit: 2000, usedCapital: 760 },
-    { id: 'grp-lungo-periodo', name: 'Lungo periodo', capitalLimit: 5000, usedCapital: 1200 },
-  ];
-  const rules: AgentRule[] = [
-    {
-      id: 'rule-compra-i-cali',
-      name: 'Compra i cali',
-      groupId: 'grp-importantissimo',
-      instrumentIds: [1001, 1003, 1002],
-      condition: { type: 'drop_from_avg', value: 3, windowDays: 20 },
-      action: { type: 'buy', amount: 250, leverage: 1 },
-      enabled: true,
-      cooldownMinutes: 240,
-      executionsToday: 0,
-    },
-    {
-      id: 'rule-btc-sotto-soglia',
-      name: 'BTC sotto soglia',
-      groupId: 'grp-lungo-periodo',
-      instrumentIds: [1301],
-      condition: { type: 'price_below', value: 92000 },
-      action: { type: 'buy', amount: 500, leverage: 1 },
-      enabled: true,
-      cooldownMinutes: 720,
-      executionsToday: 0,
-    },
-    {
-      id: 'rule-rsi-etf',
-      name: 'RSI basso su ETF',
-      groupId: 'grp-lungo-periodo',
-      instrumentIds: [1201, 1203],
-      condition: { type: 'rsi_below', value: 32 },
-      action: { type: 'buy', amount: 300, leverage: 1 },
-      enabled: false,
-      cooldownMinutes: 1440,
-      executionsToday: 0,
-    },
-  ];
-  return { groups, rules, masterEnabled: true, autoExecute: true, maxOrdersPerDay: DEFAULT_MAX_ORDERS_PER_DAY };
+  return { groups: [], rules: [], masterEnabled: false, autoExecute: false, maxOrdersPerDay: DEFAULT_MAX_ORDERS_PER_DAY };
+}
+
+function isLegacySeedState(state: PersistedState): boolean {
+  const groupIds = new Set(state.groups.map((group) => group.id));
+  const ruleIds = new Set(state.rules.map((rule) => rule.id));
+  return state.groups.length === 2
+    && state.rules.length === 3
+    && groupIds.has('grp-importantissimo')
+    && groupIds.has('grp-lungo-periodo')
+    && ruleIds.has('rule-compra-i-cali')
+    && ruleIds.has('rule-btc-sotto-soglia')
+    && ruleIds.has('rule-rsi-etf');
 }
 
 export class AgentEngine {
@@ -132,7 +104,9 @@ export class AgentEngine {
   private load(): PersistedState | null {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
-      return raw ? (JSON.parse(raw) as PersistedState) : null;
+      if (!raw) return null;
+      const state = JSON.parse(raw) as PersistedState;
+      return isLegacySeedState(state) ? defaultState() : state;
     } catch { return null; }
   }
 
@@ -329,7 +303,7 @@ export class AgentEngine {
   }
 
   private record(rule: AgentRule, quote: Quote, status: AgentExecution['status'], mode: DataMode, reason?: string): AgentExecution {
-    const inst = this.hooks.getProvider().listInstruments().find((i) => i.instrumentId === quote.instrumentId);
+    const inst = this.hooks.getProvider()?.listInstruments().find((i) => i.instrumentId === quote.instrumentId);
     const exec: AgentExecution = {
       id: uid('exec'),
       ruleId: rule.id,
@@ -351,6 +325,12 @@ export class AgentEngine {
 
   private async executeOrder(rule: AgentRule, quote: Quote, mode: DataMode) {
     const provider = this.hooks.getProvider();
+    if (!provider) {
+      this.record(rule, quote, 'failed', mode, 'Connessione Live non disponibile.');
+      this.hooks.log('error', `Agent: ordine bloccato per "${rule.name}": connessione Live non disponibile.`);
+      this.notify();
+      return;
+    }
     const result = await provider.placeMarketOrder({
       instrumentId: quote.instrumentId,
       isBuy: true,
@@ -376,6 +356,13 @@ export class AgentEngine {
     if (!exec) return;
     const rule = this.rules.find((r) => r.id === exec.ruleId);
     const provider = this.hooks.getProvider();
+    if (!provider) {
+      exec.status = 'failed';
+      exec.reason = 'Connessione Live non disponibile.';
+      this.hooks.log('error', `Conferma bloccata per ${exec.symbol}: connessione Live non disponibile.`);
+      this.notify();
+      return;
+    }
     const result = await provider.placeMarketOrder({
       instrumentId: exec.instrumentId,
       isBuy: true,

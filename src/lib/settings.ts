@@ -4,7 +4,7 @@
  */
 import type { DataMode } from './data/types';
 
-export type EtoroEnvironment = 'demo' | 'real';
+export type EtoroEnvironment = 'real';
 export type ApiPermissions = 'read' | 'write';
 export type DisplayCurrency = 'EUR' | 'USD';
 export type Density = 'comfy' | 'compact';
@@ -30,12 +30,12 @@ export interface AppSettings {
 const STORAGE_KEY = 'torino.settings.v1';
 
 export const DEFAULT_SETTINGS: AppSettings = {
-  mode: 'demo',
+  mode: 'live',
   live: {
     apiKey: '',
     userKey: '',
     proxyUrl: '',
-    environment: 'demo',
+    environment: 'real',
     permissions: 'read',
   },
   displayCurrency: 'EUR',
@@ -51,7 +51,8 @@ export function loadSettings(): AppSettings {
     return {
       ...DEFAULT_SETTINGS,
       ...parsed,
-      live: { ...DEFAULT_SETTINGS.live, ...(parsed.live ?? {}) },
+      mode: 'live',
+      live: { ...DEFAULT_SETTINGS.live, ...(parsed.live ?? {}), environment: 'real' },
     };
   } catch {
     return { ...DEFAULT_SETTINGS };
@@ -71,7 +72,7 @@ export function hasLiveCredentials(s: AppSettings): boolean {
 
 /** true se l'app può inviare ordini REALI (Live + REAL + write). */
 export function isRealExecutionActive(s: AppSettings): boolean {
-  return s.mode === 'live' && s.live.environment === 'real' && s.live.permissions === 'write';
+  return s.live.permissions === 'write';
 }
 
 /** Chiave mascherata per l'header: mostra solo gli ultimi 4 caratteri. */

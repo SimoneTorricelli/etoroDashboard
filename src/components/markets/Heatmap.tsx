@@ -123,7 +123,7 @@ export function Heatmap({ rows, height = 420, hoveredId, onHover, onSelect }: He
     return [...bySector.entries()].map(([sector, list]) => ({
       sector,
       list,
-      value: list.reduce((a, r) => a + r.marketCap, 0),
+      value: list.reduce((a, r) => a + (r.marketCap ?? 1), 0),
     }));
   }, [rows]);
 
@@ -142,7 +142,7 @@ export function Heatmap({ rows, height = 420, hoveredId, onHover, onSelect }: He
         h: Math.max(0, rect.h - HEADER_H - GAP),
       };
       const tiles = squarify(
-        sec.list.map((row) => ({ value: row.marketCap, data: row })),
+        sec.list.map((row) => ({ value: row.marketCap ?? 1, data: row })),
         inner,
       ).map(([row, r]) => ({ row, rect: r }));
       return { sector: sec.sector, rect, tiles };

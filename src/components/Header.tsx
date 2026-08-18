@@ -1,7 +1,7 @@
 /**
  * Header — barra superiore 56px sticky, bg-0 80% + blur 12px (design.md).
  * Contiene: titolo pagina, search ⌘K, chip EUR/USD, toggle valuta di display,
- * density toggle, bell notifiche, badge ambiente DEMO/REAL, chip account.
+ * density toggle, bell notifiche, badge ambiente REAL, chip account.
  */
 import { useLocation } from 'react-router';
 import { Bell, Rows3, Search } from 'lucide-react';
@@ -110,21 +110,17 @@ export function Header({ onOpenPalette }: { onOpenPalette(): void }) {
       <span
         className={cn(
           'rounded-md px-2 py-1 text-micro font-semibold uppercase tracking-wide',
-          isReal
-            ? 'border border-loss text-loss'
-            : settings.mode === 'live'
-              ? 'border border-warn text-warn'
-              : 'bg-warn/15 text-warn',
+          isReal ? 'border border-loss text-loss' : 'border border-warn text-warn',
         )}
       >
-        {settings.mode === 'demo' ? 'Demo' : isReal ? 'Real' : 'Live·Demo'}
+        {isReal ? 'Real' : 'Live'}
       </span>
 
       {/* Account chip */}
       <div className="hidden items-center gap-2 rounded-lg border border-hairline bg-bg-1 px-2.5 py-1.5 xl:flex">
-        <StatusDot variant={realExecutionActive ? 'error' : settings.mode === 'demo' ? 'ok' : 'live'} />
+        <StatusDot variant={realExecutionActive ? 'error' : 'live'} />
         <span className="font-mono text-micro text-text-1">
-          {settings.mode === 'demo' ? 'demo-user' : maskKey(settings.live.userKey)}
+          {maskKey(settings.live.userKey)}
         </span>
       </div>
     </header>

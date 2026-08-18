@@ -2,7 +2,7 @@
  * RiskSection — Impostazioni §5 "Rischio e privacy" (design/settings.md):
  * privacy card (tutto nel browser) + Esporta/Importa configurazione JSON,
  * blocco disclaimer persistente, danger zone con azioni a doppia conferma
- * (Disattiva Live, Rimuovi chiavi, Ripristina l'app).
+ * (Rimuovi chiavi, Ripristina l'app).
  */
 import { useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
@@ -32,10 +32,10 @@ function exportConfig() {
 }
 
 export function RiskSection() {
-  const { setMode, updateLiveSettings } = useAppData();
+  const { updateLiveSettings } = useAppData();
   const fileRef = useRef<HTMLInputElement>(null);
   const [importMsg, setImportMsg] = useState<string | null>(null);
-  const [confirming, setConfirming] = useState<'live' | 'keys' | 'reset' | null>(null);
+  const [confirming, setConfirming] = useState<'keys' | 'reset' | null>(null);
 
   const importConfig = async (file: File | undefined) => {
     if (!file) return;
@@ -55,13 +55,6 @@ export function RiskSection() {
   };
 
   const dangerActions = [
-    {
-      id: 'live' as const,
-      label: 'Disattiva modalità Live',
-      description: 'Torna alla modalità Demo senza toccare le chiavi.',
-      confirmLabel: 'Disattiva Live',
-      run: () => setMode('demo'),
-    },
     {
       id: 'keys' as const,
       label: 'Rimuovi chiavi API',

@@ -10,8 +10,6 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useAppData } from '@/lib/data/store';
 import type { Candle, CandleInterval } from '@/lib/data/types';
 
-export const EURUSD_ID = 1401;
-
 /* ── Storico ───────────────────────────────────────────────────────── */
 
 export type FxTimeframe = '1S' | '1M' | '3M' | '1A' | '5A';
@@ -41,32 +39,45 @@ function mean(values: number[]): number | null {
 }
 
 export function useFxHistory(timeframe: FxTimeframe) {
-  const { getCandles } = useAppData();
+  const { getCandles, getFxInstrumentId, instruments } = useAppData();
   const [candles, setCandles] = useState<Candle[]>([]);
   const [daily, setDaily] = useState<Candle[]>([]);
   const [loadingCandles, setLoadingCandles] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const fxInstrumentId = instruments.find((instrument) => instrument.symbol.toUpperCase() === 'EURUSD')?.instrumentId ?? getFxInstrumentId();
 
   /* Serie del timeframe selezionato (grafico) */
   useEffect(() => {
-    let cancelled = false;
+    if (!fxInstrumentId) {
+      const timer = window.setTimeout(() => { setLoadingCandles(false); setError('ID EUR/USD non disponibile nel catalogo eToro.'); }, 0);
+      return () => window.clearTimeout(timer);
+    }
+    const controller = new AbortController();
     const tf = FX_TIMEFRAMES.find((t) => t.key === timeframe)!;
-    void Promise.resolve().then(() => { if (!cancelled) setLoadingCandles(true); });
-    void getCandles(EURUSD_ID, tf.interval, tf.count).then((cs) => {
-      if (cancelled) return;
+    const timer = window.setTimeout(() => { if (!controller.signal.aborted) { setLoadingCandles(true); setError(null); } }, 0);
+    void getCandles(fxInstrumentId, tf.interval, tf.count, controller.signal).then((cs) => {
+      if (controller.signal.aborted) return;
       setCandles(cs);
       setLoadingCandles(false);
+      if (cs.length < 2) setError('Storico insufficiente da eToro per questo timeframe.');
+    }).catch((reason) => {
+      if (controller.signal.aborted) return;
+      setCandles([]);
+      setLoadingCandles(false);
+      setError(reason instanceof Error && /429|rate/i.test(reason.message) ? 'Quota eToro temporaneamente esaurita. Riprova tra poco.' : 'Storico EUR/USD non disponibile da eToro.');
     });
-    return () => { cancelled = true; };
-  }, [getCandles, timeframe]);
+    return () => { window.clearTimeout(timer); controller.abort(); };
+  }, [getCandles, timeframe, fxInstrumentId]);
 
   /* Serie giornaliera fissa (statistiche hero/advisor/calcolatore) */
   useEffect(() => {
-    let cancelled = false;
-    void getCandles(EURUSD_ID, 'OneDay', 120).then((cs) => {
-      if (!cancelled) setDaily(cs);
-    });
-    return () => { cancelled = true; };
-  }, [getCandles]);
+    if (!fxInstrumentId) return undefined;
+    const controller = new AbortController();
+    void getCandles(fxInstrumentId, 'OneDay', 120, controller.signal).then((cs) => {
+      if (!controller.signal.aborted) setDaily(cs);
+    }).catch(() => { if (!controller.signal.aborted) setDaily([]); });
+    return () => controller.abort();
+  }, [getCandles, fxInstrumentId]);
 
   const stats = useMemo<FxStats>(() => {
     if (daily.length < 2) {
@@ -90,7 +101,7 @@ export function useFxHistory(timeframe: FxTimeframe) {
     };
   }, [daily]);
 
-  return { candles, daily, stats, loadingCandles };
+  return { candles, daily, stats, loadingCandles, error, fxInstrumentId };
 }
 
 /* ── Bande target ──────────────────────────────────────────────────── */
@@ -214,5 +225,3 @@ export function evaluateFxAlerts(alerts: FxAlert[], rate: number): FxAlert[] {
     return a.direction === 'above' ? rate >= a.threshold : rate <= a.threshold;
   });
 }
-
-

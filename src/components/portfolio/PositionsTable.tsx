@@ -160,7 +160,7 @@ export function PositionsTable({
     >
       <td className="px-3 py-2.5">
         <span className="flex items-center gap-2.5">
-          <InstrumentAvatar symbol={r.symbol} size={28} />
+          <InstrumentAvatar symbol={r.symbol} size={28} imageUrl={r.imageUrl} />
           <span className="min-w-0">
             <span className="block font-mono text-ticker text-text-0">{r.symbol}</span>
             <span className="block max-w-[160px] truncate text-micro text-text-2">{r.name}</span>

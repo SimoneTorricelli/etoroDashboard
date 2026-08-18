@@ -23,6 +23,10 @@ function useTween(target: number, duration = 300): number {
   useEffect(() => {
     const from = prevRef.current;
     prevRef.current = target;
+    if (!Number.isFinite(from) || !Number.isFinite(target)) {
+      const raf = requestAnimationFrame(() => setValue(target));
+      return () => cancelAnimationFrame(raf);
+    }
     if (from === target) return;
     const start = performance.now();
     let raf = 0;
@@ -52,12 +56,14 @@ export function ConversionCalculator({ stats }: { stats: FxStats }) {
   const [amountRaw, setAmountRaw] = useState('1.000');
   const [rateRaw, setRateRaw] = useState<string | null>(null); // null = segui il live
   const [pips, setPips] = useState(100);
+  const [extraFeePct, setExtraFeePct] = useState(0);
 
   const amount = parseItalianNumber(amountRaw) ?? 0;
-  const rate = rateRaw != null ? (parseItalianNumber(rateRaw) ?? liveRate ?? 1.09) : (liveRate ?? 1.09);
+  const rate = rateRaw != null ? (parseItalianNumber(rateRaw) ?? liveRate ?? 0) : (liveRate ?? 0);
 
   const quote = useMemo(() => convertUsdToEur(amount, rate, pips), [amount, rate, pips]);
-  const netEur = useTween(quote.netAmount);
+  const assumedCommission = quote.netAmount * (extraFeePct / 100);
+  const netEur = useTween(quote.netAmount - assumedCommission);
   const feeEur = useTween(quote.fee);
   const costPct = conversionCostPct(rate, pips);
 
@@ -151,7 +157,7 @@ export function ConversionCalculator({ stats }: { stats: FxStats }) {
       {/* Pips */}
       <div className="mt-4">
         <div className="flex items-center justify-between">
-          <label className="text-label text-text-1">Commissione eToro</label>
+          <label className="text-label text-text-1">Spread / markup assunto</label>
           <span className="font-mono text-ticker text-info tabular-nums">{pips} pips</span>
         </div>
         <Slider
@@ -164,8 +170,9 @@ export function ConversionCalculator({ stats }: { stats: FxStats }) {
           aria-label="Commissione in pips"
         />
         <p className="mt-1.5 text-micro text-text-2">
-          eToro applica tipicamente 50–150 pips sulla conversione (base: {DEFAULT_CONVERSION_PIPS} pips).
+          Assunzione modificabile, non una quotazione eToro: base {DEFAULT_CONVERSION_PIPS} pips. Verifica il costo effettivo mostrato da eToro prima di confermare.
         </p>
+        <label className="mt-3 flex items-center justify-between gap-3 text-caption text-text-1"><span>Commissione extra assunta</span><span className="flex items-center gap-1"><input type="number" min={0} max={10} step={0.05} value={extraFeePct} onChange={(event) => setExtraFeePct(Math.max(0, Number(event.target.value) || 0))} className="w-20 rounded-md border border-hairline bg-bg-3 px-2 py-1 text-right font-mono text-text-0" aria-label="Commissione extra percentuale assunta" />%</span></label>
       </div>
 
       {/* Output */}
@@ -178,10 +185,11 @@ export function ConversionCalculator({ stats }: { stats: FxStats }) {
             </div>
           </div>
           <div className="text-right">
-            <div className="text-micro text-text-2">Costo di conversione</div>
+            <div className="text-micro text-text-2">Costi assunti separati</div>
             <div className="mt-1 text-body-strong tabular-nums text-loss">
-              −{formatCurrency(feeEur, 'EUR')} ({formatNumber(costPct, 2)}%)
+              Spread −{formatCurrency(feeEur, 'EUR')} ({formatNumber(costPct, 2)}%)
             </div>
+            <div className="text-caption tabular-nums text-loss">Commissione −{formatCurrency(assumedCommission, 'EUR')} ({formatNumber(extraFeePct, 2)}%)</div>
             <div className="text-micro text-text-2">tasso effettivo {formatFxRate(quote.effectiveRate)}</div>
           </div>
         </div>

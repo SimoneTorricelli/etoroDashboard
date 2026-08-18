@@ -39,16 +39,19 @@ const accentClasses: Record<StrategyTemplate['accent'], { border: string; text: 
 const statusClasses: Record<StrategyPortfolioConfig['status'], string> = {
   bozza: 'bg-bg-2 text-text-2',
   pronto: 'bg-info/10 text-info',
+  simulato: 'bg-agent/10 text-agent',
   attivo: 'bg-gain/10 text-gain',
   'in pausa': 'bg-warn/10 text-warn',
 };
 
 function money(value: number, currency: DisplayCurrency): string {
+  if (!Number.isFinite(value)) return '—';
   return new Intl.NumberFormat('it-IT', { style: 'currency', currency, maximumFractionDigits: 0 }).format(value);
 }
 
 function inputMoney(value: number, fromUsd: (usd: number) => number): number {
-  return Math.round(fromUsd(value) * 100) / 100;
+  const converted = fromUsd(value);
+  return Number.isFinite(converted) ? Math.round(converted * 100) / 100 : 0;
 }
 
 function numberInput(onChange: (value: number) => void) {
@@ -66,7 +69,7 @@ export function StrategyPortfolioStudio({
   displayCurrency: DisplayCurrency;
   realExecutionActive: boolean;
 }) {
-  const { settings } = useAppData();
+  const { settings, instruments, getCandles } = useAppData();
   const [portfolios, setPortfolios] = useState<StrategyPortfolioConfig[]>(() => loadStrategyPortfolios());
   const [editing, setEditing] = useState<StrategyPortfolioConfig | null>(null);
   const [confirming, setConfirming] = useState<StrategyPortfolioConfig | null>(null);
@@ -75,6 +78,7 @@ export function StrategyPortfolioStudio({
   const [remote, setRemote] = useState<RemoteAgentPortfolio[]>([]);
   const [remoteLoading, setRemoteLoading] = useState(false);
   const [remoteChecked, setRemoteChecked] = useState(false);
+  const [simulatingId, setSimulatingId] = useState<string | null>(null);
 
   useEffect(() => saveStrategyPortfolios(portfolios), [portfolios]);
 
@@ -97,7 +101,7 @@ export function StrategyPortfolioStudio({
       toast.error('Controlla i limiti del portafoglio', { description: validation.errors[0] });
       return;
     }
-    const next = { ...editing, status: 'pronto' as const, updatedAt: Date.now() };
+    const next = { ...editing, status: 'pronto' as const, simulation: undefined, updatedAt: Date.now() };
     setPortfolios((current) => current.some((item) => item.id === next.id)
       ? current.map((item) => item.id === next.id ? next : item)
       : [...current, next]);
@@ -123,8 +127,65 @@ export function StrategyPortfolioStudio({
     }
   };
 
+  const simulateStrategy = async (portfolio: StrategyPortfolioConfig) => {
+    const template = getStrategyTemplate(portfolio.templateId);
+    const allocations = template.allocations.filter((allocation) => allocation.symbol !== 'Cash');
+    const resolved = allocations.flatMap((allocation) => {
+      const instrument = instruments.find((item) => item.symbol.toUpperCase() === allocation.symbol.toUpperCase());
+      return instrument ? [{ allocation, instrument }] : [];
+    });
+    if (resolved.length === 0) {
+      toast.error('Nessun asset della strategia è disponibile nel catalogo eToro.');
+      return;
+    }
+    setSimulatingId(portfolio.id);
+    try {
+      const settled = await Promise.allSettled(resolved.map(async ({ allocation, instrument }) => ({ allocation, candles: await getCandles(instrument.instrumentId, 'OneDay', 365) })));
+      const valid = settled.flatMap((entry) => entry.status === 'fulfilled' && entry.value.candles.length >= 30 ? [entry.value] : []);
+      const coveragePct = valid.reduce((sum, item) => sum + item.allocation.weightPct, template.allocations.find((allocation) => allocation.symbol === 'Cash')?.weightPct ?? 0);
+      if (valid.length === 0 || coveragePct < 80) throw new Error(`Copertura dati ${coveragePct}%: serve almeno l’80% dei pesi.`);
+      const observations = Math.min(...valid.map((item) => item.candles.length));
+      const trailing = valid.map((item) => ({ ...item, candles: item.candles.slice(-observations) }));
+      const cashWeight = (template.allocations.find((allocation) => allocation.symbol === 'Cash')?.weightPct ?? 0) / 100;
+      const values = Array.from({ length: observations }, (_, index) => cashWeight + trailing.reduce((sum, item) => {
+        const base = item.candles[0].close;
+        return sum + (item.allocation.weightPct / 100) * (base > 0 ? item.candles[index].close / base : 1);
+      }, 0));
+      let peak = values[0];
+      let maxDrawdownPct = 0;
+      const returns: number[] = [];
+      for (let index = 1; index < values.length; index += 1) {
+        peak = Math.max(peak, values[index]);
+        maxDrawdownPct = Math.max(maxDrawdownPct, peak > 0 ? ((peak - values[index]) / peak) * 100 : 0);
+        if (values[index - 1] > 0) returns.push(values[index] / values[index - 1] - 1);
+      }
+      const mean = returns.reduce((sum, value) => sum + value, 0) / Math.max(1, returns.length);
+      const variance = returns.reduce((sum, value) => sum + (value - mean) ** 2, 0) / Math.max(1, returns.length - 1);
+      const volatilityPct = Math.sqrt(variance) * Math.sqrt(252) * 100;
+      const returnPct = (values[values.length - 1] / values[0] - 1) * 100;
+      const annualized = (Math.pow(values[values.length - 1] / values[0], 252 / Math.max(1, observations - 1)) - 1) * 100;
+      const simulation = {
+        returnPct,
+        maxDrawdownPct,
+        volatilityPct,
+        p10Pct: annualized - 1.2816 * volatilityPct,
+        p50Pct: annualized,
+        p90Pct: annualized + 1.2816 * volatilityPct,
+        coveragePct,
+        observations,
+        asOf: Date.now(),
+      };
+      setPortfolios((current) => current.map((item) => item.id === portfolio.id ? { ...item, status: 'simulato', simulation, updatedAt: Date.now() } : item));
+      toast.success('Simulazione strategia completata', { description: `${observations} osservazioni reali · copertura ${coveragePct}%` });
+    } catch (error) {
+      toast.error('Simulazione strategia non disponibile', { description: error instanceof Error ? error.message : 'Dati storici insufficienti.' });
+    } finally {
+      setSimulatingId(null);
+    }
+  };
+
   const activateRemote = async () => {
-    if (!confirming || !realExecutionActive || !ackReal) return;
+    if (!confirming || confirming.status !== 'simulato' || !confirming.simulation || !realExecutionActive || !ackReal) return;
     setCreatingId(confirming.id);
     try {
       const created = await createAgentPortfolio(settings.live, confirming);
@@ -177,12 +238,12 @@ export function StrategyPortfolioStudio({
         </button>
       </div>
 
-      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
+      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
         {STRATEGY_TEMPLATES.map((template) => {
           const style = accentClasses[template.accent];
           const configured = portfolios.some((portfolio) => portfolio.templateId === template.id);
           return (
-            <div key={template.id} className={cn('card-surface flex min-h-[214px] flex-col border p-4', style.border)}>
+            <div key={template.id} className={cn('card-surface flex min-h-[280px] flex-col border p-4', style.border)}>
               <div className="flex items-start justify-between gap-2">
                 <div className={cn('flex h-9 w-9 items-center justify-center rounded-xl', style.bg)}>
                   <Sparkles className={cn('h-4 w-4', style.text)} aria-hidden />
@@ -192,6 +253,7 @@ export function StrategyPortfolioStudio({
               <h3 className="mt-3 text-body-strong text-text-0">{template.name}</h3>
               <p className={cn('mt-1 text-micro font-medium', style.text)}>{template.tagline}</p>
               <p className="mt-2 flex-1 text-caption leading-relaxed text-text-2">{template.description}</p>
+              <div className="mt-3 rounded-lg border border-hairline bg-bg-0/60 p-2.5 text-micro text-text-2"><p><span className="text-text-1">Obiettivo:</span> {template.objective} · {template.horizon}</p><p className="mt-1"><span className="text-text-1">Asset:</span> {template.allocations.map((allocation) => `${allocation.symbol} ${allocation.weightPct}%`).join(' · ')}</p><p className="mt-1 text-warn">Stress ipotetico: fino a −{template.stressLossPct}% · non è una previsione</p></div>
               <div className="mt-3 flex items-center justify-between gap-2">
                 <span className="text-micro text-text-2">{riskLabel[template.risk]}</span>
                 <button
@@ -238,9 +300,11 @@ export function StrategyPortfolioStudio({
                     <Metric label="Max entrata" value={money(fromUsd(portfolio.maxOrderUsd), displayCurrency)} />
                     <Metric label="Posizioni" value={`${portfolio.maxPositions}`} />
                   </div>
+                  <div className="mt-3 rounded-lg border border-hairline bg-bg-0/60 p-3"><p className="text-micro text-text-2">Pesi target · {template.horizon} · ribilanciamento {portfolio.rebalance}</p><p className="mt-1 text-caption text-text-1">{template.allocations.map((allocation) => `${allocation.symbol} ${allocation.weightPct}%`).join(' · ')}</p>{portfolio.simulation ? <div className="mt-3 grid grid-cols-3 gap-2 border-t border-hairline pt-2"><Metric label="Rendimento storico" value={`${portfolio.simulation.returnPct.toFixed(1).replace('.', ',')}%`} /><Metric label="Drawdown max" value={`−${portfolio.simulation.maxDrawdownPct.toFixed(1).replace('.', ',')}%`} /><Metric label="Volatilità ann." value={`${portfolio.simulation.volatilityPct.toFixed(1).replace('.', ',')}%`} /><Metric label="Scenario P10" value={`${portfolio.simulation.p10Pct.toFixed(1).replace('.', ',')}%`} /><Metric label="Scenario P50" value={`${portfolio.simulation.p50Pct.toFixed(1).replace('.', ',')}%`} /><Metric label="Scenario P90" value={`${portfolio.simulation.p90Pct.toFixed(1).replace('.', ',')}%`} /><p className="col-span-3 text-micro text-text-2">{portfolio.simulation.observations} osservazioni reali · copertura {portfolio.simulation.coveragePct}% · scenario, non previsione garantita</p></div> : <p className="mt-2 text-caption text-text-2">Rendimento, perdita e scenari saranno calcolati su dati reali dopo la simulazione.</p>}</div>
                   <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-hairline pt-3">
                     <span className="flex items-center gap-1.5 text-micro text-text-2"><Target className="h-3.5 w-3.5 text-agent" aria-hidden /> Fino a {preview.affordablePositions} posizioni finanziabili ai minimi impostati</span>
                     <div className="flex gap-2">
+                      {portfolio.status !== 'attivo' ? <button type="button" onClick={() => void simulateStrategy(portfolio)} disabled={simulatingId === portfolio.id} className="flex items-center gap-1.5 rounded-lg border border-agent/40 px-2.5 py-1.5 text-micro text-agent hover:bg-agent/10 disabled:opacity-50">{simulatingId === portfolio.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Play className="h-3.5 w-3.5" aria-hidden />} Simula</button> : null}
                       {portfolio.status !== 'attivo' && (
                         <button
                           type="button"
@@ -253,10 +317,11 @@ export function StrategyPortfolioStudio({
                       {portfolio.status !== 'attivo' ? (
                         <button
                           type="button"
-                          onClick={() => { setAckReal(false); setConfirming(portfolio); }}
-                          className="flex items-center gap-1.5 rounded-lg bg-agent px-2.5 py-1.5 text-micro font-medium text-bg-0 transition-colors hover:bg-agent/90"
+                          onClick={() => { if (portfolio.status === 'simulato' && portfolio.simulation) { setAckReal(false); setConfirming(portfolio); } }}
+                          disabled={portfolio.status !== 'simulato' || !portfolio.simulation}
+                          className="flex items-center gap-1.5 rounded-lg bg-agent px-2.5 py-1.5 text-micro font-medium text-bg-0 transition-colors hover:bg-agent/90 disabled:cursor-not-allowed disabled:opacity-40"
                         >
-                          <Play className="h-3.5 w-3.5" aria-hidden /> Attiva su eToro
+                          <Play className="h-3.5 w-3.5" aria-hidden /> {portfolio.status === 'simulato' ? 'Attiva su eToro' : 'Simula prima'}
                         </button>
                       ) : (
                         <span className="flex items-center gap-1.5 rounded-lg bg-gain/10 px-2.5 py-1.5 text-micro text-gain"><Check className="h-3.5 w-3.5" aria-hidden /> Collegato</span>

@@ -1,5 +1,5 @@
 /**
- * Interfaccia comune dei provider dati (Demo / Live).
+ * Interfaccia del provider dati Live.
  * Lo store (store.tsx) istanzia il provider in base alle impostazioni
  * e si sottoscrive ai suoi eventi.
  */
@@ -9,6 +9,7 @@ import type {
   ConnectionStatus,
   DataMode,
   FxRate,
+  HistoricalClosingPrice,
   Instrument,
   LogEntry,
   OrderRequest,
@@ -16,6 +17,7 @@ import type {
   PnlSummary,
   Portfolio,
   Quote,
+  ClosedTrade,
 } from './types';
 
 export type ProviderEvent = 'quotes' | 'portfolio' | 'pnl' | 'status' | 'log';
@@ -41,11 +43,14 @@ export interface DataProvider {
   getPortfolio(): Promise<Portfolio>;
   getPnl(): Promise<PnlSummary>;
   getQuotes(instrumentIds: number[]): Promise<Quote[]>;
-  getCandles(instrumentId: number, interval: CandleInterval, count: number): Promise<Candle[]>;
+  getCandles(instrumentId: number, interval: CandleInterval, count: number, signal?: AbortSignal): Promise<Candle[]>;
+  getHistoricalClosingPrices(): Promise<HistoricalClosingPrice[]>;
+  getTradeHistory(): Promise<ClosedTrade[]>;
   searchInstruments(query: string): Promise<Instrument[]>;
   /** Catalogo completo degli strumenti noti al provider. */
   listInstruments(): Instrument[];
   getFxRate(): FxRate;
+  getFxInstrumentId(): number | null;
 
   placeMarketOrder(req: OrderRequest): Promise<OrderResult>;
   closePosition(positionId: number): Promise<OrderResult>;

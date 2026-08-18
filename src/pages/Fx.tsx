@@ -30,7 +30,7 @@ const stagger = (i: number) => ({
 export default function Fx() {
   const { fxRate } = useAppData();
   const [timeframe, setTimeframe] = useState<FxTimeframe>('3M');
-  const { candles, stats } = useFxHistory(timeframe);
+  const { candles, stats, loadingCandles, error } = useFxHistory(timeframe);
   const { target, upper, setTarget, setUpperBand } = useFxBands();
 
   return (
@@ -74,6 +74,7 @@ export default function Fx() {
           </div>
         </div>
         <div className="mt-3">
+          {error ? <div role="status" className="mb-2 rounded-md border border-warn/30 bg-warn/5 px-3 py-2 text-caption text-warn">{error}</div> : null}
           <FxChart
             candles={candles}
             liveRate={fxRate?.rate ?? null}
@@ -82,10 +83,11 @@ export default function Fx() {
             onTargetChange={setTarget}
             onUpperChange={setUpperBand}
           />
+          {loadingCandles ? <p className="mt-2 text-micro text-text-2">Caricamento storico reale eToro…</p> : null}
         </div>
       </motion.div>
       <motion.div {...stagger(4)} className="col-span-12 lg:col-span-4">
-        <AdvisorCard stats={stats} target={target} />
+        {candles.length >= 2 ? <AdvisorCard stats={stats} target={target} /> : <div className="card-surface density-pad h-full p-5"><h2 className="text-title text-text-0">Quando prelevare</h2><p className="mt-3 text-caption leading-relaxed text-text-2">Advisor sospeso: servono almeno due punti storici reali EUR/USD. Nessuna raccomandazione viene generata da un singolo tick.</p></div>}
       </motion.div>
 
       {/* ROW 3 — Calcolatore + Avvisi */}

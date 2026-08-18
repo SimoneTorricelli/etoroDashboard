@@ -2,7 +2,12 @@ export type StrategyRisk = 'basso' | 'medio' | 'alto' | 'molto-alto';
 
 export type StrategyRebalance = 'giornaliero' | 'settimanale' | 'mensile';
 
-export type StrategyPortfolioStatus = 'bozza' | 'pronto' | 'attivo' | 'in pausa';
+export type StrategyPortfolioStatus = 'bozza' | 'pronto' | 'simulato' | 'attivo' | 'in pausa';
+
+export interface StrategyAllocation {
+  symbol: string;
+  weightPct: number;
+}
 
 export interface StrategyTemplate {
   id: string;
@@ -19,6 +24,11 @@ export interface StrategyTemplate {
   defaultCashReservePct: number;
   defaultMaxOrdersPerDay: number;
   defaultRebalance: StrategyRebalance;
+  objective: string;
+  horizon: string;
+  allocations: StrategyAllocation[];
+  /** Scenario di stress dichiarato, non previsione. */
+  stressLossPct: number;
 }
 
 export interface StrategyPortfolioConfig {
@@ -38,6 +48,17 @@ export interface StrategyPortfolioConfig {
   virtualBalanceUsd?: number;
   tokenAvailable?: boolean;
   activatedAt?: number;
+  simulation?: {
+    returnPct: number;
+    maxDrawdownPct: number;
+    volatilityPct: number;
+    p10Pct: number;
+    p50Pct: number;
+    p90Pct: number;
+    coveragePct: number;
+    observations: number;
+    asOf: number;
+  };
   createdAt: number;
   updatedAt: number;
 }
@@ -58,13 +79,15 @@ export const STRATEGY_TEMPLATES: StrategyTemplate[] = [
     risk: 'medio',
     accent: 'gain',
     defaultAgentName: 'Dividend',
-    defaultBudgetUsd: 2000,
+    defaultBudgetUsd: 0,
     defaultMinOrderUsd: 50,
     defaultMaxOrderUsd: 250,
     defaultMaxPositions: 10,
     defaultCashReservePct: 10,
     defaultMaxOrdersPerDay: 4,
     defaultRebalance: 'mensile',
+    objective: 'Flussi distribuiti e qualità', horizon: '3–5 anni', stressLossPct: 25,
+    allocations: [{ symbol: 'SCHD', weightPct: 35 }, { symbol: 'VIG', weightPct: 25 }, { symbol: 'KO', weightPct: 15 }, { symbol: 'PG', weightPct: 15 }, { symbol: 'JPM', weightPct: 10 }],
   },
   {
     id: 'defensive',
@@ -74,13 +97,15 @@ export const STRATEGY_TEMPLATES: StrategyTemplate[] = [
     risk: 'basso',
     accent: 'info',
     defaultAgentName: 'Difesa',
-    defaultBudgetUsd: 2000,
+    defaultBudgetUsd: 0,
     defaultMinOrderUsd: 50,
     defaultMaxOrderUsd: 200,
     defaultMaxPositions: 12,
     defaultCashReservePct: 20,
     defaultMaxOrdersPerDay: 3,
     defaultRebalance: 'mensile',
+    objective: 'Preservazione e volatilità ridotta', horizon: '3–7 anni', stressLossPct: 18,
+    allocations: [{ symbol: 'SPY', weightPct: 30 }, { symbol: 'TLT', weightPct: 25 }, { symbol: 'GLD', weightPct: 20 }, { symbol: 'VIG', weightPct: 15 }, { symbol: 'Cash', weightPct: 10 }],
   },
   {
     id: 'growth',
@@ -90,13 +115,15 @@ export const STRATEGY_TEMPLATES: StrategyTemplate[] = [
     risk: 'alto',
     accent: 'agent',
     defaultAgentName: 'Crescita',
-    defaultBudgetUsd: 2000,
+    defaultBudgetUsd: 0,
     defaultMinOrderUsd: 50,
     defaultMaxOrderUsd: 225,
     defaultMaxPositions: 10,
     defaultCashReservePct: 10,
     defaultMaxOrdersPerDay: 6,
     defaultRebalance: 'settimanale',
+    objective: 'Crescita del capitale', horizon: '5+ anni', stressLossPct: 40,
+    allocations: [{ symbol: 'QQQ', weightPct: 30 }, { symbol: 'AAPL', weightPct: 20 }, { symbol: 'MSFT', weightPct: 20 }, { symbol: 'NVDA', weightPct: 20 }, { symbol: 'AMZN', weightPct: 10 }],
   },
   {
     id: 'crypto',
@@ -106,13 +133,15 @@ export const STRATEGY_TEMPLATES: StrategyTemplate[] = [
     risk: 'molto-alto',
     accent: 'warn',
     defaultAgentName: 'Crypto',
-    defaultBudgetUsd: 1000,
+    defaultBudgetUsd: 0,
     defaultMinOrderUsd: 25,
     defaultMaxOrderUsd: 150,
     defaultMaxPositions: 6,
     defaultCashReservePct: 20,
     defaultMaxOrdersPerDay: 5,
     defaultRebalance: 'settimanale',
+    objective: 'Esposizione crypto diversificata', horizon: '4+ anni', stressLossPct: 65,
+    allocations: [{ symbol: 'BTC', weightPct: 50 }, { symbol: 'ETH', weightPct: 30 }, { symbol: 'SOL', weightPct: 10 }, { symbol: 'XRP', weightPct: 5 }, { symbol: 'ADA', weightPct: 5 }],
   },
   {
     id: 'tactical',
@@ -122,13 +151,15 @@ export const STRATEGY_TEMPLATES: StrategyTemplate[] = [
     risk: 'alto',
     accent: 'loss',
     defaultAgentName: 'Tattico',
-    defaultBudgetUsd: 1000,
+    defaultBudgetUsd: 0,
     defaultMinOrderUsd: 25,
     defaultMaxOrderUsd: 100,
     defaultMaxPositions: 12,
     defaultCashReservePct: 15,
     defaultMaxOrdersPerDay: 8,
     defaultRebalance: 'giornaliero',
+    objective: 'Opportunità tattiche con limiti stretti', horizon: '3–18 mesi', stressLossPct: 35,
+    allocations: [{ symbol: 'SPY', weightPct: 25 }, { symbol: 'QQQ', weightPct: 25 }, { symbol: 'BTC', weightPct: 20 }, { symbol: 'GLD', weightPct: 15 }, { symbol: 'Cash', weightPct: 15 }],
   },
 ];
 

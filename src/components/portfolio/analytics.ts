@@ -16,36 +16,24 @@ export const CLASS_LABELS: Record<AssetClass, string> = {
   cfd: 'CFD',
 };
 
-/** Mappa simbolo → settore (catalogo demo + principali titoli eToro). */
-const SECTOR_BY_SYMBOL: Record<string, string> = {
-  AAPL: 'Tecnologia', MSFT: 'Tecnologia', NVDA: 'Tecnologia', GOOGL: 'Tecnologia',
-  META: 'Tecnologia', AMD: 'Tecnologia', INTC: 'Tecnologia', ASML: 'Tecnologia', SAP: 'Tecnologia',
-  AMZN: 'Consumi discrezionali', TSLA: 'Consumi discrezionali', RACE: 'Consumi discrezionali',
-  'MC.PA': 'Consumi discrezionali',
-  JPM: 'Finanza', V: 'Finanza', MA: 'Finanza', GS: 'Finanza',
-  NFLX: 'Comunicazione', DIS: 'Comunicazione',
-  BA: 'Industriale', SIE: 'Industriale',
-  XOM: 'Energia', SHEL: 'Energia', ENEL: 'Utilities',
-  NESN: 'Beni di prima necessità', PG: 'Beni di prima necessità', KO: 'Beni di prima necessità',
-  JNJ: 'Sanità', PFE: 'Sanità', NVS: 'Sanità',
-};
-
 export function sectorFor(p: Position): string {
+  if (p.sector) return p.sector;
   if (p.assetClass === 'etf') return 'ETF / Fondi';
   if (p.assetClass === 'crypto') return 'Criptovalute';
   if (p.assetClass !== 'stock') return CLASS_LABELS[p.assetClass] ?? 'Altro';
-  return SECTOR_BY_SYMBOL[p.symbol] ?? 'Altro';
+  return 'Non classificato';
 }
 
 /** Geografia derivata dalla valuta di quotazione. */
-export function geoFor(currency: string): string {
+export function geoFor(currency: string, country?: string): string {
+  if (country) return country;
   switch (currency) {
     case 'USD': return 'Nord America';
     case 'EUR': return 'Europa';
     case 'GBP': return 'Regno Unito';
     case 'CHF': return 'Svizzera';
     case 'JPY': return 'Giappone';
-    default: return 'Altro';
+    default: return 'Non classificato';
   }
 }
 
@@ -79,9 +67,61 @@ export function enrichPositions(portfolio: Portfolio): PositionRow[] {
       pnlUsd,
       pnlPctValue: p.pnlPct ?? (p.invested > 0 ? (pnlUsd / p.invested) * 100 : 0),
       sector: sectorFor(p),
-      geo: geoFor(p.currency),
+      geo: geoFor(p.currency, p.country),
     };
   });
+}
+
+/**
+ * Vista look-through: include le posizioni manuali e scompone ogni copy
+ * portfolio nelle esposizioni sottostanti, poi unisce i duplicati per strumento.
+ */
+export function enrichLookThroughPositions(portfolio: Portfolio): PositionRow[] {
+  const raw: Position[] = portfolio.positions.map((position) => ({ ...position, source: 'manual' }));
+  for (const copy of portfolio.copyPortfolios ?? []) {
+    const baseValues = copy.positions.map((position) => position.currentValue ?? Math.max(0, position.invested + (position.pnl ?? 0)));
+    const baseTotal = baseValues.reduce((sum, value) => sum + value, 0);
+    if (baseTotal <= 0) continue;
+    const liveExposure = Math.max(0, copy.value - copy.availableCash);
+    const scale = liveExposure / baseTotal;
+    copy.positions.forEach((position, index) => {
+      const value = baseValues[index] * scale;
+      const invested = position.invested * scale;
+      const pnl = (position.pnl ?? value - position.invested) * scale;
+      raw.push({
+        ...position,
+        positionId: position.positionId,
+        currentValue: value,
+        invested,
+        pnl,
+        pnlPct: invested > 0 ? (pnl / invested) * 100 : 0,
+        source: 'copy',
+        copyId: copy.copyId,
+      });
+    });
+  }
+  const rows = enrichPositions({ ...portfolio, positions: raw });
+  const grouped = new Map<number, PositionRow>();
+  for (const row of rows) {
+    const existing = grouped.get(row.instrumentId);
+    if (!existing) {
+      grouped.set(row.instrumentId, { ...row });
+      continue;
+    }
+    const totalInvested = existing.invested + row.invested;
+    existing.units += row.units;
+    existing.value += row.value;
+    existing.currentValue = existing.value;
+    existing.pnlUsd += row.pnlUsd;
+    existing.pnl = existing.pnlUsd;
+    existing.invested = totalInvested;
+    existing.openPrice = totalInvested > 0
+      ? ((existing.openPrice * (totalInvested - row.invested)) + row.openPrice * row.invested) / totalInvested
+      : existing.openPrice;
+    existing.weight = portfolio.totalValue > 0 ? existing.value / portfolio.totalValue : 0;
+    existing.pnlPctValue = totalInvested > 0 ? (existing.pnlUsd / totalInvested) * 100 : 0;
+  }
+  return [...grouped.values()].sort((a, b) => b.value - a.value);
 }
 
 /* ── Allocazioni ───────────────────────────────────────────────────── */
@@ -134,6 +174,9 @@ export interface SubScore {
 export interface DiversificationScore {
   total: number;
   subs: SubScore[];
+  formulaVersion: string;
+  classifiedCoveragePct: number;
+  factors: string[];
 }
 
 /** Herfindahl-Hirschman Index su pesi (somma = 1). */
@@ -195,7 +238,10 @@ export function computeDiversification(rows: PositionRow[], cash: number, totalV
     { key: 'conc', label: 'Concentrazione', score: concScore },
   ];
   const total = Math.round(subs.reduce((s, x) => s + x.score, 0) / subs.length);
-  return { total, subs };
+  const classified = rows.filter((row) => row.sector !== 'Non classificato').reduce((sum, row) => sum + row.value, 0);
+  const classifiedCoveragePct = invested > 0 ? Math.round((classified / invested) * 100) : 0;
+  const factors = [...subs].sort((a, b) => a.score - b.score).slice(0, 3).map((sub) => `${sub.label}: ${sub.score}/100`);
+  return { total, subs, formulaVersion: 'TOR-DIV-2.0', classifiedCoveragePct, factors };
 }
 
 /* ── P&L mensile (heatmap) ─────────────────────────────────────────── */

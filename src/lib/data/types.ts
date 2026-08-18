@@ -1,15 +1,15 @@
 /**
  * Tipi condivisi del data layer di Torino.
- * Tutti i provider (Demo / Live / CSV) producono queste strutture.
+ * Il provider Live e gli import reali producono queste strutture.
  * Gli import devono usare `import type` (verbatimModuleSyntax).
  */
 
 export type AssetClass = 'stock' | 'etf' | 'crypto' | 'fx' | 'index' | 'cfd';
 
-export type DataMode = 'demo' | 'live';
+export type DataMode = 'live';
 
 /** Stato connessione del provider attivo. */
-export type ConnectionStatus = 'demo' | 'connecting' | 'connected' | 'disconnected' | 'error';
+export type ConnectionStatus = 'connecting' | 'connected' | 'disconnected' | 'error';
 
 export interface Instrument {
   instrumentId: number;
@@ -20,6 +20,12 @@ export interface Instrument {
   /** Valuta di quotazione dello strumento (es. "USD"). */
   currency: string;
   exchange?: string;
+  sector?: string;
+  industry?: string;
+  country?: string;
+  imageUrl?: string;
+  imageBackgroundColor?: string;
+  imageTextColor?: string;
 }
 
 export interface Quote {
@@ -53,6 +59,10 @@ export interface Position {
   name: string;
   assetClass: AssetClass;
   currency: string;
+  sector?: string;
+  industry?: string;
+  country?: string;
+  imageUrl?: string;
   isBuy: boolean;
   units: number;
   openPrice: number;
@@ -72,6 +82,9 @@ export interface Position {
   pnl?: number;
   /** P&L % sull'investito. */
   pnlPct?: number;
+  /** Provenienza per analisi look-through. */
+  source?: 'manual' | 'copy';
+  copyId?: string;
 }
 
 export interface Portfolio {
@@ -91,6 +104,9 @@ export interface Portfolio {
   /** cash + positionsValue (USD). */
   totalValue: number;
   currency: 'USD';
+  /** Timestamp dello snapshot autorevole eToro. */
+  asOf: number;
+  source: 'etoro-pnl';
 }
 
 export interface CopyPortfolio {
@@ -104,9 +120,19 @@ export interface CopyPortfolio {
   invested: number;
   /** Valore corrente del copy portfolio (USD). */
   value: number;
+  /** Liquidità non investita interna al copy portfolio (USD). */
+  availableCash: number;
   /** P&L corrente del copy portfolio (USD). */
   pnl: number;
   pnlPct: number;
+  /** P&L delle posizioni ancora aperte. */
+  activeUnrealizedPnl: number;
+  /** P&L realizzato comunicato da eToro per le posizioni chiuse. */
+  closedRealizedPnl: number;
+  /** activeUnrealizedPnl + closedRealizedPnl. */
+  totalPnl: number;
+  startDate?: string;
+  avatarUrl?: string;
   positions: Position[];
 }
 
@@ -123,6 +149,32 @@ export interface PnlSummary {
   totalPnlPct: number;
   /** Storico equity giornaliero (USD), crescente nel tempo. */
   equityHistory: EquityPoint[];
+  asOf: number;
+  dailySource: 'etoro-daily-gain' | 'since-connection' | 'unavailable';
+  historySource: 'etoro-balances' | 'intraday-snapshots' | 'unavailable';
+  /** Testo breve mostrabile nel tooltip della UI. */
+  sourceLabel: string;
+}
+
+export interface HistoricalClosingPrice {
+  instrumentId: number;
+  officialClosingPrice?: number;
+  daily?: number;
+  weekly?: number;
+  monthly?: number;
+  asOf?: string;
+}
+
+export interface ClosedTrade {
+  positionId: number;
+  instrumentId: number;
+  netProfit: number;
+  investment: number;
+  openRate: number;
+  closeRate: number;
+  openTimestamp?: string;
+  closeTimestamp?: string;
+  socialTradeId?: number;
 }
 
 export interface FxRate {

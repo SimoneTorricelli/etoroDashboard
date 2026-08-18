@@ -51,7 +51,7 @@ export function InstrumentsTable({ rows, onSelect, onHover }: InstrumentsTablePr
       sortValue: (r) => r.instrument.symbol,
       cell: (r) => (
         <div className="flex items-center gap-2.5">
-          <InstrumentAvatar symbol={r.instrument.symbol} size={32} />
+          <InstrumentAvatar symbol={r.instrument.symbol} size={32} imageUrl={r.instrument.imageUrl} backgroundColor={r.instrument.imageBackgroundColor} textColor={r.instrument.imageTextColor} />
           <div className="min-w-0">
             <div className="font-mono text-ticker text-text-0">{r.instrument.symbol}</div>
             <div className="max-w-[180px] truncate text-micro text-text-2">{r.instrument.name}</div>
@@ -105,18 +105,18 @@ export function InstrumentsTable({ rows, onSelect, onHover }: InstrumentsTablePr
       key: 'volume',
       header: 'Volume',
       align: 'right',
-      sortValue: (r) => r.volume,
+      sortValue: (r) => r.volume ?? -Infinity,
       cell: (r) => (
-        <span className="tabular-nums text-text-1">{formatCompact(r.volume, r.instrument.currency)}</span>
+        <span className="tabular-nums text-text-1">{r.volume == null ? 'N/D eToro' : formatCompact(r.volume, r.instrument.currency)}</span>
       ),
     },
     {
       key: 'marketCap',
       header: 'Cap./Mercato',
       align: 'right',
-      sortValue: (r) => r.marketCap,
+      sortValue: (r) => r.marketCap ?? -Infinity,
       cell: (r) => (
-        <span className="tabular-nums text-text-1">{formatCompact(r.marketCap, r.instrument.currency)}</span>
+        <span className="tabular-nums text-text-1">{r.marketCap == null ? 'N/D eToro' : formatCompact(r.marketCap, r.instrument.currency)}</span>
       ),
     },
     {

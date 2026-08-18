@@ -14,13 +14,13 @@ import { useAppData } from '@/lib/data/store';
 import { EmptyState } from '@/components/shared/EmptyState';
 import { Skeleton } from '@/components/shared/Skeleton';
 import { StatusDot } from '@/components/shared/StatusDot';
-import type { AssetClass, Candle } from '@/lib/data/types';
+import type { AssetClass, Candle, HistoricalClosingPrice } from '@/lib/data/types';
 import { Heatmap } from '@/components/markets/Heatmap';
 import { MoversCard } from '@/components/markets/MoversCard';
 import { InstrumentsTable } from '@/components/markets/InstrumentsTable';
 import { InstrumentDrawer } from '@/components/markets/InstrumentDrawer';
 import type { MarketRow } from '@/components/markets/meta';
-import { changeOver, marketCapFor, sectorFor, volumeFor } from '@/components/markets/meta';
+import { sectorFor } from '@/components/markets/meta';
 
 type TabKey = 'all' | AssetClass;
 
@@ -41,7 +41,7 @@ const stagger = (i: number) => ({
 });
 
 export default function Markets() {
-  const { instruments, quotes, loading, getCandles } = useAppData();
+  const { instruments, quotes, loading, getCandles, getQuotes, getHistoricalClosingPrices } = useAppData();
   const [searchParams, setSearchParams] = useSearchParams();
 
   const [tab, setTab] = useState<TabKey>('all');
@@ -49,33 +49,58 @@ export default function Markets() {
   const [view, setView] = useState<'table' | 'heatmap'>('table');
   const [hoveredId, setHoveredId] = useState<number | null>(null);
   const [dailyCandles, setDailyCandles] = useState<Map<number, Candle[]>>(new Map());
+  const [closingPrices, setClosingPrices] = useState<Map<number, HistoricalClosingPrice>>(new Map());
+  const [marketError, setMarketError] = useState<string | null>(null);
 
-  /* Candele giornaliere per Δ 7g / Δ 1M / spark 30g (una tantum per strumento) */
+  /* Prezzi correnti e chiusure 1g/7g/1M: due richieste batch, non una per riga. */
   useEffect(() => {
     if (!instruments.length) return;
     let cancelled = false;
     void (async () => {
-      const entries = await Promise.all(
-        instruments.map(async (i) => [i.instrumentId, await getCandles(i.instrumentId, 'OneDay', 32)] as const),
-      );
-      if (!cancelled) setDailyCandles(new Map(entries));
+      try {
+        const ids = instruments.map((instrument) => instrument.instrumentId);
+        const [, closes] = await Promise.all([getQuotes(ids), getHistoricalClosingPrices()]);
+        if (!cancelled) {
+          setClosingPrices(new Map(closes.map((close) => [close.instrumentId, close])));
+          setMarketError(null);
+        }
+      } catch (error) {
+        if (!cancelled) setMarketError(error instanceof Error ? error.message : 'Dati mercato non disponibili');
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [instruments, getQuotes, getHistoricalClosingPrices]);
+
+  /* Spark reali solo per le prime righe visibili; la coda condivisa limita a 2. */
+  useEffect(() => {
+    const visible = instruments.slice(0, 8);
+    if (visible.length === 0) return;
+    let cancelled = false;
+    void (async () => {
+      const settled = await Promise.allSettled(visible.map(async (instrument) => [instrument.instrumentId, await getCandles(instrument.instrumentId, 'OneDay', 32)] as const));
+      if (cancelled) return;
+      const entries = settled.flatMap((result) => result.status === 'fulfilled' ? [result.value] : []);
+      setDailyCandles(new Map(entries));
     })();
     return () => { cancelled = true; };
   }, [instruments, getCandles]);
 
   const rows = useMemo<MarketRow[]>(() => instruments.map((instrument) => {
     const candles = dailyCandles.get(instrument.instrumentId) ?? [];
+    const close = closingPrices.get(instrument.instrumentId);
+    const current = quotes[instrument.instrumentId]?.last ?? close?.officialClosingPrice;
+    const delta = (past?: number) => current && past && past > 0 ? ((current - past) / past) * 100 : null;
     return {
       instrument,
       quote: quotes[instrument.instrumentId],
-      change7d: changeOver(candles, 7),
-      change1m: changeOver(candles, 30),
+      change7d: delta(close?.weekly),
+      change1m: delta(close?.monthly),
       spark: candles.map((c) => c.close),
-      volume: volumeFor(instrument),
-      marketCap: marketCapFor(instrument),
+      volume: null,
+      marketCap: null,
       sector: sectorFor(instrument),
     };
-  }), [instruments, quotes, dailyCandles]);
+  }), [instruments, quotes, dailyCandles, closingPrices]);
 
   const filtered = useMemo(() => {
     const q = filter.trim().toLowerCase();
@@ -182,6 +207,8 @@ export default function Markets() {
         </div>
       </div>
 
+      {marketError ? <div role="status" className="rounded-lg border border-warn/30 bg-warn/5 px-4 py-3 text-caption text-warn">{marketError.includes('Rate limit') ? 'Quota eToro temporaneamente esaurita: i dati disponibili restano visibili e il retry segue Retry-After.' : `Mercati: ${marketError}`}</div> : null}
+
       {filtered.length === 0 && !isLoading ? (
         <EmptyState
           headline="Nessuno strumento trovato"
@@ -200,9 +227,9 @@ export default function Markets() {
                 view === 'heatmap' ? 'lg:col-span-12' : 'lg:col-span-8',
               )}
             >
-              <div className="mb-3 flex items-center justify-between">
+              <div className="mb-3 flex flex-col items-start gap-1 sm:flex-row sm:items-center sm:justify-between">
                 <h2 className="text-title text-text-0">Heatmap</h2>
-                <span className="text-caption text-text-2">Dimensione = cap. · Colore = Δ 1g</span>
+                <span className="text-caption text-text-2 sm:text-right">Dimensione uniforme · Colore = Δ 1g · cap. non fornita da eToro</span>
               </div>
               {isLoading ? (
                 <Skeleton className="h-[420px] w-full" />

@@ -39,12 +39,15 @@ export function CopyPortfolioTable({ portfolios, fmtMoney, fmtSignedMoney, onSel
     },
     { key: 'positions', header: 'Posizioni', align: 'right', sortValue: (p) => p.positions.length, cell: (p) => <span className="text-text-1">{p.positions.length}</span> },
     { key: 'value', header: 'Valore', align: 'right', sortValue: (p) => p.value, cell: (p) => <span className="font-medium text-text-0">{fmtMoney(p.value)}</span> },
-    {
-      key: 'pnl', header: 'P&L', align: 'right', sortValue: (p) => p.pnl,
-      cell: (p) => <span className={p.pnl >= 0 ? 'text-gain' : 'text-loss'}>{fmtSignedMoney(p.pnl)}</span>,
-    },
+    { key: 'activePnl', header: 'P&L attivo', align: 'right', sortValue: (p) => p.activeUnrealizedPnl, cell: (p) => <PnlValue value={p.activeUnrealizedPnl} format={fmtSignedMoney} /> },
+    { key: 'closedPnl', header: 'P&L chiuso', align: 'right', sortValue: (p) => p.closedRealizedPnl, cell: (p) => <PnlValue value={p.closedRealizedPnl} format={fmtSignedMoney} /> },
+    { key: 'totalPnl', header: 'P&L totale', align: 'right', sortValue: (p) => p.totalPnl, cell: (p) => <PnlValue value={p.totalPnl} format={fmtSignedMoney} /> },
   ];
-  return <DataTable columns={columns} rows={portfolios} rowKey={(p) => p.copyId} defaultSortKey="value" onRowClick={onSelect} emptyMessage="Nessun copy portfolio attivo." />;
+  return <DataTable columns={columns} rows={portfolios} rowKey={(p) => p.copyId} defaultSortKey="totalPnl" onRowClick={onSelect} emptyMessage="Nessun copy portfolio attivo." />;
+}
+
+function PnlValue({ value, format }: { value: number; format: (value: number) => string }) {
+  return <span className={value >= 0 ? 'text-gain' : 'text-loss'}>{format(value)}</span>;
 }
 
 export function CopyPortfolioDrawer({ portfolio, onClose, fmtMoney, fmtSignedMoney }: { portfolio: CopyPortfolio | null; onClose: () => void; fmtMoney: (usd: number) => string; fmtSignedMoney: (usd: number) => string }) {
@@ -62,16 +65,19 @@ export function CopyPortfolioDrawer({ portfolio, onClose, fmtMoney, fmtSignedMon
               <button type="button" onClick={onClose} aria-label="Chiudi dettagli copy portfolio" className="rounded-md p-1.5 text-text-2 hover:bg-bg-2 hover:text-text-0"><X className="h-5 w-5" aria-hidden /></button>
             </div>
             <div className="flex-1 overflow-y-auto px-5 py-4">
-              <div className="grid grid-cols-3 gap-2">
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
                 <Metric label="Valore" value={fmtMoney(portfolio.value)} />
                 <Metric label="Investito" value={fmtMoney(portfolio.invested)} />
-                <Metric label="P&L" value={fmtSignedMoney(portfolio.pnl)} tone={portfolio.pnl >= 0 ? 'gain' : 'loss'} />
+                <Metric label="P&L attivo" value={fmtSignedMoney(portfolio.activeUnrealizedPnl)} tone={portfolio.activeUnrealizedPnl >= 0 ? 'gain' : 'loss'} />
+                <Metric label="P&L chiuso" value={fmtSignedMoney(portfolio.closedRealizedPnl)} tone={portfolio.closedRealizedPnl >= 0 ? 'gain' : 'loss'} />
+                <Metric label="P&L totale" value={fmtSignedMoney(portfolio.totalPnl)} tone={portfolio.totalPnl >= 0 ? 'gain' : 'loss'} />
+                <Metric label="Inizio copy" value={portfolio.startDate ? new Date(portfolio.startDate).toLocaleDateString('it-IT') : 'Non disponibile'} />
               </div>
               <div className="mt-5 flex items-center justify-between"><h3 className="text-body-strong text-text-0">Acquisti del copy</h3><span className="text-micro text-text-2">Aggiornati con eToro</span></div>
               <div className="mt-2 divide-y divide-hairline rounded-lg border border-hairline bg-bg-0">
                 {portfolio.positions.map((position) => (
                   <div key={position.positionId} className="flex items-center gap-3 px-3 py-3">
-                    <InstrumentAvatar symbol={position.symbol} size={28} />
+                    <InstrumentAvatar symbol={position.symbol} size={28} imageUrl={position.imageUrl} />
                     <div className="min-w-0 flex-1"><div className="font-mono text-ticker text-text-0">{position.symbol}</div><div className="truncate text-micro text-text-2">{position.name} · {CLASS_LABELS[position.assetClass] ?? position.assetClass}</div></div>
                     <div className="text-right"><div className="text-caption tabular-nums text-text-0">{fmtMoney(position.currentValue ?? position.invested)}</div><div className="text-micro tabular-nums text-text-2">{formatUnits(position.units)} · {formatPrice(position.currentPrice ?? position.openPrice)}</div></div>
                   </div>

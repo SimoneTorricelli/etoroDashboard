@@ -37,11 +37,13 @@ const CIRC = 2 * Math.PI * R;
 export function AllocationDonut({ title, slices, centerValue, centerLabel, selectedKey, onSelect }: AllocationDonutProps) {
   const [hoverKey, setHoverKey] = useState<string | null>(null);
 
-  /* Offset cumulativi dei segmenti (gap di 0.4% tra segmenti se >1). */
-  const segs = slices.map((s, i) => ({
-    ...s,
-    start: slices.slice(0, i).reduce((sum, x) => sum + x.weight, 0),
-  }));
+  const positive = slices.filter((slice) => Number.isFinite(slice.weight) && slice.weight > 0);
+  const totalWeight = positive.reduce((sum, slice) => sum + slice.weight, 0);
+  const segs = positive.map((slice, index) => {
+    const normalizedWeight = totalWeight > 0 ? slice.weight / totalWeight : 0;
+    const start = totalWeight > 0 ? positive.slice(0, index).reduce((sum, previous) => sum + previous.weight / totalWeight, 0) : 0;
+    return { ...slice, displayWeight: slice.weight, weight: normalizedWeight, start };
+  });
 
   const handleSelect = (key: string) => {
     if (!onSelect) return;
@@ -67,9 +69,9 @@ export function AllocationDonut({ title, slices, centerValue, centerLabel, selec
                   fill="none"
                   stroke={s.color}
                   strokeWidth={active ? STROKE + 5 : STROKE}
-                  strokeDasharray={`${(frac * CIRC).toFixed(2)} ${CIRC.toFixed(2)}`}
-                  initial={{ strokeDashoffset: CIRC }}
-                  animate={{ strokeDashoffset: (CIRC * (1 - s.start)).toFixed(2) }}
+                  strokeDashoffset={-s.start * CIRC}
+                  initial={{ strokeDasharray: `0 ${CIRC}` }}
+                  animate={{ strokeDasharray: `${frac * CIRC} ${CIRC}` }}
                   transition={{ duration: 0.7, delay: i * 0.08, ease: [0.2, 0.8, 0.2, 1] }}
                   style={{ cursor: onSelect ? 'pointer' : 'default', transition: 'stroke-width 150ms' }}
                   onMouseEnter={() => setHoverKey(s.key)}
@@ -103,7 +105,7 @@ export function AllocationDonut({ title, slices, centerValue, centerLabel, selec
                 >
                   <span className="h-2.5 w-2.5 shrink-0 rounded-sm" style={{ backgroundColor: s.color }} aria-hidden />
                   <span className="min-w-0 flex-1 truncate text-body text-text-1">{s.label}</span>
-                  <span className="text-body-strong tabular-nums text-text-0">{(s.weight * 100).toLocaleString('it-IT', { maximumFractionDigits: 1 })}%</span>
+                  <span className="text-body-strong tabular-nums text-text-0">{(s.displayWeight * 100).toLocaleString('it-IT', { maximumFractionDigits: 1 })}%</span>
                   <span className="w-20 text-right text-caption tabular-nums text-text-2">{s.valueLabel}</span>
                 </button>
               </li>

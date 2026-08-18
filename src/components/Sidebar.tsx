@@ -2,7 +2,7 @@
  * Sidebar — navigazione principale (design.md / App Shell).
  * ≥1200px: 232px con label. 768–1199px: rail icone 64px. <768px: nascosta
  * (navigazione via MobileTabBar).
- * Include: switch modalità Demo/Live, status card connessione, footer links.
+ * Include: stato connessione Live/Real e footer links.
  */
 import { NavLink, useNavigate } from 'react-router';
 import {
@@ -30,7 +30,6 @@ const NAV = [
 ];
 
 const STATUS_VARIANT: Record<string, StatusDotVariant> = {
-  demo: 'ok',
   connecting: 'warn',
   connected: 'live',
   disconnected: 'idle',
@@ -38,7 +37,6 @@ const STATUS_VARIANT: Record<string, StatusDotVariant> = {
 };
 
 const STATUS_LABEL: Record<string, string> = {
-  demo: 'Modalità Demo',
   connecting: 'Connessione in corso…',
   connected: 'Connesso a eToro',
   disconnected: 'Disconnesso',
@@ -46,7 +44,7 @@ const STATUS_LABEL: Record<string, string> = {
 };
 
 export function Sidebar() {
-  const { mode, setMode, status, quotes } = useAppData();
+  const { status, quotes } = useAppData();
   const navigate = useNavigate();
   const liveCount = Object.keys(quotes).length;
 
@@ -86,35 +84,6 @@ export function Sidebar() {
         ))}
       </nav>
 
-      {/* Modalità switch */}
-      <div className="border-t border-hairline p-3">
-        <div className="hidden xl:block">
-          <span className="overline">Modalità</span>
-          <div className="mt-2 grid grid-cols-2 rounded-lg border border-hairline bg-bg-1 p-0.5">
-            {(['demo', 'live'] as const).map((m) => (
-              <button
-                key={m}
-                onClick={() => setMode(m)}
-                className={cn(
-                  'rounded-md py-1.5 text-micro font-medium uppercase tracking-wide transition-colors',
-                  mode === m ? 'bg-bg-3 text-text-0' : 'text-text-2 hover:text-text-1',
-                )}
-              >
-                {m === 'demo' ? 'Demo' : 'Live'}
-              </button>
-            ))}
-          </div>
-        </div>
-        {/* icon rail: solo dot modalità cliccabile */}
-        <button
-          onClick={() => setMode(mode === 'demo' ? 'live' : 'demo')}
-          title={mode === 'demo' ? 'Modalità Demo — passa a Live' : 'Modalità Live — passa a Demo'}
-          className="mx-auto flex h-8 w-8 items-center justify-center rounded-lg border border-hairline bg-bg-1 xl:hidden"
-        >
-          <StatusDot variant={mode === 'demo' ? 'ok' : 'live'} />
-        </button>
-      </div>
-
       {/* Status card connessione */}
       <div className="border-t border-hairline p-3">
         <div className="hidden items-center gap-2 rounded-lg border border-hairline bg-bg-1 px-3 py-2.5 xl:flex">
@@ -122,7 +91,7 @@ export function Sidebar() {
           <div className="min-w-0">
             <div className="truncate text-micro font-medium text-text-0">{STATUS_LABEL[status] ?? status}</div>
             <div className="truncate text-micro text-text-2">
-              {status === 'connected' ? `${liveCount} strumenti in streaming` : mode === 'demo' ? 'Dati simulati' : 'Verifica Impostazioni'}
+              {status === 'connected' ? `${liveCount} strumenti in streaming` : 'Verifica Impostazioni'}
             </div>
           </div>
         </div>

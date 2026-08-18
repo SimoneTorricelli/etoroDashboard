@@ -12,7 +12,6 @@ import { formatFxRate, formatPercent } from '@/lib/format';
 import { DeltaChip } from '@/components/shared/DeltaChip';
 import { Sparkline } from '@/components/shared/Sparkline';
 import { Skeleton } from '@/components/shared/Skeleton';
-import { EURUSD_ID } from './useFxData';
 import type { FxStats } from './useFxData';
 
 /** Flash blu 300ms al cambio del tasso (neutro: non verde/rosso). */
@@ -31,10 +30,11 @@ function useBlueFlash(value: number | undefined) {
 }
 
 export function RateHero({ stats }: { stats: FxStats }) {
-  const { fxRate, sparkFor, status } = useAppData();
+  const { fxRate, sparkFor, status, getFxInstrumentId, instruments } = useAppData();
   const rate = fxRate?.rate;
   const flash = useBlueFlash(rate);
-  const spark = sparkFor(EURUSD_ID);
+  const fxInstrumentId = instruments.find((instrument) => instrument.symbol.toUpperCase() === 'EURUSD')?.instrumentId ?? getFxInstrumentId();
+  const spark = fxInstrumentId ? sparkFor(fxInstrumentId) : [];
 
   const strengthening = (fxRate?.changePct ?? 0) >= 0;
 
@@ -50,7 +50,7 @@ export function RateHero({ stats }: { stats: FxStats }) {
         <div className="flex items-center justify-between">
           <span className="overline">EUR/USD</span>
           <span className="text-micro text-text-2">
-            {status === 'connected' ? 'Live · eToro' : 'Simulato'}
+            {status === 'connected' ? 'Live · eToro' : 'Non connesso'}
           </span>
         </div>
 

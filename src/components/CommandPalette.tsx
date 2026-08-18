@@ -86,7 +86,7 @@ export function CommandPalette({ open, onOpenChange }: CommandPaletteProps) {
                     key={inst.instrumentId}
                     onSelect={() => go(`/mercati?instrument=${inst.instrumentId}`)}
                   >
-                    <InstrumentAvatar symbol={inst.symbol} size={24} />
+                    <InstrumentAvatar symbol={inst.symbol} size={24} imageUrl={inst.imageUrl} backgroundColor={inst.imageBackgroundColor} textColor={inst.imageTextColor} />
                     <span className="font-mono text-ticker text-text-0">{inst.symbol}</span>
                     <span className="truncate text-caption text-text-1">{inst.name}</span>
                   </PaletteItem>

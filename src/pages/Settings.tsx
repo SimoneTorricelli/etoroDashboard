@@ -26,7 +26,7 @@ const NAV = [
 ] as const;
 
 export default function Settings() {
-  const { mode, status, settings } = useAppData();
+  const { status, settings } = useAppData();
   const [searchParams] = useSearchParams();
   const [active, setActive] = useState<string>('connessione');
 
@@ -63,13 +63,9 @@ export default function Settings() {
 
   /* Chip di stato connessione (header) */
   const chip = (() => {
-    if (mode === 'demo') {
-      return { variant: 'idle' as const, cls: 'border-info/40 bg-info/10 text-info', label: 'Modalità Demo' };
-    }
     if (status === 'connected') {
-      const env = settings.live.environment === 'real' ? 'Real' : 'Demo';
       const perm = settings.live.permissions === 'write' ? 'Lettura+Scrittura' : 'Sola lettura';
-      return { variant: 'ok' as const, cls: 'border-gain/40 bg-gain-dim text-gain', label: `Connesso · ${env} · ${perm}` };
+      return { variant: 'ok' as const, cls: 'border-gain/40 bg-gain-dim text-gain', label: `Connesso · Real · ${perm}` };
     }
     return { variant: 'error' as const, cls: 'border-loss/40 bg-loss-dim text-loss', label: 'Non connesso' };
   })();

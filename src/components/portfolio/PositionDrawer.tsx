@@ -68,7 +68,7 @@ export function PositionDrawer({ row, onClose, fmtMoney, fmtSignedMoney, sparkFo
           >
             <div className="flex items-center justify-between border-b border-hairline px-5 py-4">
               <span className="flex items-center gap-3">
-                <InstrumentAvatar symbol={row.symbol} size={36} />
+                <InstrumentAvatar symbol={row.symbol} size={36} imageUrl={row.imageUrl} />
                 <span>
                   <span className="block font-mono text-ticker text-text-0">{row.symbol}</span>
                   <span className="block text-caption text-text-2">{row.name}</span>

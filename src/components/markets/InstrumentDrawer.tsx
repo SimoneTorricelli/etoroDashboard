@@ -14,17 +14,16 @@ import { Bell, BellRing, X, Zap } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useAppData } from '@/lib/data/store';
 import {
-  formatCompact, formatFxRate, formatPercent,
+  formatFxRate, formatPercent,
   formatPrice, formatSignedCurrency, formatUnits,
 } from '@/lib/format';
-import { Drawer, DrawerContent, DrawerTitle } from '@/components/ui/drawer';
+import { Drawer, DrawerContent, DrawerDescription, DrawerTitle } from '@/components/ui/drawer';
 import { InstrumentAvatar } from '@/components/shared/InstrumentAvatar';
 import { DeltaChip } from '@/components/shared/DeltaChip';
 import { TickValue } from '@/components/shared/TickValue';
 import { ConfirmDialog } from '@/components/shared/ConfirmDialog';
 import { Skeleton } from '@/components/shared/Skeleton';
 import type { Candle, CandleInterval, Instrument } from '@/lib/data/types';
-import { marketCapFor, volumeFor } from './meta';
 
 const INTERVALS: { key: string; label: string; interval: CandleInterval; count: number; seconds: number }[] = [
   { key: '1m', label: '1m', interval: 'OneMinute', count: 240, seconds: 60 },
@@ -98,10 +97,13 @@ function DrawerBody({ instrument, onClose }: { instrument: Instrument; onClose()
   return (
     <div className="flex h-full flex-col overflow-y-auto">
       <DrawerTitle className="sr-only">{instrument.name}</DrawerTitle>
+      <DrawerDescription className="sr-only">
+        Prezzo, storico e azioni disponibili per {instrument.name}.
+      </DrawerDescription>
 
       {/* Header */}
       <motion.div {...stagger(0)} className="flex items-start gap-3 border-b border-hairline p-5">
-        <InstrumentAvatar symbol={instrument.symbol} size={40} />
+        <InstrumentAvatar symbol={instrument.symbol} size={40} imageUrl={instrument.imageUrl} backgroundColor={instrument.imageBackgroundColor} textColor={instrument.imageTextColor} />
         <div className="min-w-0 flex-1">
           <h2 className="truncate text-title text-text-0">{instrument.name}</h2>
           <div className="mt-0.5 flex items-center gap-2">
@@ -290,6 +292,7 @@ function CandleChart({ instrumentId, intervalKey }: { instrumentId: number; inte
   const [lastCandle, setLastCandle] = useState<Candle | null>(null);
   /** Chiave strumento:intervallo per cui i dati sono stati caricati. */
   const [loadedFor, setLoadedFor] = useState<string | null>(null);
+  const [loadState, setLoadState] = useState<'loading' | 'ready' | 'empty' | 'rate' | 'error'>('loading');
 
   const spec = INTERVALS.find((i) => i.key === intervalKey) ?? INTERVALS[3];
 
@@ -347,24 +350,32 @@ function CandleChart({ instrumentId, intervalKey }: { instrumentId: number; inte
   const loadKey = `${instrumentId}:${spec.interval}`;
   const ready = loadedFor === loadKey;
   useEffect(() => {
-    let cancelled = false;
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => { if (!controller.signal.aborted) { setLoadState('loading'); setLoadedFor(null); } }, 0);
     void (async () => {
-      const data = await getCandles(instrumentId, spec.interval, spec.count);
-      if (cancelled) return;
-      candlesDataRef.current = data;
-      candleRef.current?.setData(data.map((c) => ({
-        time: c.time as UTCTimestamp, open: c.open, high: c.high, low: c.low, close: c.close,
-      })));
-      volumeRef.current?.setData(data.map((c) => ({
-        time: c.time as UTCTimestamp,
-        value: c.volume ?? 0,
-        color: c.close >= c.open ? '#00C39033' : '#F4556B33',
-      })));
-      chartRef.current?.timeScale().fitContent();
-      setLastCandle(data[data.length - 1] ?? null);
-      setLoadedFor(`${instrumentId}:${spec.interval}`);
+      try {
+        const data = await getCandles(instrumentId, spec.interval, spec.count, controller.signal);
+        if (controller.signal.aborted) return;
+        candlesDataRef.current = data;
+        candleRef.current?.setData(data.map((c) => ({
+          time: c.time as UTCTimestamp, open: c.open, high: c.high, low: c.low, close: c.close,
+        })));
+        volumeRef.current?.setData(data.map((c) => ({
+          time: c.time as UTCTimestamp,
+          value: c.volume ?? 0,
+          color: c.close >= c.open ? '#00C39033' : '#F4556B33',
+        })));
+        chartRef.current?.timeScale().fitContent();
+        setLastCandle(data[data.length - 1] ?? null);
+        setLoadedFor(`${instrumentId}:${spec.interval}`);
+        setLoadState(data.length >= 2 ? 'ready' : 'empty');
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        const message = error instanceof Error ? error.message.toLowerCase() : '';
+        setLoadState(message.includes('rate') || message.includes('429') ? 'rate' : 'error');
+      }
     })();
-    return () => { cancelled = true; };
+    return () => { window.clearTimeout(timer); controller.abort(); };
   }, [instrumentId, spec.interval, spec.count, getCandles]);
 
   /* morphing live dell'ultima candela */
@@ -420,7 +431,12 @@ function CandleChart({ instrumentId, intervalKey }: { instrumentId: number; inte
           </>
         )}
       </div>
-      {!ready && <Skeleton className="absolute inset-2 h-[232px]" />}
+      {loadState === 'loading' && <Skeleton className="absolute inset-2 h-[232px]" />}
+      {loadState !== 'loading' && loadState !== 'ready' ? (
+        <div className="absolute inset-2 z-10 flex h-[232px] items-center justify-center rounded-md bg-bg-0/90 px-8 text-center text-caption text-text-2">
+          {loadState === 'empty' ? 'Nessuna serie storica disponibile da eToro per questo timeframe.' : loadState === 'rate' ? 'Quota eToro temporaneamente esaurita. Riprova tra poco.' : 'Errore nel caricamento dello storico eToro.'}
+        </div>
+      ) : null}
       <div ref={containerRef} className="w-full" />
     </motion.div>
   );
@@ -454,8 +470,8 @@ function StatsGrid({ instrument }: { instrument: Instrument }) {
   const cells: { label: string; value: string }[] = [
     { label: 'Apertura', value: lastDay ? formatPrice(lastDay.open) : '—' },
     { label: 'Max/Min 24h', value: high24 != null && low24 != null ? `${formatPrice(high24)} / ${formatPrice(low24)}` : '—' },
-    { label: 'Volume', value: formatCompact(volumeFor(instrument), instrument.currency) },
-    { label: 'Cap. mercato', value: formatCompact(marketCapFor(instrument), instrument.currency) },
+    { label: 'Volume', value: 'N/D eToro' },
+    { label: 'Cap. mercato', value: 'N/D eToro' },
     { label: 'Var. 52 sett.', value: wHigh != null && wLow != null ? `${formatPrice(wLow)} – ${formatPrice(wHigh)}` : '—' },
     {
       label: 'Cambio applicato',

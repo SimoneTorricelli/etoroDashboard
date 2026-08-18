@@ -2,6 +2,7 @@
  * InstrumentAvatar — quadrato 32px arrotondato con monogramma mono di 2 lettere
  * su sfondo pastel-dark derivato da hash del simbolo (design.md, logo-less).
  */
+import { useState } from 'react';
 import { cn } from '@/lib/utils';
 
 const PALETTE = [
@@ -25,9 +26,14 @@ export interface InstrumentAvatarProps {
   symbol: string;
   size?: number;
   className?: string;
+  imageUrl?: string;
+  backgroundColor?: string;
+  textColor?: string;
 }
 
-export function InstrumentAvatar({ symbol, size = 32, className }: InstrumentAvatarProps) {
+export function InstrumentAvatar({ symbol, size = 32, className, imageUrl, backgroundColor, textColor }: InstrumentAvatarProps) {
+  const [failedUrl, setFailedUrl] = useState<string | undefined>();
+  const failed = Boolean(imageUrl && failedUrl === imageUrl);
   const [bg, fg] = PALETTE[hashCode(symbol) % PALETTE.length];
   const monogram = symbol.replace(/[^A-Za-z]/g, '').slice(0, 2).toUpperCase() || symbol.slice(0, 2).toUpperCase();
   return (
@@ -36,13 +42,13 @@ export function InstrumentAvatar({ symbol, size = 32, className }: InstrumentAva
       style={{
         width: size,
         height: size,
-        backgroundColor: bg,
-        color: fg,
+        backgroundColor: backgroundColor || bg,
+        color: textColor || fg,
         fontSize: Math.max(9, Math.round(size * 0.34)),
       }}
-      aria-hidden
+      aria-label={symbol}
     >
-      {monogram}
+      {imageUrl && !failed ? <img src={imageUrl} alt="" className="h-full w-full rounded-lg object-cover" loading="lazy" onError={() => setFailedUrl(imageUrl)} /> : monogram}
     </span>
   );
 }

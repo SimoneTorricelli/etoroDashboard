@@ -6,6 +6,7 @@
 import { motion } from 'framer-motion';
 import { Info } from 'lucide-react';
 import type { DiversificationScore } from './analytics';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 
 const R = 84;
 const STROKE = 12;
@@ -48,12 +49,18 @@ export function DiversificationGauge({ data }: { data: DiversificationScore }) {
     <div>
       <div className="flex items-center justify-between">
         <h2 className="text-title text-text-0">Score di diversificazione</h2>
-        <span
-          className="group relative"
-          title="Basato su numero di posizioni, settori, classi di attività e concentrazione (HHI)."
-        >
-            <Info className="h-4 w-4 cursor-help text-text-2 transition-colors hover:text-text-1" aria-hidden />
-        </span>
+        <Popover>
+          <PopoverTrigger asChild>
+            <button type="button" aria-label="Come viene calcolato lo score di diversificazione" className="rounded-md p-1 text-text-2 transition-colors hover:bg-bg-2 hover:text-text-1"><Info className="h-4 w-4" aria-hidden /></button>
+          </PopoverTrigger>
+          <PopoverContent align="end" className="w-80 border-hairline bg-bg-1 text-text-1">
+            <h3 className="text-body-strong text-text-0">Come leggiamo lo score</h3>
+            <p className="mt-1 text-caption leading-relaxed text-text-2">Media semplice di cinque sub-score. Ogni distribuzione usa il numero effettivo di categorie derivato dall’indice HHI; le posizioni dei copy portfolio sono scomposte e unite per strumento.</p>
+            <div className="mt-3 flex items-center justify-between text-caption"><span>Formula</span><span className="font-mono text-text-0">{data.formulaVersion}</span></div>
+            <div className="mt-1 flex items-center justify-between text-caption"><span>Copertura settori</span><span className="font-mono text-text-0">{data.classifiedCoveragePct}%</span></div>
+            <div className="mt-3 border-t border-hairline pt-2"><p className="text-micro uppercase tracking-[0.05em] text-text-2">Fattori che riducono lo score</p><ul className="mt-1.5 space-y-1 text-caption">{data.factors.map((factor) => <li key={factor}>• {factor}</li>)}</ul></div>
+          </PopoverContent>
+        </Popover>
       </div>
 
       <div className="mt-3 flex justify-center">

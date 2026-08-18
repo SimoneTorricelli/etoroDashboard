@@ -15,14 +15,14 @@ import { Toaster, toast } from 'sonner';
 import { cn } from '@/lib/utils';
 import { useAppData } from '@/lib/data/store';
 import {
-  formatCurrency, formatFxRate, formatSignedCurrency, formatTime,
+  formatCurrency, formatFxRate, formatSignedCurrency,
 } from '@/lib/format';
 import { KpiCard } from '@/components/shared/KpiCard';
 import { EmptyState } from '@/components/shared/EmptyState';
 import { Skeleton } from '@/components/shared/Skeleton';
-import { StatusDot } from '@/components/shared/StatusDot';
+import { FreshnessBadge } from '@/components/shared/FreshnessBadge';
 import {
-  allocate, buildSuggestions, computeDiversification, enrichPositions, monthlyPnl,
+  allocate, buildSuggestions, computeDiversification, enrichLookThroughPositions, enrichPositions, monthlyPnl,
   CLASS_LABELS,
 } from '@/components/portfolio/analytics';
 import type { PositionRow } from '@/components/portfolio/analytics';
@@ -64,7 +64,7 @@ export default function Portfolio() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const {
-    portfolio, pnl, fxRate, loading, status, mode, setMode,
+    portfolio, pnl, fxRate, loading, status,
     displayCurrency, setDisplayCurrency, fromUsd,
     sparkFor, agent, agentVersion, closePosition,
   } = useAppData();
@@ -74,14 +74,8 @@ export default function Portfolio() {
   const [classFilter, setClassFilter] = useState<string | null>(null);
   const [drawerRow, setDrawerRow] = useState<PositionRow | null>(null);
   const [copyDrawer, setCopyDrawer] = useState<CopyPortfolio | null>(null);
-  const [now, setNow] = useState(() => Date.now());
   const instrumentFilterId = Number(searchParams.get('instrument') ?? 0);
   const copyFilterId = searchParams.get('copyId');
-
-  useEffect(() => {
-    const t = setInterval(() => setNow(Date.now()), 5000);
-    return () => clearInterval(t);
-  }, []);
 
   useEffect(() => {
     if (!copyFilterId || !portfolio?.copyPortfolios) return;
@@ -95,69 +89,61 @@ export default function Portfolio() {
 
   /* ── Dati derivati ─────────────────────────────────────────────── */
   const rows = useMemo(() => (portfolio ? enrichPositions(portfolio) : []), [portfolio]);
-
-  const copyValue = useMemo(
-    () => portfolio?.copyPortfolios?.reduce((sum, copy) => sum + copy.value, 0) ?? portfolio?.mirrorValue ?? 0,
+  const lookThroughRows = useMemo(() => (portfolio ? enrichLookThroughPositions(portfolio) : []), [portfolio]);
+  const lookThroughCash = useMemo(
+    () => (portfolio?.cash ?? 0) + (portfolio?.copyPortfolios ?? []).reduce((sum, copy) => sum + copy.availableCash, 0),
     [portfolio],
   );
 
   const score = useMemo(
-    () => computeDiversification(rows, portfolio?.cash ?? 0, portfolio?.totalValue ?? 0, copyValue),
-    [rows, portfolio, copyValue],
+    () => computeDiversification(lookThroughRows, lookThroughCash, portfolio?.totalValue ?? 0),
+    [lookThroughCash, lookThroughRows, portfolio],
   );
 
   const classSlices = useMemo(() => {
     if (!portfolio) return [];
     return allocate(
-      rows,
+      lookThroughRows,
       (r) => r.assetClass,
       (k) => CLASS_LABELS[k as keyof typeof CLASS_LABELS] ?? k,
       portfolio.totalValue,
       [
-        ...(portfolio.cash > 0
-          ? [{ key: 'cash', label: 'Cash', value: portfolio.cash, weight: portfolio.cash / portfolio.totalValue }]
-          : []),
-        ...(copyValue
-          ? [{ key: 'mirror', label: 'Copy trading', value: copyValue, weight: copyValue / portfolio.totalValue }]
+        ...(lookThroughCash > 0
+          ? [{ key: 'cash', label: 'Cash', value: lookThroughCash, weight: lookThroughCash / portfolio.totalValue }]
           : []),
       ],
     );
-  }, [rows, portfolio, copyValue]);
+  }, [lookThroughCash, lookThroughRows, portfolio]);
 
   const currencySlices = useMemo(() => {
     if (!portfolio) return [];
     return allocate(
-      rows,
+      lookThroughRows,
       (r) => r.currency,
       (k) => k,
       portfolio.totalValue,
       [
-        ...(portfolio.cash > 0
-          ? [{ key: 'USD', label: 'USD (cash)', value: portfolio.cash, weight: portfolio.cash / portfolio.totalValue }]
-          : []),
-        ...(copyValue
-          ? [{ key: 'USD', label: 'USD (copy trading)', value: copyValue, weight: copyValue / portfolio.totalValue }]
+        ...(lookThroughCash > 0
+          ? [{ key: 'USD', label: 'USD (cash)', value: lookThroughCash, weight: lookThroughCash / portfolio.totalValue }]
           : []),
       ],
     );
-  }, [rows, portfolio, copyValue]);
+  }, [lookThroughCash, lookThroughRows, portfolio]);
 
   const sectorSlices = useMemo(() => {
     if (!portfolio) return [];
     return allocate(
-      rows,
+      lookThroughRows,
       (r) => r.sector,
       (k) => k,
       portfolio.totalValue,
-      copyValue
-        ? [{ key: 'Copy trading', label: 'Copy trading', value: copyValue, weight: copyValue / portfolio.totalValue }]
-        : [],
+      [],
     );
-  }, [rows, portfolio, copyValue]);
+  }, [lookThroughRows, portfolio]);
 
   const usdExposure = useMemo(
-    () => (portfolio?.cash ?? 0) + copyValue + rows.filter((r) => r.currency === 'USD').reduce((s, r) => s + r.value, 0),
-    [rows, portfolio, copyValue],
+    () => lookThroughCash + lookThroughRows.filter((r) => r.currency === 'USD').reduce((s, r) => s + r.value, 0),
+    [lookThroughCash, lookThroughRows],
   );
   const usdExposurePct = portfolio && portfolio.totalValue > 0 ? usdExposure / portfolio.totalValue : 0;
 
@@ -165,7 +151,7 @@ export default function Portfolio() {
 
   const suggestions = useMemo(
     () => buildSuggestions({
-      rows,
+      rows: lookThroughRows,
       totalValue: portfolio?.totalValue ?? 0,
       cash: portfolio?.cash ?? 0,
       usdExposure,
@@ -175,7 +161,7 @@ export default function Portfolio() {
       fmtPct: fmtWeight,
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [rows, portfolio, usdExposure, usdExposurePct, score, cur],
+    [lookThroughRows, portfolio, usdExposure, usdExposurePct, score, cur],
   );
 
   const unprotectedCount = rows.filter((r) => r.stopLossRate == null).length;
@@ -265,15 +251,13 @@ export default function Portfolio() {
   };
 
   /* ── Stati vuoti / caricamento ─────────────────────────────────── */
-  if (!loading && !portfolio && mode === 'live') {
+  if (!loading && !portfolio) {
     return (
       <EmptyState
         headline="Nessun dato disponibile"
-        copy="Collega il tuo account eToro o esplora la modalità Demo con dati simulati."
-        actionLabel="Attiva modalità Demo"
-        onAction={() => setMode('demo')}
-        secondaryLabel="Configura le chiavi API"
-        onSecondary={() => navigate('/impostazioni')}
+        copy="Configura chiavi e proxy per collegare il tuo account eToro reale. Nessun dato simulato verrà mostrato."
+        actionLabel="Configura la connessione"
+        onAction={() => navigate('/impostazioni')}
       />
     );
   }
@@ -282,11 +266,9 @@ export default function Portfolio() {
     return (
       <EmptyState
         headline="Nessuna posizione"
-        copy="Il portafoglio è vuoto: importa l'estratto conto eToro o esplora la modalità Demo con un portafoglio simulato."
+        copy="Il portafoglio reale è vuoto. Puoi importare l'estratto conto eToro per estendere lo storico."
         actionLabel="Importa CSV eToro"
         onAction={() => navigate('/impostazioni')}
-        secondaryLabel="Esplora la Demo"
-        onSecondary={() => setMode('demo')}
       />
     );
   }
@@ -315,16 +297,8 @@ export default function Portfolio() {
       <motion.div {...stagger(0)} className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-3">
           <h1 className="font-display text-display-lg text-text-0">Portfolio</h1>
-          <span
-            className={cn(
-              'flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-micro font-medium',
-              mode === 'demo'
-                ? 'border-warn/40 bg-warn/10 text-warn'
-                : 'border-hairline bg-bg-1 text-text-1',
-            )}
-          >
-            <StatusDot variant={mode === 'demo' ? 'warn' : status === 'connected' ? 'live' : 'error'} />
-            {mode === 'demo' ? 'Dati Demo simulati' : `Dati live · sync ${formatTime(now)}`}
+          <span className="rounded-full border border-hairline bg-bg-1 px-1.5 py-0.5">
+            <FreshnessBadge asOf={portfolio?.asOf} source="Snapshot conto reale eToro" />
           </span>
         </div>
 
@@ -383,27 +357,35 @@ export default function Portfolio() {
             <KpiCard
               label="Valore totale"
               value={portfolio ? fmt(portfolio.totalValue) : '—'}
+              numericValue={portfolio ? fromUsd(portfolio.totalValue) : undefined}
+              formatValue={(value) => formatCurrency(value, cur)}
               deltaPct={pnl?.dailyPnlPct}
               deltaAbsolute={pnl ? fromUsd(pnl.dailyPnl) : undefined}
               currency={cur}
               sparkData={sparkWindow(pnl?.equityHistory)}
               sparkLive
-              status={status === 'connected' || status === 'demo' ? 'live' : 'idle'}
+              status={status === 'connected' ? 'live' : 'idle'}
+              info="Equity corrente: cash più valore delle posizioni manuali e dei copy portfolio nello snapshot reale eToro."
             />
           </div>
           <div className="col-span-12 sm:col-span-6 lg:col-span-3">
             <KpiCard
               label="P&L totale"
               value={pnl ? fmtSigned(pnl.totalPnl) : '—'}
+              numericValue={pnl ? fromUsd(pnl.totalPnl) : undefined}
+              formatValue={(value) => formatSignedCurrency(value, cur)}
               deltaPct={pnl?.totalPnlPct}
               currency={cur}
               sparkData={sparkWindow(pnl?.equityHistory)}
+              info="Formula eToro: P&L manuale non realizzato + P&L mirror non realizzato + profitto netto mirror chiuso."
             />
           </div>
           <div className="col-span-12 sm:col-span-6 lg:col-span-3">
             <KpiCard
               label="P&L non realizzato"
               value={fmtSigned(unrealizedPnl)}
+              numericValue={fromUsd(unrealizedPnl)}
+              formatValue={(value) => formatSignedCurrency(value, cur)}
               deltaPct={unrealizedPct}
               currency={cur}
               sparkData={sparkWindow(pnl?.equityHistory)}

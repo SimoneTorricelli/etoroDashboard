@@ -6,7 +6,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createChart, LineSeries } from 'lightweight-charts';
 import type { IChartApi, ISeriesApi, UTCTimestamp } from 'lightweight-charts';
-import { ChevronDown, FlaskConical, Play } from 'lucide-react';
+import { ChevronDown, FlaskConical, Play, TriangleAlert } from 'lucide-react';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import {
   Select,
@@ -40,6 +40,7 @@ export function BacktestCard({ rules, sltpMap, capitalLimitFor }: BacktestCardPr
   const [period, setPeriod] = useState<(typeof PERIODS)[number]['key']>('6M');
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<BacktestResult | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   const selectedRule = useMemo(
     () => rules.find((r) => r.id === ruleId) ?? rules[0] ?? null,
@@ -50,24 +51,32 @@ export function BacktestCard({ rules, sltpMap, capitalLimitFor }: BacktestCardPr
     if (!selectedRule || running) return;
     setRunning(true);
     setResult(null);
+    setError(null);
     try {
       const days = PERIODS.find((p) => p.key === period)!.days;
-      const entries = await Promise.all(
+      const settled = await Promise.allSettled(
         selectedRule.instrumentIds.map(
           async (iid) => [iid, await getCandles(iid, 'OneDay', Math.min(days, 1000))] as const,
         ),
       );
+      const failed = settled.filter((entry) => entry.status === 'rejected');
+      if (failed.length > 0) throw new Error(`${failed.length} serie storiche non sono state scaricate.`);
+      const entries = settled.flatMap((entry) => entry.status === 'fulfilled' ? [entry.value] : []);
+      const insufficient = entries.filter(([, candles]) => candles.length < 30);
+      if (insufficient.length > 0) throw new Error(`Dati insufficienti per ${insufficient.length} strumenti: servono almeno 30 candele reali.`);
       const map = new Map(entries);
       const sltp = sltpMap[selectedRule.id] ?? { stopLossPct: 8, takeProfitPct: 15 };
       setResult(runBacktest(selectedRule, sltp, map, capitalLimitFor(selectedRule)));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Simulazione non disponibile.');
     } finally {
       setRunning(false);
     }
   };
 
   return (
-    <Collapsible open={open} onOpenChange={setOpen}>
-      <div className="card-surface density-pad col-span-12 p-5">
+    <Collapsible open={open} onOpenChange={setOpen} className="col-span-12 min-w-0">
+      <div className="card-surface density-pad p-5">
         <CollapsibleTrigger className="flex w-full items-center justify-between gap-2 text-left">
           <span className="flex items-center gap-2">
             <FlaskConical className="h-4 w-4 text-agent" aria-hidden />
@@ -136,16 +145,20 @@ export function BacktestCard({ rules, sltpMap, capitalLimitFor }: BacktestCardPr
                   tone={result.maxDrawdownPct > 15 ? 'neg' : 'neutral'}
                 />
                 <StatChip label="Vincenti / Perdenti" value={`${result.wins} / ${result.losses}`} />
+                <StatChip label="Volatilità ann." value={formatPercent(result.volatilityPct, 1, false)} />
+                <StatChip label="Sharpe indicativo" value={result.sharpe == null ? 'N/D' : result.sharpe.toLocaleString('it-IT', { maximumFractionDigits: 2 })} />
+                <StatChip label="Costi + slippage" value={formatCurrency(fromUsd(result.estimatedCosts), displayCurrency)} />
                 <StatChip
                   label="Capitale impiegato max"
                   value={formatCurrency(fromUsd(result.investedTotal), displayCurrency, 0)}
                 />
               </div>
               <p className="mt-3 text-caption text-text-2">
-                Simulazione indicativa su dati storici — non garantisce risultati futuri.
+                Simulazione indicativa su dati storici reali · ipotesi: 5 bps di costo + 5 bps di slippage per lato · non garantisce risultati futuri.
               </p>
             </div>
           )}
+          {error ? <div role="alert" className="mt-4 flex items-start gap-2 rounded-lg border border-warn/30 bg-warn/5 p-3 text-caption text-warn"><TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />{error} Nessun risultato a zero viene mostrato come valido.</div> : null}
           {!result && !running && (
             <p className="mt-4 text-caption text-text-2">
               Scegli una regola e un periodo: la simulazione valuta la condizione giorno per giorno

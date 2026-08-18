@@ -12,7 +12,7 @@ import { useSearchParams } from 'react-router';
 import { motion } from 'framer-motion';
 import {
   Bot, Copy, Download, EllipsisVertical, OctagonX, Pencil, Play, Plus, Power,
-  Trash2, Zap,
+  Trash2, Zap, Info,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { Toaster } from '@/components/ui/sonner';
@@ -33,6 +33,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { cn } from '@/lib/utils';
 import { useAppData } from '@/lib/data/store';
 import {
@@ -51,6 +52,7 @@ import { GroupEditor } from '@/components/agent/GroupEditor';
 import { KillSwitchDialog } from '@/components/agent/KillSwitchDialog';
 import { BacktestCard } from '@/components/agent/BacktestCard';
 import { StrategyPortfolioStudio } from '@/components/agent/StrategyPortfolioStudio';
+import { AgentMasterSwitch } from '@/components/agent/AgentMasterSwitch';
 import {
   DEFAULT_SLTP, conditionChip, hasAutoAck, loadGroupMeta, loadSlTpMap, saveGroupMeta, setAutoAck,
 } from '@/components/agent/agent-utils';
@@ -70,7 +72,7 @@ export default function Agent() {
     fromUsd, displayCurrency, fxRate, realExecutionActive,
   } = useAppData();
   const cur = displayCurrency;
-  const toUsd = (v: number) => (displayCurrency === 'USD' ? v : v * (fxRate?.rate ?? 1.09));
+  const toUsd = (v: number) => (displayCurrency === 'USD' ? v : fxRate?.rate ? v * fxRate.rate : Number.NaN);
 
   const [searchParams, setSearchParams] = useSearchParams();
   const [builderOpen, setBuilderOpen] = useState(false);
@@ -86,13 +88,14 @@ export default function Agent() {
   const [now, setNow] = useState(() => Date.now());
 
   /* ── Snapshot engine (agentVersion forza il re-render) ───────────── */
-  const groups = useMemo(() => agent.getGroups(), [agent, agentVersion]);
-  const rules = useMemo(() => agent.getRules(), [agent, agentVersion]);
-  const executions = useMemo(() => agent.getExecutions(), [agent, agentVersion]);
-  const pending = useMemo(() => agent.getPendingConfirmations(), [agent, agentVersion]);
-  const activeRules = useMemo(() => agent.getActiveRulesCount(), [agent, agentVersion]);
-  const execToday = useMemo(() => agent.getExecutionsToday(), [agent, agentVersion]);
-  const remainingBudget = useMemo(() => agent.getRemainingBudget(), [agent, agentVersion]);
+  void agentVersion;
+  const groups = agent.getGroups();
+  const rules = agent.getRules();
+  const executions = agent.getExecutions();
+  const pending = agent.getPendingConfirmations();
+  const activeRules = agent.getActiveRulesCount();
+  const execToday = agent.getExecutionsToday();
+  const remainingBudget = agent.getRemainingBudget();
   const masterEnabled = agent.masterEnabled;
   const autoExecute = agent.autoExecute;
   const killEngaged = agent.killSwitchEngaged;
@@ -185,8 +188,7 @@ export default function Agent() {
   };
 
   /* ── Azioni ──────────────────────────────────────────────────────── */
-  const handleMasterToggle = (on: boolean) => {
-    agent.setMasterEnabled(on);
+  const handleMasterChanged = (on: boolean) => {
     toast(on ? 'Agent attivato' : 'Agent in pausa', {
       icon: <Bot className="h-4 w-4 text-agent" />,
     });
@@ -291,16 +293,7 @@ export default function Agent() {
             <StatusDot variant={execToday >= agent.maxOrdersPerDay ? 'warn' : 'agent'} />
             Ordini oggi {execToday}/{agent.maxOrdersPerDay}
           </span>
-          <label className="flex items-center gap-2">
-            <span className="text-label text-text-1">Agent</span>
-            <Switch
-              checked={masterEnabled}
-              onCheckedChange={handleMasterToggle}
-              disabled={killEngaged}
-              className="data-[state=checked]:bg-agent"
-              aria-label="Master switch Agent"
-            />
-          </label>
+          <AgentMasterSwitch agent={agent} realExecutionActive={realExecutionActive} disabled={killEngaged} onChanged={handleMasterChanged} />
           <label className="flex items-center gap-2">
             <span className="flex items-center gap-1 text-label text-text-1">
               <Zap className="h-3.5 w-3.5 text-agent" aria-hidden />
@@ -339,12 +332,12 @@ export default function Agent() {
       </div>
 
       {/* ── ROW 0: banner di sicurezza ──────────────────────────────── */}
-      {realExecutionActive && (
+      {realExecutionActive && masterEnabled && (
         <RiskBanner
           variant="danger"
           dismissible={false}
           className="col-span-12"
-          message="Esecuzione reale attiva — gli ordini Agent useranno denaro reale."
+          message="Agent attivo sul conto reale — le regole abilitate possono usare denaro reale entro i limiti configurati."
         />
       )}
       {killEngaged && (
@@ -669,7 +662,7 @@ function StatTiles({
       {/* Budget allocato (stacked bar per gruppo) */}
       <motion.div {...stagger(2)} className="card-surface density-pad p-5">
         <div className="flex items-center justify-between">
-          <span className="overline">Budget allocato</span>
+          <span className="inline-flex items-center gap-1.5 overline">Budget allocato<TooltipProvider delayDuration={150}><Tooltip><TooltipTrigger asChild><button type="button" aria-label="Origine del budget allocato" className="text-text-2 hover:text-text-1"><Info className="h-3.5 w-3.5" aria-hidden /></button></TooltipTrigger><TooltipContent className="max-w-80"><p className="text-caption">Somma dei limiti dei gruppi creati dall’utente. Usato = somma del capitale impiegato; residuo = somma di max(limite − usato, 0).</p>{groups.length ? <ul className="mt-2 space-y-1 text-micro text-text-2">{groups.map((group) => <li key={group.id}>{group.name}: {formatCurrency(fromUsd(group.usedCapital), cur, 0)} / {formatCurrency(fromUsd(group.capitalLimit), cur, 0)}</li>)}</ul> : <p className="mt-2 text-micro text-text-2">Nessun gruppo: origine vuota, budget zero.</p>}</TooltipContent></Tooltip></TooltipProvider></span>
           <StatusDot variant="agent" />
         </div>
         <div className="mt-2 font-display text-display-md text-text-0 tabular-nums">

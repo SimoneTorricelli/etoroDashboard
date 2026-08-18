@@ -1,12 +1,11 @@
 /**
  * PreferencesSection — Impostazioni §4 "Preferenze" (design/settings.md):
  * righe label+controllo con divisori hairline: valuta di display (EUR/USD),
- * densità, notifiche browser, suoni tick, riduci animazioni, intervallo
- * aggiornamento demo, reimposta dati demo, cancella dati locali.
+ * densità, notifiche browser, suoni tick, riduci animazioni e cancella dati locali.
  * Ogni modifica mostra un "Salvato ✓" transiente.
  */
 import { useState } from 'react';
-import { RefreshCcw, Trash2 } from 'lucide-react';
+import { Trash2 } from 'lucide-react';
 import { useAppData } from '@/lib/data/store';
 import { Switch } from '@/components/ui/switch';
 import { SavedCaption, Section, Segmented } from './common';
@@ -16,7 +15,6 @@ import { useSavedFeedback } from './useSavedFeedback';
 const PREFS = {
   sounds: 'torino.prefs.sounds',
   reducedMotion: 'torino.prefs.reducedMotion',
-  demoInterval: 'torino.prefs.demoIntervalMs',
 } as const;
 
 function loadBool(key: string, fallback: boolean): boolean {
@@ -32,12 +30,8 @@ function saveBool(key: string, v: boolean): void {
   try { localStorage.setItem(key, v ? '1' : '0'); } catch { /* ignora */ }
 }
 
-function loadInterval(): string {
-  try { return localStorage.getItem(PREFS.demoInterval) ?? '1500'; } catch { return '1500'; }
-}
-
 export function PreferencesSection() {
-  const { displayCurrency, setDisplayCurrency, density, setDensity, refresh } = useAppData();
+  const { displayCurrency, setDisplayCurrency, density, setDensity } = useAppData();
   const [savedVisible, triggerSaved] = useSavedFeedback();
 
   const [notificationsOn, setNotificationsOn] = useState(
@@ -47,9 +41,7 @@ export function PreferencesSection() {
   const [reducedMotion, setReducedMotion] = useState(
     () => loadBool(PREFS.reducedMotion, window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false),
   );
-  const [demoInterval, setDemoInterval] = useState(loadInterval);
   const [confirmClear, setConfirmClear] = useState(false);
-  const [demoResetDone, setDemoResetDone] = useState(false);
 
   const notifPermission = typeof Notification !== 'undefined' ? Notification.permission : 'unsupported';
 
@@ -116,33 +108,6 @@ export function PreferencesSection() {
             onCheckedChange={(v) => { setReducedMotion(v); saveBool(PREFS.reducedMotion, v); triggerSaved(); }}
             aria-label="Riduci animazioni"
           />
-        </PrefRow>
-
-        <PrefRow label="Intervallo aggiornamento demo" hint="Frequenza dei tick simulati in modalità Demo.">
-          <Segmented
-            ariaLabel="Intervallo aggiornamento demo"
-            options={[{ value: '1000', label: '1s' }, { value: '2000', label: '2s' }, { value: '5000', label: '5s' }]}
-            value={demoInterval}
-            onChange={(v) => {
-              setDemoInterval(v);
-              try { localStorage.setItem(PREFS.demoInterval, v); } catch { /* ignora */ }
-              triggerSaved();
-            }}
-          />
-        </PrefRow>
-
-        <PrefRow label="Reimposta dati demo" hint="Ricarica portfolio e quotazioni simulate dal provider.">
-          <button
-            onClick={() => {
-              void refresh();
-              setDemoResetDone(true);
-              setTimeout(() => setDemoResetDone(false), 1500);
-            }}
-            className="flex items-center gap-1.5 rounded-lg border border-hairline px-3 py-1.5 text-caption text-text-1 transition-colors hover:bg-bg-2 hover:text-text-0"
-          >
-            <RefreshCcw className="h-3.5 w-3.5" aria-hidden />
-            {demoResetDone ? 'Dati ricaricati' : 'Reimposta'}
-          </button>
         </PrefRow>
 
         <PrefRow label="Cancella dati locali" hint="Svuota il localStorage (chiavi, regole, avvisi) e ricarica l'app.">

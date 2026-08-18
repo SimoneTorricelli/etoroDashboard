@@ -1,6 +1,6 @@
 /**
- * AppDataStore — React context che istanzia il provider giusto
- * (Demo / Live) in base alle impostazioni e distribuisce dati live
+ * AppDataStore — React context che istanzia il provider Live
+ * quando la configurazione è completa e distribuisce dati reali
  * a tutta l'app.
  *
  * Uso:
@@ -18,15 +18,16 @@ import {
   useState,
 } from 'react';
 import type { ReactNode } from 'react';
-import { DemoDataProvider } from './DemoDataProvider';
 import { LiveDataProvider } from './LiveDataProvider';
 import type { DataProvider } from './DataProvider';
 import type {
   Candle,
   CandleInterval,
+  ClosedTrade,
   ConnectionStatus,
   DataMode,
   FxRate,
+  HistoricalClosingPrice,
   Instrument,
   LogEntry,
   OrderRequest,
@@ -102,7 +103,11 @@ export interface AppDataStore {
   placeOrder(req: OrderRequest): Promise<OrderResult>;
   closePosition(positionId: number): Promise<OrderResult>;
   refresh(): Promise<void>;
-  getCandles(instrumentId: number, interval: CandleInterval, count: number): Promise<Candle[]>;
+  getCandles(instrumentId: number, interval: CandleInterval, count: number, signal?: AbortSignal): Promise<Candle[]>;
+  getQuotes(instrumentIds: number[]): Promise<Quote[]>;
+  getHistoricalClosingPrices(): Promise<HistoricalClosingPrice[]>;
+  getTradeHistory(): Promise<ClosedTrade[]>;
+  getFxInstrumentId(): number | null;
   searchInstruments(query: string): Promise<Instrument[]>;
   addPriceAlert(alert: Omit<PriceAlert, 'id' | 'createdAt' | 'triggeredAt'>): void;
   removePriceAlert(id: string): void;
@@ -115,7 +120,7 @@ const AppDataContext = createContext<AppDataStore | null>(null);
 
 export function AppDataProvider({ children }: { children: ReactNode }) {
   const [settings, setSettings] = useState<AppSettings>(() => loadSettings());
-  const [status, setStatus] = useState<ConnectionStatus>('demo');
+  const [status, setStatus] = useState<ConnectionStatus>('disconnected');
   const [loading, setLoading] = useState(true);
   const [quotes, setQuotes] = useState<Record<number, Quote>>({});
   const [portfolio, setPortfolio] = useState<Portfolio | null>(null);
@@ -144,7 +149,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
   const agentRef = useRef<AgentEngine | null>(null);
   if (!agentRef.current) {
     agentRef.current = new AgentEngine({
-      getProvider: () => providerRef.current ?? new DemoDataProvider(),
+      getProvider: () => providerRef.current,
       getMode: () => settingsRef.current.mode,
       canWrite: () => {
         const s = settingsRef.current;
@@ -164,10 +169,20 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     const prev = providerRef.current;
     if (prev) prev.stop();
 
-    const useLive = settings.mode === 'live' && hasLiveCredentials(settings);
-    const provider: DataProvider = useLive
-      ? new LiveDataProvider(settings.live)
-      : new DemoDataProvider();
+    const useLive = hasLiveCredentials(settings);
+    if (!useLive) {
+      providerRef.current = null;
+      setStatus('disconnected');
+      setLoading(false);
+      setQuotes({});
+      setPortfolio(null);
+      setPnl(null);
+      setFxRate(null);
+      setInstruments([]);
+      previousQuotesRef.current = {};
+      return () => { cancelled = true; };
+    }
+    const provider: DataProvider = new LiveDataProvider(settings.live);
     providerRef.current = provider;
 
     const offQuotes = provider.on('quotes', (qs) => {
@@ -233,42 +248,16 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     const offPnl = provider.on('pnl', (p) => {
       if (!cancelled) setPnl(p);
     });
-    const useLiveProvider = settings.mode === 'live' && Boolean(settings.live.apiKey && settings.live.userKey);
     const offStatus = provider.on('status', (s) => {
       if (cancelled) return;
       setStatus(s);
-      if (useLiveProvider && (s === 'connected' || s === 'error')) setLoading(false);
+      if (s === 'connected' || s === 'error') setLoading(false);
     });
     const offLog = provider.on('log', (l) => { if (!cancelled) pushLog(l); });
 
     setLoading(true);
     setInstruments(provider.listInstruments());
     provider.start();
-    if (!useLiveProvider) {
-      void (async () => {
-        try {
-          const [pf, pnlData] = await Promise.all([provider.getPortfolio(), provider.getPnl()]);
-          if (cancelled) return;
-          setPortfolio(pf);
-          setPnl(pnlData);
-          setInstruments(provider.listInstruments());
-          // Non sovrascrivere un cambio live già arrivato dal bootstrap con il fallback iniziale.
-          setFxRate((previous) => previous ?? provider.getFxRate());
-          const initialQuotes = await provider.getQuotes(provider.listInstruments().map((i) => i.instrumentId));
-          if (cancelled) return;
-          setQuotes(Object.fromEntries(initialQuotes.map((q) => [q.instrumentId, q])));
-          for (const q of initialQuotes) {
-            let arr = sparksRef.current.get(q.instrumentId);
-            if (!arr) { arr = []; sparksRef.current.set(q.instrumentId, arr); }
-            arr.push(q.last);
-          }
-        } catch {
-          /* lo stato di errore arriva via evento 'status' */
-        } finally {
-          if (!cancelled) setLoading(false);
-        }
-      })();
-    }
 
     return () => {
       cancelled = true;
@@ -356,8 +345,8 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
 
   const fromUsd = useCallback((usd: number): number => {
     if (settings.displayCurrency === 'USD') return usd;
-    const rate = fxRate?.rate ?? 1.09;
-    return usd / rate;
+    const rate = fxRate?.rate ?? 0;
+    return rate > 0 ? usd / rate : Number.NaN;
   }, [settings.displayCurrency, fxRate]);
 
   const placeOrder = useCallback(async (req: OrderRequest): Promise<OrderResult> => {
@@ -396,10 +385,36 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const getCandles = useCallback(
-    (instrumentId: number, interval: CandleInterval, count: number) =>
-      providerRef.current?.getCandles(instrumentId, interval, count) ?? Promise.resolve([]),
+    (instrumentId: number, interval: CandleInterval, count: number, signal?: AbortSignal) =>
+      providerRef.current?.getCandles(instrumentId, interval, count, signal) ?? Promise.resolve([]),
     [],
   );
+
+  const getQuotes = useCallback(
+    async (instrumentIds: number[]) => {
+      const nextQuotes = await (providerRef.current?.getQuotes(instrumentIds) ?? Promise.resolve([]));
+      setQuotes((previous) => {
+        const next = { ...previous };
+        for (const quote of nextQuotes) next[quote.instrumentId] = quote;
+        return next;
+      });
+      if (providerRef.current) setInstruments(providerRef.current.listInstruments());
+      return nextQuotes;
+    },
+    [],
+  );
+
+  const getHistoricalClosingPrices = useCallback(
+    () => providerRef.current?.getHistoricalClosingPrices() ?? Promise.resolve([]),
+    [],
+  );
+
+  const getTradeHistory = useCallback(
+    () => providerRef.current?.getTradeHistory() ?? Promise.resolve([]),
+    [],
+  );
+
+  const getFxInstrumentId = useCallback(() => providerRef.current?.getFxInstrumentId() ?? null, []);
 
   const searchInstruments = useCallback(
     (query: string) => providerRef.current?.searchInstruments(query) ?? Promise.resolve([]),
@@ -467,6 +482,10 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     closePosition,
     refresh,
     getCandles,
+    getQuotes,
+    getHistoricalClosingPrices,
+    getTradeHistory,
+    getFxInstrumentId,
     searchInstruments,
     addPriceAlert,
     removePriceAlert,
@@ -476,13 +495,15 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     settings, updateSettings, updateLiveSettings, setMode, setDisplayCurrency, setDensity,
     fromUsd, realExecutionActive, status, loading, quotes, portfolio, pnl, fxRate,
     instruments, logs, priceAlerts, agent, agentVersion, placeOrder, closePosition, refresh,
-    getCandles, searchInstruments, addPriceAlert, removePriceAlert, resetPriceAlert, sparkFor,
+    getCandles, getQuotes, getHistoricalClosingPrices, getTradeHistory, getFxInstrumentId,
+    searchInstruments, addPriceAlert, removePriceAlert, resetPriceAlert, sparkFor,
   ]);
 
   return <AppDataContext.Provider value={value}>{children}</AppDataContext.Provider>;
 }
 
 /** Hook di accesso allo store. Deve essere usato dentro <AppDataProvider>. */
+// eslint-disable-next-line react-refresh/only-export-components
 export function useAppData(): AppDataStore {
   const ctx = useContext(AppDataContext);
   if (!ctx) throw new Error('useAppData deve essere usato dentro <AppDataProvider>');

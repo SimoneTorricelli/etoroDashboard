@@ -12,7 +12,7 @@ import { motion } from 'framer-motion';
 import { createChart, AreaSeries, LineSeries } from 'lightweight-charts';
 import type { IChartApi, ISeriesApi, UTCTimestamp } from 'lightweight-charts';
 import {
-  ArrowRight, Bell, Bot, CircleAlert, Lightbulb, Pencil, Plus, TrendingUp,
+  ArrowRight, Bell, Bot, CircleAlert, Lightbulb, Pencil, Plus, TrendingUp, TriangleAlert,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useAppData } from '@/lib/data/store';
@@ -30,11 +30,14 @@ import { EmptyState } from '@/components/shared/EmptyState';
 import { StatusDot } from '@/components/shared/StatusDot';
 import { Skeleton } from '@/components/shared/Skeleton';
 import { TickValue } from '@/components/shared/TickValue';
+import { FreshnessBadge } from '@/components/shared/FreshnessBadge';
 import { CopyPortfolioTable } from '@/components/portfolio/CopyPortfolioTable';
-import type { Position, PriceAlert } from '@/lib/data/types';
+import { enrichLookThroughPositions } from '@/components/portfolio/analytics';
+import type { Candle, Position, PriceAlert } from '@/lib/data/types';
 import { externalCryptoSymbol } from '@/lib/data/ExternalPriceProvider';
+import { AgentMasterSwitch } from '@/components/agent/AgentMasterSwitch';
 
-const WATCHLIST_IDS = [1001, 1003, 1301, 1201, 1401, 1007];
+const WATCHLIST_SYMBOLS = ['AAPL', 'META', 'BTC', 'ETH', 'SPY', 'EURUSD'];
 const TIMEFRAMES = [
   { key: '1G', days: 1 }, { key: '1S', days: 7 }, { key: '1M', days: 30 },
   { key: '3M', days: 90 }, { key: '1A', days: 365 }, { key: 'TUTTO', days: 365 },
@@ -49,29 +52,21 @@ const stagger = (i: number) => ({
 export default function Overview() {
   const navigate = useNavigate();
   const {
-    portfolio, pnl, loading, status, mode, setMode,
-    displayCurrency, fromUsd, realExecutionActive,
+    portfolio, pnl, loading, status,
+    displayCurrency, fromUsd, realExecutionActive, agent,
   } = useAppData();
 
   const cur = displayCurrency;
   const [timeframe, setTimeframe] = useState<(typeof TIMEFRAMES)[number]['key']>('1M');
-  const [now, setNow] = useState(() => Date.now());
-
-  useEffect(() => {
-    const t = setInterval(() => setNow(Date.now()), 5000);
-    return () => clearInterval(t);
-  }, []);
 
   /* ── Empty state: Live senza connessione e nessun dato ──────────── */
-  if (!loading && !portfolio && mode === 'live') {
+  if (!loading && !portfolio) {
     return (
       <EmptyState
         headline="Il tuo terminale è pronto"
-        copy="Collega il tuo account eToro o esplora la modalità Demo con dati simulati."
-        actionLabel="Attiva modalità Demo"
-        onAction={() => setMode('demo')}
-        secondaryLabel="Configura le chiavi API"
-        onSecondary={() => navigate('/impostazioni')}
+        copy="Configura chiavi e proxy per collegare il tuo account eToro reale. Nessun dato simulato verrà mostrato."
+        actionLabel="Configura la connessione"
+        onAction={() => navigate('/impostazioni')}
       />
     );
   }
@@ -79,15 +74,15 @@ export default function Overview() {
   return (
     <div className="grid grid-cols-12 gap-4">
       {/* ROW 0 — RiskBanner */}
-      {realExecutionActive && (
+      {realExecutionActive && agent.masterEnabled && (
         <div className="col-span-12">
           <RiskBanner
             variant="danger"
-            message="Esecuzione reale attiva — l'Agent può inviare ordini con denaro reale."
+            message="Agent attivo sul conto reale — le regole abilitate possono usare denaro reale entro i limiti configurati."
           />
         </div>
       )}
-      {mode === 'live' && (status === 'error' || status === 'disconnected') && (
+      {(status === 'error' || status === 'disconnected') && (
         <div className="col-span-12">
           <RiskBanner
             variant="warn"
@@ -102,10 +97,7 @@ export default function Overview() {
       <motion.div {...stagger(0)} className="card-surface density-pad col-span-12 p-5 lg:col-span-5">
         <div className="flex items-center justify-between">
           <span className="overline">Valore portafoglio</span>
-          <span className="flex items-center gap-1.5 text-caption text-text-2">
-            <StatusDot variant={status === 'connected' || status === 'demo' ? 'live' : 'idle'} />
-            aggiornato {formatTime(now)}
-          </span>
+          <FreshnessBadge asOf={portfolio?.asOf} source="Snapshot conto eToro · aggiornamento autorevole ogni 45 secondi" />
         </div>
         {portfolio ? (
           <>
@@ -127,24 +119,32 @@ export default function Overview() {
         <KpiCard
           label="P&L Oggi"
           value={pnl ? formatSignedCurrency(fromUsd(pnl.dailyPnl), cur) : '—'}
+          numericValue={pnl ? fromUsd(pnl.dailyPnl) : undefined}
+          formatValue={(value) => formatSignedCurrency(value, cur)}
           deltaPct={pnl?.dailyPnlPct}
           currency={cur}
-          sparkData={pnl?.equityHistory.slice(-30).map((p) => p.value)}
+          sparkData={pnl?.historySource === 'etoro-balances' ? pnl.equityHistory.slice(-30).map((p) => p.value) : undefined}
           sparkLive
           status={pnl && pnl.dailyPnl >= 0 ? 'ok' : 'error'}
+          className="relative"
+          info={pnl ? `${pnl.sourceLabel}. Aggiornato ${new Date(pnl.asOf).toLocaleString('it-IT')}.` : 'Dato non ancora disponibile.'}
         />
         <KpiCard
           label="P&L Totale"
           value={pnl ? formatSignedCurrency(fromUsd(pnl.totalPnl), cur) : '—'}
+          numericValue={pnl ? fromUsd(pnl.totalPnl) : undefined}
+          formatValue={(value) => formatSignedCurrency(value, cur)}
           deltaPct={pnl?.totalPnlPct}
           currency={cur}
-          sparkData={pnl?.equityHistory.slice(-90).map((p) => p.value)}
+          sparkData={pnl?.historySource === 'etoro-balances' ? pnl.equityHistory.slice(-90).map((p) => p.value) : undefined}
+          info="Somma del P&L non realizzato manuale, del P&L non realizzato mirror e del profitto netto delle posizioni mirror chiuse, come da formula eToro."
         />
         <KpiCard
           label="Cash disponibile"
           value={portfolio ? formatCurrency(fromUsd(portfolio.cash), cur) : '—'}
+          numericValue={portfolio ? fromUsd(portfolio.cash) : undefined}
+          formatValue={(value) => formatCurrency(value, cur)}
           currency={cur}
-          sparkData={pnl?.equityHistory.slice(-30).map((p) => p.value * 0.13)}
         />
       </div>
 
@@ -173,6 +173,7 @@ export default function Overview() {
           fromUsd={fromUsd}
         />
         <PnlStats history={pnl?.equityHistory ?? []} />
+        <ProjectionScenario history={pnl?.equityHistory ?? []} fromUsd={fromUsd} currency={cur} />
       </motion.div>
 
       <SuggestionsCard />
@@ -186,8 +187,8 @@ export default function Overview() {
           </button>
         </div>
         <div className="mt-3 divide-y divide-hairline">
-          {WATCHLIST_IDS.map((id) => (
-            <WatchlistRow key={id} instrumentId={id} />
+          {WATCHLIST_SYMBOLS.map((symbol) => (
+            <WatchlistRow key={symbol} symbol={symbol} />
           ))}
         </div>
       </motion.div>
@@ -258,16 +259,76 @@ function HeroNumber({ value, currency }: { value: number; currency: 'EUR' | 'USD
   );
 }
 
+function ProjectionScenario({ history, fromUsd, currency }: { history: { time: number; value: number }[]; fromUsd(value: number): number; currency: 'EUR' | 'USD' }) {
+  const [months, setMonths] = useState(3);
+  const scenario = useMemo(() => {
+    if (history.length < 20) return null;
+    const returns: number[] = [];
+    for (let index = 1; index < history.length; index += 1) {
+      const previous = history[index - 1].value;
+      const current = history[index].value;
+      if (previous > 0 && current > 0) returns.push(Math.log(current / previous));
+    }
+    if (returns.length < 19) return null;
+    const sorted = [...returns].sort((a, b) => a - b);
+    const low = sorted[Math.floor(sorted.length * 0.05)];
+    const high = sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * 0.95))];
+    const cleaned = returns.map((value) => Math.max(low, Math.min(high, value)));
+    const mean = cleaned.reduce((sum, value) => sum + value, 0) / cleaned.length;
+    const variance = cleaned.reduce((sum, value) => sum + (value - mean) ** 2, 0) / Math.max(1, cleaned.length - 1);
+    const horizonDays = months * 30;
+    const medianLog = mean * horizonDays;
+    const dispersion = Math.sqrt(variance * horizonDays) * 1.2816;
+    const base = history[history.length - 1].value;
+    return {
+      p10: base * Math.exp(medianLog - dispersion),
+      p50: base * Math.exp(medianLog),
+      p90: base * Math.exp(medianLog + dispersion),
+      observations: cleaned.length,
+    };
+  }, [history, months]);
+
+  return (
+    <div className="mt-4 rounded-lg border border-hairline bg-bg-0/60 p-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <div className="flex items-center gap-1.5 text-body-strong text-text-0"><TriangleAlert className="h-4 w-4 text-warn" aria-hidden /> Scenario probabilistico</div>
+          <p className="mt-0.5 text-micro text-text-2">Scenario, non previsione garantita · rendimenti reali giornalieri winsorizzati</p>
+        </div>
+        <div className="flex rounded-md border border-hairline bg-bg-1 p-0.5" aria-label="Orizzonte scenario">
+          {[1, 3, 6, 12].map((value) => <button key={value} type="button" onClick={() => setMonths(value)} className={cn('rounded px-2 py-1 text-micro', months === value ? 'bg-bg-3 text-text-0' : 'text-text-2 hover:text-text-1')}>{value}M</button>)}
+        </div>
+      </div>
+      {scenario ? (
+        <div className="mt-3 grid grid-cols-3 gap-2">
+          <ScenarioMetric label="P10 · prudente" value={formatCurrency(fromUsd(scenario.p10), currency)} tone="loss" />
+          <ScenarioMetric label="P50 · mediano" value={formatCurrency(fromUsd(scenario.p50), currency)} />
+          <ScenarioMetric label="P90 · favorevole" value={formatCurrency(fromUsd(scenario.p90), currency)} tone="gain" />
+          <p className="col-span-3 text-micro text-text-2">Campione: {scenario.observations} rendimenti reali. Non include versamenti, prelievi, costi futuri o cambi di composizione.</p>
+        </div>
+      ) : <p className="mt-3 text-caption text-text-2">Servono almeno 20 punti reali di storico per costruire una banda attendibile.</p>}
+    </div>
+  );
+}
+
+function ScenarioMetric({ label, value, tone }: { label: string; value: string; tone?: 'gain' | 'loss' }) {
+  return <div className="min-w-0 rounded-md bg-bg-1 p-2"><div className="text-micro text-text-2">{label}</div><div className={cn('mt-1 truncate font-mono text-caption tabular-nums', tone === 'gain' ? 'text-gain' : tone === 'loss' ? 'text-loss' : 'text-text-0')}>{value}</div></div>;
+}
+
 /* ── Grafico P&L (lightweight-charts area) ─────────────────────────── */
 function PnlChart({ data, days, fromUsd }: { data: { time: number; value: number }[]; days: number; fromUsd(n: number): number }) {
+  const { instruments, getCandles } = useAppData();
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<'Area'> | null>(null);
   const benchRef = useRef<ISeriesApi<'Line'> | null>(null);
   const [showBenchmark, setShowBenchmark] = useState(false);
+  const [benchmark, setBenchmark] = useState<Candle[]>([]);
+  const [benchmarkState, setBenchmarkState] = useState<'idle' | 'loading' | 'error'>('idle');
+  const spxInstrument = instruments.find((instrument) => instrument.symbol.toUpperCase() === 'SPX500');
   /* ref per evitare il rebuild della serie a ogni tick FX */
   const fromUsdRef = useRef(fromUsd);
-  fromUsdRef.current = fromUsd;
+  useEffect(() => { fromUsdRef.current = fromUsd; }, [fromUsd]);
 
   useEffect(() => {
     const el = containerRef.current;
@@ -308,24 +369,45 @@ function PnlChart({ data, days, fromUsd }: { data: { time: number; value: number
     series.setData(filtered.map((p) => ({ time: p.time as UTCTimestamp, value: fromUsdRef.current(p.value) })));
     seriesRef.current = series;
     chart.timeScale().fitContent();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data, days]);
 
-  /* Benchmark SPX (linea dashed text-2) */
+  useEffect(() => {
+    if (!showBenchmark || !spxInstrument) return;
+    const controller = new AbortController();
+    const interval = days <= 1 ? 'OneHour' : 'OneDay';
+    const count = days <= 1 ? 24 : Math.min(365, Math.max(7, days));
+    void getCandles(spxInstrument.instrumentId, interval, count, controller.signal)
+      .then((candles) => {
+        if (candles.length < 2) {
+          setBenchmark([]);
+          setBenchmarkState('error');
+          return;
+        }
+        setBenchmark(candles);
+        setBenchmarkState('idle');
+      })
+      .catch((error) => {
+        if (!(error instanceof DOMException && error.name === 'AbortError')) setBenchmarkState('error');
+      });
+    return () => controller.abort();
+  }, [days, getCandles, showBenchmark, spxInstrument]);
+
+  /* Benchmark SPX reale, normalizzato al valore iniziale del portafoglio. */
   useEffect(() => {
     const chart = chartRef.current;
     if (!chart || data.length < 2) return;
     if (benchRef.current) { chart.removeSeries(benchRef.current); benchRef.current = null; }
-    if (!showBenchmark) return;
+    if (!showBenchmark || benchmark.length < 2) return;
     const cutoff = Date.now() / 1000 - days * 86400;
     const filtered = data.filter((p) => p.time >= cutoff);
-    const base = filtered[0].value;
+    if (filtered.length < 2) return;
+    const base = fromUsdRef.current(filtered[0].value);
+    const benchmarkBase = benchmark[0].close;
     const line = chart.addSeries(LineSeries, { color: '#5C6B7A', lineWidth: 1, lineStyle: 2, priceLineVisible: false });
-    // benchmark sintetico: stessa shape smorzata al 60%
-    line.setData(filtered.map((p) => ({ time: p.time as UTCTimestamp, value: fromUsdRef.current(base + (p.value - base) * 0.6) })));
+    line.setData(benchmark.map((candle) => ({ time: candle.time as UTCTimestamp, value: base * (candle.close / benchmarkBase) })));
     benchRef.current = line;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showBenchmark, data, days]);
+    chart.timeScale().fitContent();
+  }, [benchmark, showBenchmark, data, days]);
 
   return (
     <div className="mt-3">
@@ -334,11 +416,16 @@ function PnlChart({ data, days, fromUsd }: { data: { time: number; value: number
         <input
           type="checkbox"
           checked={showBenchmark}
-          onChange={(e) => setShowBenchmark(e.target.checked)}
+          onChange={(e) => {
+            setShowBenchmark(e.target.checked);
+            setBenchmarkState(e.target.checked ? 'loading' : 'idle');
+          }}
           className="h-3.5 w-3.5 accent-[#00C390]"
         />
         Confronta con benchmark (SPX)
       </label>
+      {showBenchmark && benchmarkState === 'loading' ? <p className="mt-1 text-micro text-text-2">Caricamento benchmark reale eToro…</p> : null}
+      {showBenchmark && (benchmarkState === 'error' || !spxInstrument) ? <p className="mt-1 text-micro text-warn">Storico SPX non disponibile da eToro per questo intervallo.</p> : null}
     </div>
   );
 }
@@ -395,20 +482,21 @@ function SuggestionsCard() {
   const insights = useMemo<Insight[]>(() => {
     const out: Insight[] = [];
     if (portfolio && portfolio.positions.length > 0) {
-      // Concentrazione per asset class
+      // Concentrazione per asset class con look-through dei copy portfolio.
+      const lookThrough = enrichLookThroughPositions(portfolio);
       const byClass = new Map<string, number>();
-      for (const p of portfolio.positions) {
-        const v = (p.units * (p.currentPrice ?? p.openPrice)) || p.invested;
-        byClass.set(p.assetClass, (byClass.get(p.assetClass) ?? 0) + v);
+      for (const p of lookThrough) {
+        byClass.set(p.assetClass, (byClass.get(p.assetClass) ?? 0) + p.value);
       }
-      const total = portfolio.positionsValue || 1;
+      const total = lookThrough.reduce((sum, position) => sum + position.value, 0) || 1;
       const [topClass, topValue] = [...byClass.entries()].sort((a, b) => b[1] - a[1])[0];
       const pct = (topValue / total) * 100;
-      if (pct > 30) {
+      if (pct > 50) {
+        const labels: Record<string, string> = { stock: 'azioni', etf: 'ETF', crypto: 'crypto', fx: 'valute', index: 'indici', cfd: 'CFD' };
         out.push({
           id: 'concentration', severity: 'warn',
           title: 'Concentrazione elevata',
-          detail: `Il ${pct.toFixed(0)}% del portafoglio è su "${topClass}". Valuta un ribilanciamento.`,
+          detail: `Il ${pct.toFixed(0)}% degli asset investiti è in ${labels[topClass] ?? topClass}, includendo gli strumenti dentro i copy portfolio.`,
           to: '/portfolio',
         });
       }
@@ -424,11 +512,11 @@ function SuggestionsCard() {
         });
       }
       // Peggiore di oggi + regola
-      const worst = [...portfolio.positions].sort((a, b) => (a.pnlPct ?? 0) - (b.pnlPct ?? 0))[0];
-      if (worst && (worst.pnlPct ?? 0) < -3) {
+      const worst = [...lookThrough].sort((a, b) => a.pnlPctValue - b.pnlPctValue)[0];
+      if (worst && worst.pnlPctValue < -3) {
         out.push({
           id: 'worst', severity: 'opportunity',
-          title: `${worst.symbol} ${formatPercent(worst.pnlPct ?? 0)} dall'apertura`,
+          title: `${worst.symbol} ${formatPercent(worst.pnlPctValue)} dall'apertura`,
           detail: 'La regola "Compra i cali" potrebbe attivarsi se il calo continua.',
           to: '/agent',
         });
@@ -496,24 +584,24 @@ function SuggestionsCard() {
 }
 
 /* ── Watchlist row ─────────────────────────────────────────────────── */
-function WatchlistRow({ instrumentId }: { instrumentId: number }) {
+function WatchlistRow({ symbol }: { symbol: string }) {
   const navigate = useNavigate();
   const { quotes, instruments, sparkFor } = useAppData();
-  const quote = quotes[instrumentId];
-  const inst = instruments.find((i) => i.instrumentId === instrumentId);
+  const inst = instruments.find((i) => i.symbol.toUpperCase() === symbol);
   if (!inst) return null;
+  const quote = quotes[inst.instrumentId];
 
   return (
     <button
-      onClick={() => navigate(`/mercati?instrument=${instrumentId}`)}
+      onClick={() => navigate(`/mercati?instrument=${inst.instrumentId}`)}
       className="flex w-full items-center gap-3 py-2.5 text-left transition-colors hover:bg-bg-2/50"
     >
-      <InstrumentAvatar symbol={inst.symbol} size={32} />
+      <InstrumentAvatar symbol={inst.symbol} size={32} imageUrl={inst.imageUrl} backgroundColor={inst.imageBackgroundColor} textColor={inst.imageTextColor} />
       <div className="min-w-0 flex-1">
         <div className="font-mono text-ticker text-text-0">{inst.symbol}</div>
         <div className="truncate text-caption text-text-2">{inst.name}</div>
       </div>
-      <Sparkline data={sparkFor(instrumentId)} width={60} height={20} live />
+      <Sparkline data={sparkFor(inst.instrumentId)} width={60} height={20} live />
       <div className="w-24 text-right">
         {quote ? (
           <>
@@ -535,10 +623,11 @@ function WatchlistRow({ instrumentId }: { instrumentId: number }) {
 /* ── Agent status card ─────────────────────────────────────────────── */
 function AgentStatusCard() {
   const navigate = useNavigate();
-  const { agent, fromUsd, displayCurrency, agentVersion } = useAppData();
+  const { agent, fromUsd, displayCurrency, agentVersion, realExecutionActive } = useAppData();
   // agentVersion forza il re-render a ogni update dell'engine
-  const rules = useMemo(() => agent.getRules(), [agent, agentVersion]);
-  const pending = useMemo(() => agent.getPendingConfirmations(), [agent, agentVersion]);
+  void agentVersion;
+  const rules = agent.getRules();
+  const pending = agent.getPendingConfirmations();
 
   return (
     <motion.div {...stagger(3)} className="card-surface density-pad col-span-12 border-l-2 border-l-agent p-5 md:col-span-6 lg:col-span-4">
@@ -547,22 +636,7 @@ function AgentStatusCard() {
           <Bot className="h-4 w-4 text-agent" aria-hidden />
           eToro Agent
         </h2>
-        <button
-          role="switch"
-          aria-checked={agent.masterEnabled}
-          onClick={() => agent.setMasterEnabled(!agent.masterEnabled)}
-          className={cn(
-            'relative h-5 w-9 rounded-full transition-colors',
-            agent.masterEnabled ? 'bg-agent' : 'bg-bg-3',
-          )}
-        >
-          <span
-            className={cn(
-              'absolute top-0.5 h-4 w-4 rounded-full bg-white transition-transform',
-              agent.masterEnabled ? 'translate-x-4' : 'translate-x-0.5',
-            )}
-          />
-        </button>
+        <AgentMasterSwitch agent={agent} realExecutionActive={realExecutionActive} label="" />
       </div>
 
       <div className="mt-3 grid grid-cols-3 gap-2">
@@ -639,9 +713,8 @@ function CurrencyExposure() {
     if (!portfolio) return [];
     const byCcy = new Map<string, number>();
     byCcy.set('USD', portfolio.cash);
-    for (const p of portfolio.positions) {
-      const v = p.units * (p.currentPrice ?? p.openPrice);
-      byCcy.set(p.currency, (byCcy.get(p.currency) ?? 0) + v);
+    for (const position of enrichLookThroughPositions(portfolio)) {
+      byCcy.set(position.currency, (byCcy.get(position.currency) ?? 0) + position.value);
     }
     const total = [...byCcy.values()].reduce((s, v) => s + v, 0) || 1;
     return [...byCcy.entries()]
@@ -728,7 +801,7 @@ function PositionsTable() {
       sortValue: (p) => p.symbol,
       cell: (p) => (
         <div className="flex items-center gap-2.5">
-          <InstrumentAvatar symbol={p.symbol} size={28} />
+          <InstrumentAvatar symbol={p.symbol} size={28} imageUrl={p.imageUrl} />
           <div>
             <div className="font-mono text-ticker text-text-0">{p.symbol}</div>
             <div className="max-w-32 truncate text-micro text-text-2">{p.name} · {p.purchaseCount} acquisti</div>

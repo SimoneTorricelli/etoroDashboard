@@ -48,6 +48,7 @@ export function FxChart({ candles, liveRate, target, upper, onTargetChange, onUp
     targetY: null, upperY: null, currentY: null,
   });
   const [dragging, setDragging] = useState<'target' | 'upper' | null>(null);
+  const hasHistory = candles.length >= 2;
 
   /* Refs per i callback di drag (evitano closure stale) */
   const targetRef = useRef(target);
@@ -220,25 +221,25 @@ export function FxChart({ candles, liveRate, target, upper, onTargetChange, onUp
       <div ref={containerRef} className="relative mt-2 w-full" style={{ height: chartHeight }}>
         {/* Overlay bande (allineato al pane del chart) */}
         <div className="pointer-events-none absolute inset-0" style={{ bottom: 26, right: 52 }} aria-hidden>
-          {bandTop != null && (
+          {hasHistory && bandTop != null && (
             <div
               className="absolute left-0 right-0 top-0 bg-loss/10 transition-[height] duration-200"
               style={{ height: Math.max(0, bandTop) }}
             />
           )}
-          {bandBottom != null && (
+          {hasHistory && bandBottom != null && (
             <div
               className="absolute bottom-0 left-0 right-0 bg-gain/10 transition-[top] duration-200"
               style={{ top: Math.max(0, bandBottom) }}
             />
           )}
-          {positions.currentY != null && (
+          {hasHistory && positions.currentY != null && (
             <div className="absolute left-0 right-0 border-t border-dashed border-text-2" style={{ top: positions.currentY }} />
           )}
         </div>
 
         {/* Handle trascinabili sui bordi delle bande */}
-        {positions.upperY != null && (
+        {hasHistory && positions.upperY != null && (
           <BandHandle
             y={positions.upperY}
             value={upper}
@@ -248,7 +249,7 @@ export function FxChart({ candles, liveRate, target, upper, onTargetChange, onUp
             onPointerDown={startDrag('upper')}
           />
         )}
-        {positions.targetY != null && (
+        {hasHistory && positions.targetY != null && (
           <BandHandle
             y={positions.targetY}
             value={target}
@@ -258,6 +259,7 @@ export function FxChart({ candles, liveRate, target, upper, onTargetChange, onUp
             onPointerDown={startDrag('target')}
           />
         )}
+        {!hasHistory ? <div className="absolute inset-0 z-20 flex items-center justify-center rounded-md bg-bg-0/85 px-8 text-center text-caption text-text-2">Grafico non mostrato: la serie reale contiene meno di due punti.</div> : null}
       </div>
 
       <p className="mt-2 text-micro text-text-2">

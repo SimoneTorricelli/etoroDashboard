@@ -94,7 +94,6 @@ export async function createAgentPortfolio(
   settings: LiveSettings,
   config: StrategyPortfolioConfig,
 ): Promise<CreateRemoteAgentPortfolioResult> {
-  const real = settings.environment === 'real';
   const tokenName = `${config.name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-token`.slice(0, 32);
   const response = await fetch(apiUrl(settings, '/api/v2/agent-portfolios'), {
     method: 'POST',
@@ -105,8 +104,8 @@ export async function createAgentPortfolio(
       agentPortfolioName: config.name.trim(),
       userTokenName: tokenName,
       scopeNames: [
-        `etoro-public:trade.${real ? 'real' : 'demo'}:read`,
-        `etoro-public:trade.${real ? 'real' : 'demo'}:write`,
+        'etoro-public:trade.real:read',
+        'etoro-public:trade.real:write',
       ],
       agentPortfolioDescription: `Torino — strategia ${config.templateId}; max ${config.maxPositions} posizioni; ${config.cashReservePct}% liquidità.`,
     }),

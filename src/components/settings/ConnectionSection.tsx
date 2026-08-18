@@ -1,10 +1,10 @@
 /**
  * ConnectionSection — Impostazioni §1 "Connessione API" (design/settings.md):
- * - Mode card Demo/Live (setMode) con avviso ambra se Live senza chiavi
+ * - Stato Live/Real con avviso se mancano chiavi o proxy
  * - Form chiavi x-api-key / x-user-key (mono, masked, eye-toggle), salvate
  *   SOLO in localStorage via updateLiveSettings; dopo il salvataggio mostra
  *   la chiave mascherata (maskKey) con Sostituisci / Rimuovi
- * - Radio card Ambiente (Demo/Real) e Permesso (lettura/scrittura)
+ * - Ambiente Real fisso e permesso lettura/scrittura
  * - Pulsante "Testa connessione": fetch portfolio reale via proxy con timing
  *   e hint parsati (401/403/429/rete)
  * - Mini step-list "Dove trovare le chiavi"
@@ -12,12 +12,12 @@
 import { useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import {
-  CheckCircle2, Eye, EyeOff, FlaskConical, KeyRound, Loader2, Lock, Pencil, ShieldAlert, Trash2, XCircle,
+  CheckCircle2, Eye, EyeOff, KeyRound, Loader2, Pencil, ShieldAlert, Trash2, XCircle,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useAppData } from '@/lib/data/store';
 import { hasLiveCredentials, maskKey } from '@/lib/settings';
-import type { ApiPermissions, EtoroEnvironment } from '@/lib/settings';
+import type { ApiPermissions } from '@/lib/settings';
 import { Section } from './common';
 
 type TestResult =
@@ -33,7 +33,7 @@ function hintForStatus(status: number): string {
 }
 
 export function ConnectionSection() {
-  const { settings, mode, setMode, updateLiveSettings } = useAppData();
+  const { settings, updateLiveSettings } = useAppData();
   const live = settings.live;
 
   /* Form chiavi: editing=true mostra i campi; altrimenti vista mascherata */
@@ -62,8 +62,7 @@ export function ConnectionSection() {
     setTesting(true);
     setTestResult(null);
     const base = live.proxyUrl.replace(/\/+$/, '');
-    const envPrefix = live.environment === 'demo' ? 'demo/' : 'real/';
-    const url = `${base}/api/v1/trading/info/${envPrefix}pnl`;
+    const url = `${base}/api/v1/trading/info/real/pnl`;
     const started = performance.now();
     try {
       const res = await fetch(url, {
@@ -102,28 +101,21 @@ export function ConnectionSection() {
     <Section
       id="connessione"
       title="Connessione API"
-      description="Collega il tuo account eToro tramite la Public API ufficiale, oppure resta in modalità Demo."
+      description="Collega il tuo account reale eToro tramite la Public API ufficiale."
     >
-      {/* Mode card */}
+      {/* Live/Real only */}
       <div className="card-surface density-pad p-5">
-        <div className="grid gap-3 sm:grid-cols-2">
-          <ModeCard
-            active={mode === 'demo'}
-            onClick={() => setMode('demo')}
-            icon={<FlaskConical className="h-4 w-4 text-info" aria-hidden />}
-            title="Demo"
-            description="Dati simulati realistici. Tutto funziona senza chiavi."
-          />
-          <ModeCard
-            active={mode === 'live'}
-            onClick={() => setMode('live')}
-            icon={<Lock className="h-4 w-4 text-gain" aria-hidden />}
-            title="Live"
-            description="Si collega al tuo account eToro tramite la Public API ufficiale."
-          />
+        <div className="flex items-start gap-3 rounded-xl border border-loss/40 bg-loss-dim p-4">
+          <ShieldAlert className="mt-0.5 h-5 w-5 shrink-0 text-loss" aria-hidden />
+          <div>
+            <h3 className="text-body-strong text-text-0">Solo Live · Conto Real</h3>
+            <p className="mt-1 text-caption text-text-1">
+              Questa installazione non usa dati simulati. Senza una connessione valida i moduli finanziari restano vuoti.
+            </p>
+          </div>
         </div>
         <AnimatePresence>
-          {mode === 'live' && !hasLiveCredentials(settings) && (
+          {!hasLiveCredentials(settings) && (
             <motion.p
               initial={{ opacity: 0, height: 0 }}
               animate={{ opacity: 1, height: 'auto' }}
@@ -132,7 +124,7 @@ export function ConnectionSection() {
               className="mt-3 flex items-center gap-2 overflow-hidden rounded-lg border border-warn/30 bg-[#F5A62314] px-3 py-2 text-caption text-warn"
             >
               <ShieldAlert className="h-4 w-4 shrink-0" aria-hidden />
-              Modalità Live attiva ma mancano chiavi o proxy: l'app userà dati demo finché non completi la configurazione.
+              Mancano chiavi o proxy: nessun dato finanziario verrà mostrato finché la configurazione non è completa.
             </motion.p>
           )}
         </AnimatePresence>
@@ -220,20 +212,13 @@ export function ConnectionSection() {
         <div className="mt-3 grid gap-3 sm:grid-cols-2">
           <div>
             <span className="text-label text-text-1">Ambiente</span>
-            <div className="mt-1.5 space-y-2">
-              <RadioCard
-                active={live.environment === 'demo'}
-                onClick={() => updateLiveSettings({ environment: 'demo' satisfies EtoroEnvironment })}
-                title="Demo"
-                description="Conto virtuale eToro (paper trading)."
-              />
-              <RadioCard
-                active={live.environment === 'real'}
-                onClick={() => updateLiveSettings({ environment: 'real' satisfies EtoroEnvironment })}
-                title="Real"
-                description="Conto reale: operazioni con denaro vero."
-                tone="danger"
-              />
+            <div className="mt-1.5 rounded-lg border border-loss/60 bg-loss-dim p-3">
+              <div className="flex items-center gap-2">
+                <span className="text-body-strong text-text-0">Real</span>
+                <ShieldAlert className="h-3.5 w-3.5 text-loss" aria-hidden />
+                <CheckCircle2 className="ml-auto h-4 w-4 text-loss" aria-hidden />
+              </div>
+              <p className="mt-1 text-micro text-text-1">Conto reale: le operazioni possono usare denaro vero.</p>
             </div>
           </div>
           <div>
@@ -316,32 +301,6 @@ export function ConnectionSection() {
         </div>
       </div>
     </Section>
-  );
-}
-
-function ModeCard({ active, onClick, icon, title, description }: {
-  active: boolean;
-  onClick: () => void;
-  icon: React.ReactNode;
-  title: string;
-  description: string;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      aria-pressed={active}
-      className={cn(
-        'rounded-xl border p-4 text-left transition-colors duration-300',
-        active ? 'border-gain/50 bg-gain/5' : 'border-hairline hover:border-hairline-strong hover:bg-bg-2',
-      )}
-    >
-      <div className="flex items-center gap-2">
-        {icon}
-        <span className="text-body-strong text-text-0">{title}</span>
-        {active && <CheckCircle2 className="ml-auto h-4 w-4 text-gain" aria-hidden />}
-      </div>
-      <p className="mt-1.5 text-caption text-text-1">{description}</p>
-    </button>
   );
 }
 

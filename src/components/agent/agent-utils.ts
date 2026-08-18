@@ -110,6 +110,9 @@ export interface BacktestResult {
   pnl: number;
   investedTotal: number;
   maxDrawdownPct: number;
+  volatilityPct: number;
+  sharpe: number | null;
+  estimatedCosts: number;
   /** P&L cumulato nel tempo (unix seconds → USD). */
   equity: { time: number; value: number }[];
   /** Baseline buy & hold dello stesso capitale. */
@@ -134,6 +137,7 @@ export function runBacktest(
   sltp: SlTp,
   candlesByInstrument: Map<number, Candle[]>,
   capitalLimit: number,
+  costs: { feeBps: number; slippageBps: number } = { feeBps: 5, slippageBps: 5 },
 ): BacktestResult {
   const cooldownDays = Math.max(1, Math.ceil(rule.cooldownMinutes / 1440));
   const sl = sltp.stopLossPct / 100;
@@ -147,6 +151,8 @@ export function runBacktest(
   const perInstSeries = new Map<number, Map<number, number>>();
   const buyHoldSeries = new Map<number, Map<number, number>>();
   let deployedPeak = 0;
+  let estimatedCosts = 0;
+  const costRate = (costs.feeBps + costs.slippageBps) / 10_000;
 
   for (const [iid, candles] of candlesByInstrument) {
     if (candles.length < 30) continue;
@@ -168,7 +174,9 @@ export function runBacktest(
       if (pos) {
         const ret = (price - pos.entryPrice) / pos.entryPrice;
         if (ret >= tp || ret <= -sl) {
-          const pnl = pos.amount * ret;
+          const tradeCost = pos.amount * costRate * 2;
+          const pnl = pos.amount * ret - tradeCost;
+          estimatedCosts += tradeCost;
           instPnl += pnl;
           closedPnl += pnl;
           deployed = Math.max(0, deployed - pos.amount);
@@ -229,6 +237,14 @@ export function runBacktest(
     if (dd > maxDrawdownPct) maxDrawdownPct = dd;
   }
 
+  const dailyReturns: number[] = [];
+  for (let index = 1; index < equity.length; index += 1) dailyReturns.push((equity[index].value - equity[index - 1].value) / Math.max(capitalLimit, 1));
+  const meanReturn = dailyReturns.length ? dailyReturns.reduce((sum, value) => sum + value, 0) / dailyReturns.length : 0;
+  const variance = dailyReturns.length > 1 ? dailyReturns.reduce((sum, value) => sum + (value - meanReturn) ** 2, 0) / (dailyReturns.length - 1) : 0;
+  const dailyVol = Math.sqrt(variance);
+  const volatilityPct = dailyVol * Math.sqrt(252) * 100;
+  const sharpe = dailyVol > 0 ? (meanReturn / dailyVol) * Math.sqrt(252) : null;
+
   return {
     orders,
     wins,
@@ -236,6 +252,9 @@ export function runBacktest(
     pnl: equity.length ? equity[equity.length - 1].value : closedPnl,
     investedTotal: deployedPeak,
     maxDrawdownPct,
+    volatilityPct,
+    sharpe,
+    estimatedCosts,
     equity,
     buyHold,
   };

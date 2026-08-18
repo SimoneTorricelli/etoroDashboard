@@ -13,7 +13,7 @@ export function PnlPositionBars({ rows, fmtSigned }: { rows: PositionRow[]; fmtS
 
   return (
     <div>
-      <h2 className="text-title text-text-0">P&L per posizione</h2>
+      <div className="flex items-end justify-between gap-3"><div><h2 className="text-title text-text-0">P&L per posizione</h2><p className="mt-0.5 text-caption text-text-2">Valore assoluto e rendimento dall’apertura</p></div><span className="text-micro text-text-2">Dal migliore al peggiore</span></div>
       <div className="mt-4 space-y-2">
         {sorted.map((r, i) => {
           const positive = r.pnlUsd >= 0;
@@ -36,13 +36,14 @@ export function PnlPositionBars({ rows, fmtSigned }: { rows: PositionRow[]; fmtS
                 />
               </div>
               <motion.span
-                className="w-24 shrink-0 text-right text-caption tabular-nums"
+                className="w-28 shrink-0 text-right tabular-nums"
                 style={{ color: positive ? '#00C390' : '#F4556B' }}
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
                 transition={{ delay: 0.3 + i * 0.04, duration: 0.25 }}
               >
-                {fmtSigned(r.pnlUsd)}
+                <span className="block text-caption">{fmtSigned(r.pnlUsd)}</span>
+                <span className="block text-micro opacity-80">{formatPercent(r.pnlPctValue)}</span>
               </motion.span>
             </div>
           );
