@@ -6,7 +6,7 @@ const PASS_HEADERS = ['x-api-key', 'x-user-key', 'x-request-id', 'content-type']
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
   'Access-Control-Allow-Headers': PASS_HEADERS.join(', '),
   'Access-Control-Max-Age': '86400',
 };

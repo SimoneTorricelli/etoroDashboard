@@ -1,7 +1,7 @@
 /**
  * ProxySection — Impostazioni §2 "Proxy CORS" (design/settings.md):
  * explainer, guida in 3 step con blocco codice copiabile (Cloudflare Worker
- * ~30 righe: inoltra /{path} a https://public-api.etoro.com/api/v1/{path}
+ * ~45 righe: inoltra /api/v1/* e /api/v2/* alla versione eToro corretta
  * passando x-api-key, x-user-key, x-request-id + CORS * e preflight OPTIONS),
  * input URL proxy + "Verifica proxy", nota di sicurezza ambra.
  */
@@ -13,32 +13,42 @@ import { useAppData } from '@/lib/data/store';
 import { Section } from './common';
 
 const WORKER_CODE = `// Cloudflare Worker — proxy CORS per la eToro Public API.
-// Accetta /{path} e inoltra a https://public-api.etoro.com/api/v1/{path}
+// Accetta /api/v1/* e /api/v2/* e conserva la versione dell'endpoint
 // passando gli header x-api-key, x-user-key, x-request-id.
 // Risponde con Access-Control-Allow-Origin: * e gestisce il preflight OPTIONS.
 
-const ETORO_BASE = 'https://public-api.etoro.com/api/v1';
+const ETORO_BASES = {
+  v1: 'https://public-api.etoro.com/api/v1',
+  v2: 'https://public-api.etoro.com/api/v2',
+};
 const PASS_HEADERS = ['x-api-key', 'x-user-key', 'x-request-id', 'content-type'];
 
 export default {
   async fetch(request) {
     const cors = {
       'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
       'Access-Control-Allow-Headers': PASS_HEADERS.join(', '),
+      'Access-Control-Max-Age': '86400',
     };
     if (request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: cors });
     }
     const url = new URL(request.url);
-    // l'app chiama già /api/v1/... : evita il doppio prefisso
-    const path = url.pathname.replace(/^\\/+/, '').replace(/^api\\/v1\\//, '');
+    if (!url.pathname.startsWith('/api/v1/') && !url.pathname.startsWith('/api/v2/')) {
+      return new Response(JSON.stringify({ error: 'Endpoint non supportato' }), {
+        status: 404,
+        headers: { ...cors, 'content-type': 'application/json' },
+      });
+    }
+    const version = url.pathname.startsWith('/api/v2/') ? 'v2' : 'v1';
+    const path = url.pathname.replace(/^\\/api\\/v[12]\\//, '');
     const headers = new Headers();
     for (const h of PASS_HEADERS) {
       const v = request.headers.get(h);
       if (v) headers.set(h, v);
     }
-    const res = await fetch(\`\${ETORO_BASE}/\${path}\${url.search}\`, {
+    const res = await fetch(\`\${ETORO_BASES[version]}/\${path}\${url.search}\`, {
       method: request.method,
       headers,
       body: ['GET', 'HEAD'].includes(request.method) ? undefined : request.body,
@@ -51,6 +61,7 @@ type VerifyResult = { ok: boolean; message: string };
 
 export function ProxySection() {
   const { settings, updateLiveSettings } = useAppData();
+  const live = settings.live;
   const [urlRaw, setUrlRaw] = useState(settings.live.proxyUrl);
   const [copied, setCopied] = useState(false);
   const [verifying, setVerifying] = useState(false);
@@ -80,12 +91,27 @@ export function ProxySection() {
       return;
     }
     try {
-      /* Qualunque risposta HTTP (anche 401/404) prova che il proxy è
-       * raggiungibile e che il preflight CORS è gestito. */
-      const res = await fetch(`${base}/api/v1/trading/info/portfolio`, { method: 'GET' });
+      const headers = live.apiKey && live.userKey ? {
+        'x-api-key': live.apiKey,
+        'x-user-key': live.userKey,
+        'x-request-id': crypto.randomUUID(),
+      } : undefined;
+      const [v1, v2] = await Promise.all([
+        fetch(`${base}/api/v1/trading/info/real/pnl`, { method: 'GET', headers }),
+        fetch(`${base}/api/v2/agent-portfolios/user-tokens/scopes`, { method: 'GET', headers }),
+      ]);
+      const v1Usable = v1.ok || (!headers && v1.status === 401);
+      const v2Usable = v2.ok || (!headers && v2.status === 401);
+      if (!v1Usable || !v2Usable) {
+        setVerifyResult({
+          ok: false,
+          message: `Proxy raggiungibile, ma API v1/v2 non utilizzabili (HTTP ${v1.status}/${v2.status}). Aggiorna il Worker o verifica i permessi delle chiavi.`,
+        });
+        return;
+      }
       setVerifyResult({
         ok: true,
-        message: `Proxy raggiungibile (HTTP ${res.status}) — CORS gestito correttamente.`,
+        message: `Proxy compatibile v1/v2 (HTTP ${v1.status}/${v2.status}) — CORS gestito correttamente.`,
       });
       saveUrl();
     } catch {

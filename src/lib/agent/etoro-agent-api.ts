@@ -52,10 +52,58 @@ async function parseResponse(response: Response): Promise<unknown> {
   try { body = text ? JSON.parse(text) as unknown : {}; } catch { body = { message: text }; }
   if (!response.ok) {
     const record = asRecord(body);
-    const message = String(firstValue(record, 'message', 'error', 'detail') ?? `Errore HTTP ${response.status}`);
+    const nestedError = asRecord(firstValue(record, 'error', 'Error', 'data', 'Data'));
+    const rawError = firstValue(record, 'error', 'Error');
+    const code = firstValue(record, 'errorCode', 'ErrorCode', 'code', 'Code')
+      ?? firstValue(nestedError, 'errorCode', 'ErrorCode', 'code', 'Code');
+    const detail = firstValue(record, 'errorMessage', 'ErrorMessage', 'message', 'Message', 'detail', 'Detail')
+      ?? firstValue(nestedError, 'errorMessage', 'ErrorMessage', 'message', 'Message', 'detail', 'Detail')
+      ?? (typeof rawError === 'string' ? rawError : undefined);
+    const codeText = code == null ? '' : String(code).trim();
+    const detailText = detail == null ? '' : String(detail).trim();
+    const message = codeText && detailText && codeText.toLowerCase() !== detailText.toLowerCase()
+      ? `${codeText}: ${detailText}`
+      : detailText || codeText || `Errore HTTP ${response.status}`;
     throw new Error(`${response.status} — ${message}`);
   }
   return body;
+}
+
+const REQUIRED_AGENT_SCOPES = [
+  'etoro-public:trade.real:read',
+  'etoro-public:trade.real:write',
+] as const;
+
+async function assertAgentPortfolioV2Available(settings: LiveSettings): Promise<void> {
+  let body: unknown;
+  try {
+    const response = await fetch(apiUrl(settings, '/api/v2/agent-portfolios/user-tokens/scopes'), {
+      method: 'GET',
+      headers: apiHeaders(settings),
+      cache: 'no-store',
+    });
+    body = await parseResponse(response);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Pre-verifica Agent Portfolio v2 non riuscita. Aggiorna il Worker v1/v2 e controlla i permessi eToro. Dettaglio: ${detail}`);
+  }
+
+  const record = asRecord(body);
+  const nested = asRecord(firstValue(record, 'data', 'Data'));
+  const scopes = firstValue(record, 'scopes', 'Scopes') ?? firstValue(nested, 'scopes', 'Scopes');
+  const allowed = new Set(
+    (Array.isArray(scopes) ? scopes : [])
+      .map((scope) => {
+        if (typeof scope === 'string') return scope;
+        const scopeRecord = asRecord(scope);
+        return String(firstValue(scopeRecord, 'name', 'Name') ?? '');
+      })
+      .filter(Boolean),
+  );
+  const missing = REQUIRED_AGENT_SCOPES.filter((scope) => !allowed.has(scope));
+  if (missing.length > 0) {
+    throw new Error(`eToro non consente gli scope richiesti per questo Agent Portfolio: ${missing.join(', ')}.`);
+  }
 }
 
 function normalizeRemote(value: unknown): RemoteAgentPortfolio | null {
@@ -94,6 +142,8 @@ export async function createAgentPortfolio(
   settings: LiveSettings,
   config: StrategyPortfolioConfig,
 ): Promise<CreateRemoteAgentPortfolioResult> {
+  // GET di sicurezza: verifica routing v2 e scope prima della POST che muove fondi reali.
+  await assertAgentPortfolioV2Available(settings);
   const tokenName = `${config.name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-token`.slice(0, 32);
   const response = await fetch(apiUrl(settings, '/api/v2/agent-portfolios'), {
     method: 'POST',
@@ -103,10 +153,7 @@ export async function createAgentPortfolio(
       investmentAmountInUsd: Math.round(config.budgetUsd * 100) / 100,
       agentPortfolioName: config.name.trim(),
       userTokenName: tokenName,
-      scopeNames: [
-        'etoro-public:trade.real:read',
-        'etoro-public:trade.real:write',
-      ],
+      scopeNames: [...REQUIRED_AGENT_SCOPES],
       agentPortfolioDescription: `Torino — strategia ${config.templateId}; max ${config.maxPositions} posizioni; ${config.cashReservePct}% liquidità.`,
     }),
   });

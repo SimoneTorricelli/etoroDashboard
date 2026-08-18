@@ -21,7 +21,7 @@ Dashboard personale per eToro: portfolio analytics, mercati globali in tempo rea
 
 ### Perché serve un proxy?
 
-L'API pubblica eToro (`https://public-api.etoro.com/api/v1`) non supporta CORS: un sito statico non può chiamarla direttamente dal browser. La pagina Impostazioni include lo script completo (~35 righe) di un **Cloudflare Worker gratuito** che fa da relay: lo deployi sul tuo account Cloudflare in 2 minuti e incolli l'URL nelle Impostazioni.
+L'API pubblica eToro (`https://public-api.etoro.com/api/v1` e `/api/v2`) non supporta CORS: un sito statico non può chiamarla direttamente dal browser. La pagina Impostazioni include lo script completo di un **Cloudflare Worker gratuito** che conserva la versione dell'endpoint e fa da relay: lo deployi sul tuo account Cloudflare e incolli l'URL nelle Impostazioni.
 
 ## Deploy su GitHub Pages
 
