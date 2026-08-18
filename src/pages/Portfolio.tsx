@@ -10,7 +10,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router';
 import { motion } from 'framer-motion';
-import { Download, X } from 'lucide-react';
+import { CalendarDays, Download, Loader2, ReceiptText, RefreshCw, X } from 'lucide-react';
 import { Toaster, toast } from 'sonner';
 import { cn } from '@/lib/utils';
 import { useAppData } from '@/lib/data/store';
@@ -37,6 +37,9 @@ import { SuggestionsCard } from '@/components/portfolio/SuggestionsCard';
 import { PnlHeatmap } from '@/components/portfolio/PnlHeatmap';
 import { CopyPortfolioDrawer, CopyPortfolioTable } from '@/components/portfolio/CopyPortfolioTable';
 import type { CopyPortfolio } from '@/lib/data/types';
+import type { DividendRecord } from '@/lib/data/CsvImporter';
+import { fetchDeclaredDividends, loadDeclaredDividends } from '@/lib/data/DividendProvider';
+import type { DeclaredDividend } from '@/lib/data/DividendProvider';
 
 const PERIODS = [
   { key: '1M', days: 30 },
@@ -66,7 +69,7 @@ export default function Portfolio() {
   const {
     portfolio, pnl, fxRate, loading, status,
     displayCurrency, setDisplayCurrency, fromUsd,
-    sparkFor, agent, agentVersion, closePosition,
+    sparkFor, agent, agentVersion, closePosition, settings,
   } = useAppData();
 
   const cur = displayCurrency;
@@ -74,6 +77,16 @@ export default function Portfolio() {
   const [classFilter, setClassFilter] = useState<string | null>(null);
   const [drawerRow, setDrawerRow] = useState<PositionRow | null>(null);
   const [copyDrawer, setCopyDrawer] = useState<CopyPortfolio | null>(null);
+  const [importedDividends] = useState<DividendRecord[]>(() => {
+    try {
+      const raw = localStorage.getItem('torino.csv.positions.v1');
+      const parsed = raw ? JSON.parse(raw) as { dividends?: DividendRecord[] } : null;
+      return Array.isArray(parsed?.dividends) ? parsed.dividends : [];
+    } catch { return []; }
+  });
+  const [declaredDividends, setDeclaredDividends] = useState<DeclaredDividend[]>([]);
+  const [dividendLoading, setDividendLoading] = useState(false);
+  const [dividendError, setDividendError] = useState<string | null>(null);
   const instrumentFilterId = Number(searchParams.get('instrument') ?? 0);
   const copyFilterId = searchParams.get('copyId');
 
@@ -90,6 +103,16 @@ export default function Portfolio() {
   /* ── Dati derivati ─────────────────────────────────────────────── */
   const rows = useMemo(() => (portfolio ? enrichPositions(portfolio) : []), [portfolio]);
   const lookThroughRows = useMemo(() => (portfolio ? enrichLookThroughPositions(portfolio) : []), [portfolio]);
+  const dividendSymbols = useMemo(
+    () => lookThroughRows.filter((row) => row.assetClass === 'stock' || row.assetClass === 'etf').map((row) => row.symbol.toUpperCase()).sort(),
+    [lookThroughRows],
+  );
+  const dividendSymbolsKey = dividendSymbols.join(',');
+  useEffect(() => {
+    setDeclaredDividends(loadDeclaredDividends(dividendSymbols));
+  // La chiave stabilizza l'elenco senza rilanciare l'effetto per identità dell'array.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dividendSymbolsKey]);
   const lookThroughCash = useMemo(
     () => (portfolio?.cash ?? 0) + (portfolio?.copyPortfolios ?? []).reduce((sum, copy) => sum + copy.availableCash, 0),
     [portfolio],
@@ -148,6 +171,50 @@ export default function Portfolio() {
   const usdExposurePct = portfolio && portfolio.totalValue > 0 ? usdExposure / portfolio.totalValue : 0;
 
   const months = useMemo(() => monthlyPnl(pnl?.equityHistory ?? []), [pnl]);
+  const dividendsYtd = useMemo(() => {
+    const year = new Date().getFullYear();
+    return importedDividends.filter((dividend) => new Date(dividend.date).getFullYear() === year);
+  }, [importedDividends]);
+  const dividendsYtdUsd = useMemo(() => dividendsYtd.reduce((sum, dividend) => {
+    if (dividend.currency === 'USD') return sum + dividend.amount;
+    if (dividend.currency === 'EUR' && fxRate?.rate) return sum + dividend.amount * fxRate.rate;
+    return sum;
+  }, 0), [dividendsYtd, fxRate]);
+  const unsupportedDividendCurrencies = useMemo(
+    () => [...new Set(dividendsYtd.map((dividend) => dividend.currency).filter((currency) => currency !== 'USD' && currency !== 'EUR'))],
+    [dividendsYtd],
+  );
+  const upcomingDividends = useMemo(() => {
+    const unitsBySymbol = new Map(lookThroughRows.map((row) => [row.symbol.toUpperCase(), row.units]));
+    return declaredDividends.map((dividend) => {
+      const units = unitsBySymbol.get(dividend.symbol) ?? 0;
+      const gross = dividend.amountPerShare * units;
+      const grossUsd = dividend.currency === 'USD' ? gross : dividend.currency === 'EUR' && fxRate?.rate ? gross * fxRate.rate : undefined;
+      return { ...dividend, units, gross, grossUsd };
+    }).filter((dividend) => dividend.units > 0);
+  }, [declaredDividends, fxRate, lookThroughRows]);
+  const upcomingGrossUsd = useMemo(() => upcomingDividends.reduce((sum, dividend) => sum + (dividend.grossUsd ?? 0), 0), [upcomingDividends]);
+
+  const refreshDividends = async () => {
+    if (!settings.fmpApiKey) {
+      navigate('/impostazioni#dati-esterni');
+      return;
+    }
+    setDividendLoading(true);
+    setDividendError(null);
+    try {
+      const rows = await fetchDeclaredDividends(settings.fmpApiKey, dividendSymbols);
+      setDeclaredDividends(rows);
+      if (rows.length === 0) toast.info('Nessun dividendo dichiarato trovato', { description: 'Il calendario non contiene eventi futuri per i ticker attualmente in portafoglio.' });
+      else toast.success('Calendario dividendi aggiornato', { description: `${rows.length} eventi dichiarati trovati.` });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Errore del provider esterno.';
+      setDividendError(message);
+      toast.error('Calendario dividendi non disponibile', { description: message });
+    } finally {
+      setDividendLoading(false);
+    }
+  };
 
   const suggestions = useMemo(
     () => buildSuggestions({
@@ -398,7 +465,7 @@ export default function Portfolio() {
             </div>
             <div className="mt-2 flex items-center justify-between gap-2">
               <span className="text-caption text-text-2">
-                Dividendi YTD: <span className="tabular-nums text-text-1">{formatCurrency(0, cur)}</span>
+                Dividendi YTD: <span className="text-text-1">{dividendsYtd.length > 0 ? fmt(dividendsYtdUsd) : 'non esposti dalla Public API'}</span>
               </span>
               <span className="text-micro text-text-2">
                 {portfolio ? fmtWeight(portfolio.cash / Math.max(portfolio.totalValue, 0.01)) : ''} del totale
@@ -493,6 +560,55 @@ export default function Portfolio() {
           <CopyPortfolioTable portfolios={portfolio.copyPortfolios} fmtMoney={fmt} fmtSignedMoney={fmtSigned} onSelect={setCopyDrawer} />
         </motion.div>
       )}
+
+      <motion.section {...stagger(8)} className="card-surface density-pad col-span-12 p-5">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h2 className="text-title text-text-0">Dividendi</h2>
+            <p className="mt-1 max-w-3xl text-caption leading-relaxed text-text-1">
+              Separiamo gli accrediti realmente ricevuti dalle stime future: sono due dati diversi e non vanno ricavati inventando uno yield.
+            </p>
+          </div>
+          <span className="rounded-full border border-warn/35 bg-warn/10 px-2.5 py-1 text-micro font-medium text-warn">Fonte parziale</span>
+        </div>
+        <div className="mt-4 grid gap-3 md:grid-cols-2">
+          <div className="rounded-xl border border-hairline bg-bg-1 p-4">
+            <div className="flex items-center gap-2 text-body-strong text-text-0"><ReceiptText className="h-4 w-4 text-gain" aria-hidden /> Dividendi ricevuti</div>
+            {dividendsYtd.length > 0 ? <><div className="mt-2 font-display text-display-md text-gain">{fmt(dividendsYtdUsd)}</div><p className="text-micro text-text-2">{dividendsYtd.length} accrediti trovati nell’Account Statement · USD ed EUR convertiti nella valuta di visualizzazione{unsupportedDividendCurrencies.length > 0 ? ` · esclusi dal totale: ${unsupportedDividendCurrencies.join(', ')}` : ''}</p><div className="mt-3 space-y-1.5">{dividendsYtd.slice(0, 4).map((dividend) => <div key={dividend.id} className="flex items-center justify-between gap-3 text-caption"><span className="min-w-0 truncate text-text-1">{dividend.symbol ?? dividend.description}</span><span className="shrink-0 font-mono text-gain">{new Intl.NumberFormat('it-IT', { style: 'currency', currency: dividend.currency }).format(dividend.amount)}</span></div>)}</div></> : <p className="mt-2 text-caption leading-relaxed text-text-2">La Public API eToro documenta saldi e transazioni dei conti cash, ma non un registro dividendi del conto Trading. Il dato verificabile resta l’Account Statement.</p>}
+            <Link to="/impostazioni#import" className="mt-3 inline-flex items-center text-caption font-medium text-info hover:text-text-0">Importa l’Account Statement →</Link>
+          </div>
+          <div className="rounded-xl border border-hairline bg-bg-1 p-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2 text-body-strong text-text-0"><CalendarDays className="h-4 w-4 text-info" aria-hidden /> Prossimi pagamenti dichiarati</div>
+              <button type="button" onClick={() => void refreshDividends()} disabled={dividendLoading || (Boolean(settings.fmpApiKey) && dividendSymbols.length === 0)} className="inline-flex items-center gap-1.5 rounded-lg border border-hairline px-2.5 py-1.5 text-micro font-medium text-info hover:bg-bg-2 disabled:cursor-not-allowed disabled:opacity-40">
+                {dividendLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <RefreshCw className="h-3.5 w-3.5" aria-hidden />}
+                {settings.fmpApiKey ? 'Aggiorna calendario' : 'Configura fonte'}
+              </button>
+            </div>
+            {upcomingDividends.length > 0 ? (
+              <>
+                <div className="mt-2 font-display text-display-md text-info">{fmt(upcomingGrossUsd)}</div>
+                <p className="text-micro text-text-2">Stima lorda dei prossimi 12 mesi · dividendo dichiarato × unità attualmente possedute</p>
+                <div className="mt-3 max-h-48 space-y-2 overflow-y-auto pr-1">
+                  {upcomingDividends.map((dividend) => (
+                    <div key={`${dividend.symbol}-${dividend.exDate}`} className="flex items-center justify-between gap-3 rounded-lg bg-bg-0 px-2.5 py-2 text-caption">
+                      <div className="min-w-0"><div className="font-medium text-text-0">{dividend.symbol} · ex {new Date(`${dividend.exDate}T12:00:00Z`).toLocaleDateString('it-IT')}</div><div className="text-micro text-text-2">{dividend.amountPerShare.toLocaleString('it-IT', { maximumFractionDigits: 4 })} {dividend.currency}/azione × {dividend.units.toLocaleString('it-IT', { maximumFractionDigits: 4 })} unità{dividend.paymentDate ? ` · pagamento ${new Date(`${dividend.paymentDate.slice(0, 10)}T12:00:00Z`).toLocaleDateString('it-IT')}` : ''}</div></div>
+                      <span className="shrink-0 font-mono text-info">{new Intl.NumberFormat('it-IT', { style: 'currency', currency: dividend.currency, maximumFractionDigits: 2 }).format(dividend.gross)}</span>
+                    </div>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <div className="mt-3 space-y-2 text-caption leading-relaxed text-text-1">
+                <p>{settings.fmpApiKey ? 'Aggiorna il calendario per cercare gli eventi dichiarati dei ticker in portafoglio.' : 'Configura una chiave Financial Modeling Prep per interrogare online il calendario dei dividendi dichiarati.'}</p>
+                <p className="text-micro text-text-2">Il dato futuro è una stima lorda. Il netto effettivo dipende da ritenute, cambio, data di possesso e contabilizzazione eToro.</p>
+              </div>
+            )}
+            {dividendError ? <p className="mt-2 rounded-md border border-loss/25 bg-loss/5 px-2.5 py-2 text-micro text-loss">{dividendError}</p> : null}
+            <p className="mt-3 text-micro text-text-2">Ticker azionari/ETF verificabili: {dividendSymbols.length} · fonte online FMP · accrediti reali da Account Statement</p>
+          </div>
+        </div>
+      </motion.section>
 
       {/* ── ROW 5: Suggerimenti + Storico ───────────────────────── */}
       <div className="grid grid-cols-12 gap-4">

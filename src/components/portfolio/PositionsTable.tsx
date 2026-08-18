@@ -6,7 +6,7 @@
  * - riga totali in footer;
  * - P&L live con tick-flash, sparkline 30g, azioni (dettagli / chiudi).
  */
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import { ArrowUp, ChevronDown, Info, XCircle } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -17,10 +17,11 @@ import { TickValue } from '@/components/shared/TickValue';
 import { CLASS_LABELS } from './analytics';
 import type { PositionRow } from './analytics';
 
-export type GroupBy = 'none' | 'class' | 'sector' | 'currency' | 'agent';
+export type GroupBy = 'none' | 'instrument' | 'class' | 'sector' | 'currency' | 'agent';
 
 const GROUP_OPTIONS: Array<{ key: GroupBy; label: string }> = [
   { key: 'none', label: 'Nessun raggruppamento' },
+  { key: 'instrument', label: 'Per strumento (acquisti uniti)' },
   { key: 'class', label: 'Per asset class' },
   { key: 'sector', label: 'Per settore' },
   { key: 'currency', label: 'Per valuta' },
@@ -50,8 +51,9 @@ const SORTERS: Record<SortKey, (r: PositionRow) => number | string> = {
 export function PositionsTable({
   rows, fmtMoney, fmtSignedMoney, sparkFor, agentGroupFor, onDetails, onClose,
 }: PositionsTableProps) {
-  const [groupBy, setGroupBy] = useState<GroupBy>('none');
+  const [groupBy, setGroupBy] = useState<GroupBy>('instrument');
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  const instrumentGroupsInitialized = useRef(false);
   const [sortKey, setSortKey] = useState<SortKey>('value');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
   const [confirmCloseId, setConfirmCloseId] = useState<number | null>(null);
@@ -73,6 +75,7 @@ export function PositionsTable({
     const keyOf = (r: PositionRow): string => {
       switch (groupBy) {
         case 'class': return CLASS_LABELS[r.assetClass] ?? r.assetClass;
+        case 'instrument': return String(r.instrumentId);
         case 'sector': return r.sector;
         case 'currency': return r.currency;
         case 'agent': return agentGroupFor(r.instrumentId);
@@ -89,7 +92,7 @@ export function PositionsTable({
     return [...map.entries()]
       .map(([key, groupRows]) => ({
         key,
-        label: key,
+        label: groupBy === 'instrument' ? `${groupRows[0].symbol} · ${groupRows[0].name}` : key,
         rows: groupRows,
       }))
       .sort((a, b) => {
@@ -98,6 +101,12 @@ export function PositionsTable({
         return vb - va;
       });
   }, [sorted, groupBy, agentGroupFor]);
+
+  useEffect(() => {
+    if (groupBy !== 'instrument' || instrumentGroupsInitialized.current || groups.length === 0) return;
+    setCollapsed(new Set(groups.map((group) => group.key)));
+    instrumentGroupsInitialized.current = true;
+  }, [groupBy, groups]);
 
   const totals = useMemo(() => ({
     value: rows.reduce((s, r) => s + r.value, 0),
@@ -222,12 +231,17 @@ export function PositionsTable({
   return (
     <div>
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <h2 className="text-title text-text-0">Posizioni ({rows.length})</h2>
+        <h2 className="text-title text-text-0">Posizioni ({rows.length} acquisti aperti)</h2>
         <label className="flex items-center gap-2 text-caption text-text-2">
           Raggruppa
           <select
             value={groupBy}
-            onChange={(e) => { setGroupBy(e.target.value as GroupBy); setCollapsed(new Set()); }}
+            onChange={(e) => {
+              const next = e.target.value as GroupBy;
+              setGroupBy(next);
+              instrumentGroupsInitialized.current = next !== 'instrument';
+              setCollapsed(new Set());
+            }}
             className="rounded-md border border-hairline bg-bg-3 px-2 py-1 text-caption text-text-0 outline-none focus:border-hairline-strong"
           >
             {GROUP_OPTIONS.map((o) => (

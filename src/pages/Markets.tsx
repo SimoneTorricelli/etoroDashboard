@@ -5,7 +5,7 @@
  * sparkline e tick-flash; drawer dettaglio 480px con candele e CTA ordine/regola.
  * Supporta ?instrument=<id> per aprire il drawer via deep-link.
  */
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router';
 import { motion } from 'framer-motion';
 import { LayoutGrid, Search, Table2 } from 'lucide-react';
@@ -47,7 +47,6 @@ export default function Markets() {
   const [tab, setTab] = useState<TabKey>('all');
   const [filter, setFilter] = useState('');
   const [view, setView] = useState<'table' | 'heatmap'>('table');
-  const [hoveredId, setHoveredId] = useState<number | null>(null);
   const [dailyCandles, setDailyCandles] = useState<Map<number, Candle[]>>(new Map());
   const [closingPrices, setClosingPrices] = useState<Map<number, HistoricalClosingPrice>>(new Map());
   const [marketError, setMarketError] = useState<string | null>(null);
@@ -110,6 +109,17 @@ export default function Markets() {
       return true;
     });
   }, [rows, tab, filter]);
+
+  // La heatmap è una sintesi: un aggiornamento al secondo evita di ricostruire
+  // 100+ tile a ogni tick WebSocket, mentre tabella e prezzi restano live.
+  const latestHeatmapRows = useRef(filtered);
+  const [heatmapRows, setHeatmapRows] = useState(filtered);
+  useEffect(() => { latestHeatmapRows.current = filtered; }, [filtered]);
+  useEffect(() => {
+    setHeatmapRows(latestHeatmapRows.current);
+    const timer = window.setInterval(() => setHeatmapRows(latestHeatmapRows.current), 1_000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   /* Drawer sincronizzato con ?instrument=<id> */
   const selectedId = searchParams.get('instrument');
@@ -232,13 +242,11 @@ export default function Markets() {
                 <span className="text-caption text-text-2 sm:text-right">Dimensione uniforme · Colore = Δ 1g · cap. non fornita da eToro</span>
               </div>
               {isLoading ? (
-                <Skeleton className="h-[420px] w-full" />
+                <Skeleton className="h-[500px] w-full" />
               ) : (
                 <Heatmap
-                  rows={filtered}
-                  height={view === 'heatmap' ? 560 : 420}
-                  hoveredId={hoveredId}
-                  onHover={setHoveredId}
+                  rows={heatmapRows}
+                  height={view === 'heatmap' ? 620 : 500}
                   onSelect={openDrawer}
                 />
               )}
@@ -268,7 +276,7 @@ export default function Markets() {
                 {Array.from({ length: 10 }).map((_, i) => <Skeleton key={i} className="h-11 w-full" />)}
               </div>
             ) : (
-              <InstrumentsTable rows={filtered} onSelect={openDrawer} onHover={setHoveredId} />
+              <InstrumentsTable rows={filtered} onSelect={openDrawer} />
             )}
           </motion.div>
         </>

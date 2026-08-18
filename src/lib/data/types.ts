@@ -150,7 +150,11 @@ export interface PnlSummary {
   /** Storico equity giornaliero (USD), crescente nel tempo. */
   equityHistory: EquityPoint[];
   asOf: number;
-  dailySource: 'etoro-daily-gain' | 'since-connection' | 'unavailable';
+  dailySource: 'etoro-market-delta' | 'etoro-daily-gain' | 'since-connection' | 'unavailable';
+  /** Quota del valore investito coperta da prezzi con chiusura precedente. */
+  dailyCoveragePct?: number;
+  /** Performance giornaliera pubblicata da eToro, separata dal P&L monetario delle posizioni aperte. */
+  etoroDailyPerformancePct?: number;
   historySource: 'etoro-balances' | 'intraday-snapshots' | 'unavailable';
   /** Testo breve mostrabile nel tooltip della UI. */
   sourceLabel: string;
@@ -190,13 +194,14 @@ export interface FxRate {
 
 export type AgentConditionType =
   | 'drop_from_avg'   // calo % dalla media mobile a N giorni
+  | 'daily_drop'      // variazione giornaliera sotto una soglia negativa
   | 'price_below'     // prezzo sotto soglia
   | 'price_above'     // prezzo sopra soglia
   | 'rsi_below';      // RSI-14 sotto soglia
 
 export interface AgentCondition {
   type: AgentConditionType;
-  /** Soglia: % per drop_from_avg, prezzo per price_*, livello RSI per rsi_below. */
+  /** Soglia: % per drop_from_avg/daily_drop, prezzo per price_*, livello RSI per rsi_below. */
   value: number;
   /** Finestra in giorni per drop_from_avg (default 20). */
   windowDays?: number;

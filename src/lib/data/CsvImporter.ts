@@ -12,9 +12,19 @@ import type { Position } from './types';
 
 export interface CsvImportResult {
   positions: Position[];
+  dividends: DividendRecord[];
   /** Righe riconosciute ma saltate (es. posizioni chiuse). */
   skipped: number;
   errors: string[];
+}
+
+export interface DividendRecord {
+  id: string;
+  date: string;
+  symbol?: string;
+  description: string;
+  amount: number;
+  currency: string;
 }
 
 const COLUMN_ALIASES: Record<string, string[]> = {
@@ -45,10 +55,51 @@ function parseNumber(raw: string | undefined): number {
   return Number.isFinite(n) ? n : 0;
 }
 
+function normalizeStatementDate(raw: string): string {
+  const value = raw.trim();
+  const match = value.match(/^(\d{1,4})[-./](\d{1,2})[-./](\d{1,4})(.*)$/);
+  if (!match) return value;
+  const [, first, middle, last, suffix] = match;
+  const year = first.length === 4 ? Number(first) : Number(last);
+  const month = Number(middle);
+  const day = first.length === 4 ? Number(last) : Number(first);
+  if (year < 1900 || month < 1 || month > 12 || day < 1 || day > 31) return value;
+  const isoDate = `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  const parsed = new Date(`${isoDate}${suffix.trim() ? ` ${suffix.trim()}` : 'T12:00:00Z'}`);
+  return Number.isNaN(parsed.getTime()) ? `${isoDate}T12:00:00.000Z` : parsed.toISOString();
+}
+
+function parseDividendRows(csvText: string): DividendRecord[] {
+  const parsed = Papa.parse<string[]>(csvText, { header: false, skipEmptyLines: 'greedy' });
+  const output: DividendRecord[] = [];
+  for (let index = 0; index < parsed.data.length; index += 1) {
+    const row = parsed.data[index].map((cell) => String(cell ?? '').trim());
+    const joined = row.join(' ').toLowerCase();
+    if (!joined.includes('dividend') || joined.includes('dividends total')) continue;
+    const dateCell = row.find((cell) => /\d{1,4}[-./]\d{1,2}[-./]\d{1,4}/.test(cell));
+    if (!dateCell) continue;
+    const numeric = row.map((cell) => ({ cell, value: parseNumber(cell) }))
+      .filter(({ cell, value }) => value !== 0 && !/\d{1,4}[-./]\d{1,2}[-./]\d{1,4}/.test(cell));
+    const amount = numeric[numeric.length - 1]?.value ?? 0;
+    if (!Number.isFinite(amount) || amount === 0) continue;
+    const symbolMatch = joined.toUpperCase().match(/(?:DIVIDEND|DIVIDENDO)[^A-Z0-9]{0,8}([A-Z][A-Z0-9.-]{1,9})/);
+    output.push({
+      id: `dividend-${index}-${dateCell}-${amount}`,
+      date: normalizeStatementDate(dateCell),
+      symbol: symbolMatch?.[1],
+      description: row.find((cell) => cell.toLowerCase().includes('dividend')) ?? row.join(' '),
+      amount,
+      currency: row.find((cell) => /^(USD|EUR|GBP|CHF)$/i.test(cell))?.toUpperCase() ?? (row.some((cell) => cell.includes('€')) ? 'EUR' : 'USD'),
+    });
+  }
+  return output;
+}
+
 /** Parsing testo CSV → posizioni aperte. */
 export function parseAccountStatement(csvText: string): CsvImportResult {
   const errors: string[] = [];
   const positions: Position[] = [];
+  const dividends = parseDividendRows(csvText);
   let skipped = 0;
 
   const result = Papa.parse<Record<string, string>>(csvText, {
@@ -77,7 +128,7 @@ export function parseAccountStatement(csvText: string): CsvImportResult {
 
   if (col.action < 0 || col.openRate < 0) {
     errors.push('Colonne obbligatorie non trovate (Action / Open Rate). Verifica che sia un Account Statement eToro.');
-    return { positions, skipped, errors };
+    return { positions, dividends, skipped, errors };
   }
 
   const get = (row: Record<string, string>, idx: number) =>
@@ -115,7 +166,7 @@ export function parseAccountStatement(csvText: string): CsvImportResult {
     });
   }
 
-  return { positions, skipped, errors };
+  return { positions, dividends, skipped, errors };
 }
 
 /** Helper: legge un File e ritorna il risultato del parsing. */

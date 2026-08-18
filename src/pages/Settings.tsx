@@ -14,6 +14,7 @@ import { StatusDot } from '@/components/shared/StatusDot';
 import { ConnectionSection } from '@/components/settings/ConnectionSection';
 import { ProxySection } from '@/components/settings/ProxySection';
 import { CsvImportSection } from '@/components/settings/CsvImportSection';
+import { ExternalDataSection } from '@/components/settings/ExternalDataSection';
 import { PreferencesSection } from '@/components/settings/PreferencesSection';
 import { RiskSection } from '@/components/settings/RiskSection';
 
@@ -21,6 +22,7 @@ const NAV = [
   { id: 'connessione', label: 'Connessione API' },
   { id: 'proxy', label: 'Proxy CORS' },
   { id: 'import', label: 'Import CSV' },
+  { id: 'dati-esterni', label: 'Dati esterni' },
   { id: 'preferenze', label: 'Preferenze' },
   { id: 'rischio', label: 'Rischio e privacy' },
 ] as const;
@@ -134,6 +136,7 @@ export default function Settings() {
         <ConnectionSection />
         <ProxySection />
         <CsvImportSection />
+        <ExternalDataSection />
         <PreferencesSection />
         <RiskSection />
       </motion.div>

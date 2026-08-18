@@ -60,10 +60,32 @@ export interface RuleBuilderProps {
 
 const NEW_GROUP = '__new__';
 
-const CONDITION_OPTIONS: { value: AgentConditionType; label: string }[] = [
-  { value: 'drop_from_avg', label: 'Calo % dalla media a N giorni' },
-  { value: 'price_below', label: 'Prezzo sotto soglia' },
-  { value: 'rsi_below', label: 'RSI-14 sotto soglia' },
+const CONDITION_OPTIONS: Array<{ value: AgentConditionType; label: string; explanation: string; example: string }> = [
+  {
+    value: 'drop_from_avg', label: 'Calo % dalla media a N giorni',
+    explanation: 'Confronta il prezzo live con la media delle chiusure giornaliere eToro del periodo scelto.',
+    example: 'Esempio: compra se il prezzo è almeno 3% sotto la media delle ultime 20 chiusure.',
+  },
+  {
+    value: 'daily_drop', label: 'Calo nella seduta',
+    explanation: 'Scatta quando la variazione odierna supera in negativo la percentuale indicata.',
+    example: 'Esempio: compra se oggi perde almeno il 3% rispetto alla chiusura precedente.',
+  },
+  {
+    value: 'price_below', label: 'Prezzo sotto soglia',
+    explanation: 'Scatta quando il prezzo live scende sotto un valore assoluto scelto da te.',
+    example: 'Esempio: compra solo sotto 180 USD.',
+  },
+  {
+    value: 'price_above', label: 'Prezzo sopra soglia',
+    explanation: 'Scatta quando il prezzo live sale sopra un valore assoluto scelto da te.',
+    example: 'Esempio: compra solo dopo il superamento di 200 USD.',
+  },
+  {
+    value: 'rsi_below', label: 'RSI-14 sotto soglia',
+    explanation: 'RSI sotto 30 indica spesso forte pressione di vendita; non garantisce però un rimbalzo.',
+    example: 'Esempio: compra quando RSI(14) scende sotto 30.',
+  },
 ];
 
 const COOLDOWN_OPTIONS = [
@@ -170,6 +192,7 @@ export function RuleBuilder({
     }),
     [condType, condValue, windowDays],
   );
+  const conditionHelp = CONDITION_OPTIONS.find((option) => option.value === condType) ?? CONDITION_OPTIONS[0];
 
   const summary = `Compra ${formatCurrency(amount, displayCurrency, 0)} di ${symbols} ${conditionSentence(condition, symbols)} · SL −${slPct}% · TP +${tpPct}%.`;
 
@@ -359,7 +382,11 @@ export function RuleBuilder({
                 <div>
                   <Label className="overline mb-2 block">Condizione di ingresso</Label>
                   <div className="flex flex-wrap items-center gap-2">
-                    <Select value={condType} onValueChange={(v) => setCondType(v as AgentConditionType)}>
+                    <Select value={condType} onValueChange={(value) => {
+                      const next = value as AgentConditionType;
+                      setCondType(next);
+                      setCondValue(next === 'rsi_below' ? 30 : next === 'price_below' || next === 'price_above' ? 100 : 3);
+                    }}>
                       <SelectTrigger className="w-[240px]">
                         <SelectValue />
                       </SelectTrigger>
@@ -397,6 +424,18 @@ export function RuleBuilder({
                   </div>
                   <p key={summary} className="mt-2 text-caption text-agent">
                     {conditionSentence(condition, symbols)}.
+                  </p>
+                  <div className="mt-2 rounded-lg border border-info/25 bg-info/5 p-3 text-caption leading-relaxed text-text-1">
+                    <p>{conditionHelp.explanation}</p>
+                    <p className="mt-1 text-text-2">{conditionHelp.example}</p>
+                    {(condType === 'drop_from_avg' || condType === 'rsi_below') ? <p className="mt-1 text-micro text-info">Il segnale usa candele giornaliere reali eToro, aggiornate ogni 15 minuti per limitare le chiamate.</p> : null}
+                  </div>
+                </div>
+
+                <div className="rounded-lg border border-hairline bg-bg-1 p-3">
+                  <p className="text-body-strong text-text-0">Altre regole utili da aggiungere in seguito</p>
+                  <p className="mt-1 text-caption leading-relaxed text-text-2">
+                    Accumulo periodico (DCA), incrocio tra medie mobili, breakout con volume, scostamento dai pesi target e presa di profitto progressiva. Non sono selezionabili finché il motore non ne gestisce dati, test e limiti in modo completo.
                   </p>
                 </div>
 

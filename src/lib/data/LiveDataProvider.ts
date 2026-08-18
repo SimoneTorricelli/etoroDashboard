@@ -362,6 +362,7 @@ export class LiveDataProvider implements DataProvider {
       const featuredIds = await this.resolveFeaturedInstruments();
       try {
         const initialQuotes = await this.getQuotes([...featuredIds, this.fxInstrumentId]);
+        for (const quote of initialQuotes) this.lastQuotes.set(quote.instrumentId, quote);
         const fx = initialQuotes.find((quote) => quote.instrumentId === this.fxInstrumentId);
         if (fx && fx.last > 0) this.lastFx = { pair: 'EURUSD', rate: fx.last, prevClose: fx.prevClose, changePct: fx.changePct, timestamp: fx.timestamp };
         if (initialQuotes.length > 0) this.emitter.emit('quotes', initialQuotes);
@@ -658,6 +659,32 @@ export class LiveDataProvider implements DataProvider {
     };
   }
 
+  /**
+   * P&L della seduta sulle sole posizioni aperte, usando le chiusure ufficiali
+   * precedenti restituite dalle quote eToro. È volutamente separato dal
+   * `daily-gain`, che rappresenta una metrica percentuale di performance utente.
+   */
+  private openPositionsDailyPnl(positions: Position[], copyPortfolios: CopyPortfolio[]) {
+    const all = [...positions, ...copyPortfolios.flatMap((copy) => copy.positions)];
+    let totalWeight = 0;
+    let coveredWeight = 0;
+    let value = 0;
+    for (const position of all) {
+      const weight = Math.max(0, position.currentValue ?? position.invested);
+      totalWeight += weight;
+      const quote = this.lastQuotes.get(position.instrumentId);
+      if (!quote || !(quote.prevClose > 0) || !(position.units > 0)) continue;
+      const currentPrice = position.isBuy ? quote.bid || quote.last : quote.ask || quote.last;
+      const direction = position.isBuy ? 1 : -1;
+      value += (currentPrice - quote.prevClose) * position.units * direction;
+      coveredWeight += weight;
+    }
+    return {
+      value,
+      coveragePct: totalWeight > 0 ? Math.round((coveredWeight / totalWeight) * 100) : 0,
+    };
+  }
+
   private markToMarket(snapshot: AccountSnapshot, incoming: Quote[]): AccountSnapshot {
     const quoteMap = new Map(this.lastQuotes);
     for (const quote of incoming) quoteMap.set(quote.instrumentId, quote);
@@ -683,8 +710,19 @@ export class LiveDataProvider implements DataProvider {
     const totalPnl = positions.reduce((sum, position) => sum + (position.pnl ?? 0), 0)
       + copyPortfolios.reduce((sum, copy) => sum + copy.totalPnl, 0);
     const portfolio = { ...snapshot.portfolio, positions, copyPortfolios, positionsValue, mirrorValue, totalValue };
-    const pnl = {
+    const daily = this.openPositionsDailyPnl(positions, copyPortfolios);
+    const useMarketDaily = daily.coveragePct >= 80;
+    const pnl: PnlSummary = {
       ...snapshot.pnl,
+      dailyPnl: useMarketDaily ? daily.value : snapshot.pnl.dailyPnl,
+      dailyPnlPct: useMarketDaily && totalValue - daily.value > 0
+        ? (daily.value / (totalValue - daily.value)) * 100
+        : snapshot.pnl.dailyPnlPct,
+      dailySource: useMarketDaily ? 'etoro-market-delta' : snapshot.pnl.dailySource,
+      dailyCoveragePct: daily.coveragePct,
+      sourceLabel: useMarketDaily
+        ? `Variazione delle posizioni aperte rispetto alla chiusura precedente eToro · copertura ${daily.coveragePct}%`
+        : snapshot.pnl.sourceLabel,
       totalPnl,
       totalPnlPct: portfolio.totalInvested > 0 ? (totalPnl / portfolio.totalInvested) * 100 : 0,
       asOf: Date.now(),
@@ -838,7 +876,12 @@ export class LiveDataProvider implements DataProvider {
     let dailyPnl = 0;
     let dailyPnlPct = 0;
     let dailySource: PnlSummary['dailySource'] = 'unavailable';
-    if (dailyGain != null && Number.isFinite(dailyGain) && dailyGain > -100) {
+    const marketDaily = this.openPositionsDailyPnl(positions, copyPortfolios);
+    if (marketDaily.coveragePct >= 80) {
+      dailyPnl = marketDaily.value;
+      dailyPnlPct = equity - dailyPnl > 0 ? (dailyPnl / (equity - dailyPnl)) * 100 : 0;
+      dailySource = 'etoro-market-delta';
+    } else if (dailyGain != null && Number.isFinite(dailyGain) && dailyGain > -100) {
       const openingEquity = equity / (1 + dailyGain / 100);
       dailyPnl = equity - openingEquity;
       dailyPnlPct = dailyGain;
@@ -870,8 +913,12 @@ export class LiveDataProvider implements DataProvider {
       equityHistory,
       asOf,
       dailySource,
+      dailyCoveragePct: marketDaily.coveragePct,
+      etoroDailyPerformancePct: dailyGain ?? undefined,
       historySource: history.length >= 2 ? 'etoro-balances' : intraday.length >= 2 ? 'intraday-snapshots' : 'unavailable',
-      sourceLabel: dailySource === 'etoro-daily-gain'
+      sourceLabel: dailySource === 'etoro-market-delta'
+        ? `Variazione delle posizioni aperte rispetto alla chiusura precedente eToro · copertura ${marketDaily.coveragePct}%`
+        : dailySource === 'etoro-daily-gain'
         ? 'Performance giornaliera eToro · equity da snapshot conto'
         : dailySource === 'since-connection'
           ? 'Variazione misurata dal primo snapshot reale della connessione'
@@ -1002,10 +1049,41 @@ export class LiveDataProvider implements DataProvider {
 
   async searchInstruments(query: string): Promise<Instrument[]> {
     const q = query.trim().toLowerCase();
-    // Catalogo locale (la Public API non espone una search testuale stabile)
-    return this.listInstruments().filter(
+    const local = this.listInstruments().filter(
       (i) => !q || i.symbol.toLowerCase().includes(q) || i.name.toLowerCase().includes(q),
     ).slice(0, 20);
+    if (!q || local.length > 0 || !/^[a-z0-9.-]{1,16}$/.test(q)) return local;
+
+    const symbol = q.toUpperCase();
+    const cached = this.loadSymbolCache()[symbol];
+    if (cached?.instrumentId > 0) {
+      this.instruments.set(cached.instrumentId, cached);
+      return [cached];
+    }
+
+    const data = await this.api<Record<string, unknown>>(
+      `api/v1/market-data/search?internalSymbolFull=${encodeURIComponent(symbol)}`,
+      undefined,
+      { ttlMs: METADATA_TTL_MS, priority: 'history' },
+    );
+    const candidates = this.recordList(data['instruments'] ?? data['Instruments'] ?? data['results'] ?? data['items'] ?? data);
+    const match = candidates.find((item) => String(item['internalSymbolFull'] ?? item['InternalSymbolFull'] ?? item['symbol'] ?? item['Symbol'] ?? '').toUpperCase() === symbol);
+    const instrumentId = Number(match?.['instrumentId'] ?? match?.['InstrumentID'] ?? match?.['id'] ?? match?.['Id'] ?? 0);
+    if (!match || instrumentId <= 0) return [];
+    const name = String(match['instrumentDisplayName'] ?? match['InstrumentDisplayName'] ?? match['name'] ?? match['Name'] ?? symbol);
+    const instrument: Instrument = {
+      instrumentId,
+      symbol,
+      name,
+      assetClass: this.inferAssetClass(match, instrumentId, symbol, name),
+      currency: String(match['currency'] ?? match['Currency'] ?? 'USD'),
+      exchange: String(match['exchangeName'] ?? match['ExchangeName'] ?? match['exchange'] ?? '') || undefined,
+      sector: String(match['sectorName'] ?? match['SectorName'] ?? match['sector'] ?? '') || undefined,
+      country: String(match['countryName'] ?? match['CountryName'] ?? match['country'] ?? '') || undefined,
+    };
+    this.instruments.set(instrumentId, instrument);
+    this.saveSymbolCache({ [symbol]: instrument });
+    return [instrument];
   }
 
   listInstruments(): Instrument[] {

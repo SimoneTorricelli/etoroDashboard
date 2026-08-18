@@ -21,8 +21,8 @@ import type {
 } from '../data/types';
 
 const STORAGE_KEY = 'torino.agent.v1';
-const PRICE_WINDOW = 64; // campioni per media/RSI
 const DEFAULT_MAX_ORDERS_PER_DAY = 5;
+const INDICATOR_TTL_MS = 15 * 60_000;
 
 export interface AgentEngineHooks {
   getProvider(): DataProvider | null;
@@ -82,7 +82,9 @@ export class AgentEngine {
   private groups: AgentGroup[];
   private rules: AgentRule[];
   private executions: AgentExecution[] = [];
-  private priceHistory = new Map<number, number[]>();
+  private indicatorCache = new Map<number, { at: number; closes: number[] }>();
+  private indicatorPending = new Map<number, Promise<number[]>>();
+  private evaluatingRules = new Set<string>();
   private listeners = new Set<UpdateListener>();
   masterEnabled: boolean;
   autoExecute: boolean;
@@ -219,23 +221,19 @@ export class AgentEngine {
     if (!r) return;
     r.enabled = enabled;
     this.hooks.log('agent', enabled
-      ? `Regola attivata: "${r.name}" — eseguirà senza conferma.`
+      ? `Regola attivata: "${r.name}" — ${this.autoExecute ? 'eseguirà senza conferma' : 'ogni trigger richiederà conferma'}.`
       : `Regola in pausa: "${r.name}".`);
     this.notify();
   }
 
   /* ── Valutazione condizioni sui tick ─────────────────────────────── */
   handleQuotes(quotes: Quote[]) {
-    for (const q of quotes) {
-      let hist = this.priceHistory.get(q.instrumentId);
-      if (!hist) { hist = []; this.priceHistory.set(q.instrumentId, hist); }
-      hist.push(q.last);
-      if (hist.length > PRICE_WINDOW) hist.shift();
-    }
     if (!this.masterEnabled || this.killSwitchEngaged) return;
     for (const rule of this.rules) {
       if (!rule.enabled) continue;
-      this.evaluateRule(rule, quotes);
+      if (this.evaluatingRules.has(rule.id)) continue;
+      this.evaluatingRules.add(rule.id);
+      void this.evaluateRule(rule, quotes).finally(() => this.evaluatingRules.delete(rule.id));
     }
   }
 
@@ -243,7 +241,7 @@ export class AgentEngine {
     return this.groups.find((g) => g.id === id)?.name ?? id;
   }
 
-  private evaluateRule(rule: AgentRule, quotes: Quote[]) {
+  private async evaluateRule(rule: AgentRule, quotes: Quote[]) {
     // Cooldown
     if (rule.lastTriggeredAt && Date.now() - rule.lastTriggeredAt < rule.cooldownMinutes * 60_000) return;
     // Max ordini/giorno globale
@@ -252,25 +250,49 @@ export class AgentEngine {
     for (const iid of rule.instrumentIds) {
       const quote = quotes.find((q) => q.instrumentId === iid);
       if (!quote) continue;
-      if (!this.conditionMet(rule, iid, quote.last)) continue;
+      if (!await this.conditionMet(rule, quote)) continue;
       void this.trigger(rule, quote);
       break; // un trigger per tick per regola
     }
   }
 
-  private conditionMet(rule: AgentRule, instrumentId: number, price: number): boolean {
+  private async dailyCloses(instrumentId: number): Promise<number[]> {
+    const cached = this.indicatorCache.get(instrumentId);
+    if (cached && Date.now() - cached.at < INDICATOR_TTL_MS) return cached.closes;
+    const pending = this.indicatorPending.get(instrumentId);
+    if (pending) return pending;
+    const provider = this.hooks.getProvider();
+    if (!provider) return [];
+    const request = provider.getCandles(instrumentId, 'OneDay', 80)
+      .then((candles) => candles.map((candle) => candle.close).filter((close) => Number.isFinite(close) && close > 0))
+      .then((closes) => {
+        this.indicatorCache.set(instrumentId, { at: Date.now(), closes });
+        return closes;
+      })
+      .catch(() => [] as number[])
+      .finally(() => this.indicatorPending.delete(instrumentId));
+    this.indicatorPending.set(instrumentId, request);
+    return request;
+  }
+
+  private async conditionMet(rule: AgentRule, quote: Quote): Promise<boolean> {
     const c = rule.condition;
-    const hist = this.priceHistory.get(instrumentId) ?? [];
+    const price = quote.last;
     switch (c.type) {
       case 'price_below': return price < c.value;
       case 'price_above': return price > c.value;
+      case 'daily_drop': return quote.changePct <= -Math.abs(c.value);
       case 'drop_from_avg': {
-        if (hist.length < 10) return false;
-        const avg = hist.reduce((s, p) => s + p, 0) / hist.length;
+        const hist = await this.dailyCloses(quote.instrumentId);
+        const window = Math.max(2, c.windowDays ?? 20);
+        const sample = hist.slice(-window);
+        if (sample.length < Math.min(10, window)) return false;
+        const avg = sample.reduce((s, p) => s + p, 0) / sample.length;
         return ((avg - price) / avg) * 100 >= c.value;
       }
       case 'rsi_below': {
-        const rsi = computeRsi(hist);
+        const hist = await this.dailyCloses(quote.instrumentId);
+        const rsi = computeRsi([...hist.slice(-14), price]);
         return rsi != null && rsi < c.value;
       }
     }

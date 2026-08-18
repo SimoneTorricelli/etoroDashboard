@@ -19,7 +19,6 @@ import type { MarketRow } from './meta';
 export interface InstrumentsTableProps {
   rows: MarketRow[];
   onSelect(id: number): void;
-  onHover(id: number | null): void;
 }
 
 function pctCell(value: number | null) {
@@ -31,7 +30,7 @@ function pctCell(value: number | null) {
   );
 }
 
-export function InstrumentsTable({ rows, onSelect, onHover }: InstrumentsTableProps) {
+export function InstrumentsTable({ rows, onSelect }: InstrumentsTableProps) {
   const navigate = useNavigate();
   const [watchlist, setWatchlist] = useState<Set<number>>(() => new Set());
   const [alerts, setAlerts] = useState<Set<number>>(() => new Set());
@@ -167,17 +166,8 @@ export function InstrumentsTable({ rows, onSelect, onHover }: InstrumentsTablePr
     },
   ], [watchlist, alerts, navigate, onSelect]);
 
-  /* Hover riga → evidenzia la tile in heatmap (delegation: DataTable non
-     espone onRowHover; risaliamo al simbolo dalla cella mono della riga). */
-  const handleMouseOver = (e: React.MouseEvent<HTMLDivElement>) => {
-    const tr = (e.target as HTMLElement).closest('tbody tr');
-    const symbol = tr?.querySelector('.font-mono')?.textContent;
-    const row = symbol ? rows.find((r) => r.instrument.symbol === symbol) : undefined;
-    onHover(row ? row.instrument.instrumentId : null);
-  };
-
   return (
-    <div onMouseOver={handleMouseOver} onMouseLeave={() => onHover(null)}>
+    <div>
       <DataTable
         columns={columns}
         rows={rows}

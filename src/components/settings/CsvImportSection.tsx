@@ -14,7 +14,7 @@ import type { CsvImportResult } from '@/lib/data/CsvImporter';
 import { formatCurrency, formatPrice, formatUnits } from '@/lib/format';
 import { Section } from './common';
 
-const IMPORTED_KEY = 'torino.csv.positions.v1';
+export const IMPORTED_KEY = 'torino.csv.positions.v1';
 
 export function CsvImportSection() {
   const inputRef = useRef<HTMLInputElement>(null);
@@ -45,7 +45,7 @@ export function CsvImportSection() {
   const useForAnalysis = () => {
     if (!result) return;
     try {
-      localStorage.setItem(IMPORTED_KEY, JSON.stringify({ importedAt: Date.now(), fileName, positions: result.positions }));
+      localStorage.setItem(IMPORTED_KEY, JSON.stringify({ importedAt: Date.now(), fileName, positions: result.positions, dividends: result.dividends }));
     } catch { /* storage pieno: ignora */ }
     setSaved(true);
   };
@@ -116,6 +116,8 @@ export function CsvImportSection() {
             <p className="mt-2 text-caption text-text-1 tabular-nums">
               <span className="text-gain">{result.positions.length} posizioni importate</span>
               {' · '}
+              <span className="text-gain">{result.dividends.length} dividendi trovati</span>
+              {' · '}
               <span className="text-text-1">{result.skipped} righe saltate</span>
               {' · '}
               <span className={result.errors.length ? 'text-loss' : 'text-text-1'}>{result.errors.length} errori</span>
@@ -164,7 +166,7 @@ export function CsvImportSection() {
             <div className="mt-4 flex flex-wrap items-center gap-2">
               <button
                 onClick={useForAnalysis}
-                disabled={result.positions.length === 0 || saved}
+                disabled={(result.positions.length === 0 && result.dividends.length === 0) || saved}
                 className="rounded-lg bg-gain px-4 py-2 text-body-strong text-bg-0 transition-colors hover:bg-gain/90 disabled:cursor-not-allowed disabled:opacity-40"
               >
                 Usa per le analisi storiche

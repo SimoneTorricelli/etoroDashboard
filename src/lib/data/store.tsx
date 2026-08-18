@@ -417,7 +417,13 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
   const getFxInstrumentId = useCallback(() => providerRef.current?.getFxInstrumentId() ?? null, []);
 
   const searchInstruments = useCallback(
-    (query: string) => providerRef.current?.searchInstruments(query) ?? Promise.resolve([]),
+    async (query: string) => {
+      const provider = providerRef.current;
+      if (!provider) return [];
+      const result = await provider.searchInstruments(query);
+      setInstruments(provider.listInstruments());
+      return result;
+    },
     [],
   );
 

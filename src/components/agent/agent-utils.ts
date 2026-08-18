@@ -78,6 +78,8 @@ export function conditionChip(c: AgentCondition): string {
   switch (c.type) {
     case 'drop_from_avg':
       return `−${c.value}% da media ${c.windowDays ?? 20}g`;
+    case 'daily_drop':
+      return `giornata ≤ −${c.value}%`;
     case 'price_below':
       return `prezzo < ${c.value}`;
     case 'price_above':
@@ -92,6 +94,8 @@ export function conditionSentence(c: AgentCondition, symbols: string): string {
   switch (c.type) {
     case 'drop_from_avg':
       return `se ${symbols} scende del ${c.value}% rispetto alla media a ${c.windowDays ?? 20} giorni`;
+    case 'daily_drop':
+      return `se ${symbols} perde almeno il ${c.value}% rispetto alla chiusura precedente`;
     case 'price_below':
       return `se il prezzo di ${symbols} scende sotto ${c.value}`;
     case 'price_above':
@@ -268,6 +272,10 @@ function conditionMetOnHistory(c: AgentCondition, closes: number[]): boolean {
       return price < c.value;
     case 'price_above':
       return price > c.value;
+    case 'daily_drop': {
+      const previous = closes[closes.length - 2];
+      return previous > 0 && ((previous - price) / previous) * 100 >= c.value;
+    }
     case 'drop_from_avg': {
       const w = Math.min(c.windowDays ?? 20, closes.length - 1);
       if (w < 5) return false;

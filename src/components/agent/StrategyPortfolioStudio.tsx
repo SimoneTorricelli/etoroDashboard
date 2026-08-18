@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { ChangeEvent, ReactNode } from 'react';
 import {
   Check, ChevronRight, CircleDollarSign, CloudDownload, ExternalLink, Info, Loader2,
@@ -17,9 +17,10 @@ import { createAgentPortfolio, listAgentPortfolios } from '@/lib/agent/etoro-age
 import type { RemoteAgentPortfolio } from '@/lib/agent/etoro-agent-api';
 import {
   allocationPreview, createStrategyDraft, getStrategyTemplate, loadStrategyPortfolios, saveStrategyPortfolios,
-  STRATEGY_TEMPLATES, validateStrategyPortfolio,
+  STRATEGY_SIMULATION_MODEL_VERSION, STRATEGY_TEMPLATES, validateStrategyPortfolio,
 } from '@/lib/agent/strategy-portfolios';
 import type { StrategyPortfolioConfig, StrategyTemplate } from '@/lib/agent/strategy-portfolios';
+import { logReturnStats, projectPercentiles } from '@/lib/finance/scenario';
 
 const riskLabel: Record<StrategyTemplate['risk'], string> = {
   basso: 'Rischio più contenuto',
@@ -58,6 +59,76 @@ function numberInput(onChange: (value: number) => void) {
   return (event: ChangeEvent<HTMLInputElement>) => onChange(Number(event.target.value) || 0);
 }
 
+function pct(value: number): string {
+  return `${value >= 0 ? '+' : ''}${value.toFixed(1).replace('.', ',')}%`;
+}
+
+const rebalanceLabel: Record<StrategyPortfolioConfig['rebalance'], string> = {
+  giornaliero: 'giornaliera',
+  settimanale: 'settimanale',
+  mensile: 'mensile',
+};
+
+function StrategySimulationPanel({
+  portfolio,
+  fromUsd,
+  displayCurrency,
+}: {
+  portfolio: StrategyPortfolioConfig;
+  fromUsd(usd: number): number;
+  displayCurrency: DisplayCurrency;
+}) {
+  const [months, setMonths] = useState(18);
+  const simulation = portfolio.simulation;
+  if (!simulation) return <p className="mt-2 text-caption text-text-2">Rendimento, perdita e scenari saranno calcolati su dati reali dopo la simulazione.</p>;
+
+  const safeAnnualMedian = Math.max(-99.9, simulation.p50Pct) / 100;
+  const meanLog = simulation.dailyMeanLog ?? Math.log(1 + safeAnnualMedian) / 252;
+  const volatilityLog = simulation.dailyVolatilityLog ?? (simulation.volatilityPct / 100) / Math.sqrt(252);
+  const projection = projectPercentiles(portfolio.budgetUsd, { meanLog, volatilityLog }, months);
+  const historicalEnd = portfolio.budgetUsd * (1 + simulation.returnPct / 100);
+  const historyMonths = Math.max(1, Math.round(simulation.observations / 21));
+  const horizonLabel = months === 12 ? '1 anno' : months === 18 ? '18 mesi' : `${months / 12} anni`;
+  const scenarioCards = [
+    { key: 'P10', title: 'Scenario debole', value: projection.p10, change: projection.p10ChangePct, copy: '10% degli esiti sotto', tone: 'text-loss' },
+    { key: 'P50', title: 'Scenario mediano', value: projection.p50, change: projection.p50ChangePct, copy: '50% sopra e 50% sotto', tone: 'text-text-0' },
+    { key: 'P90', title: 'Scenario forte', value: projection.p90, change: projection.p90ChangePct, copy: 'Solo 10% degli esiti sopra', tone: 'text-gain' },
+  ];
+
+  return (
+    <div className="mt-3 border-t border-hairline pt-3">
+      <div className="grid gap-2 sm:grid-cols-3">
+        <Metric label={`Test storico · ${historyMonths} mesi`} value={pct(simulation.returnPct)} />
+        <Metric label="Perdita massima osservata" value={`−${simulation.maxDrawdownPct.toFixed(1).replace('.', ',')}%`} />
+        <Metric label="Oscillazione annua" value={`${simulation.volatilityPct.toFixed(1).replace('.', ',')}%`} />
+      </div>
+      <div className="mt-2 rounded-md bg-bg-1 px-2.5 py-2 text-caption text-text-1">
+        Nel periodo testato, un budget iniziale di <span className="font-mono text-text-0">{money(fromUsd(portfolio.budgetUsd), displayCurrency)}</span> sarebbe diventato <span className={cn('font-mono', historicalEnd >= portfolio.budgetUsd ? 'text-gain' : 'text-loss')}>{money(fromUsd(historicalEnd), displayCurrency)}</span>. È un confronto storico, non una previsione.
+      </div>
+      <div className="mt-2 rounded-md border border-info/20 bg-info/5 px-2.5 py-2 text-micro leading-relaxed text-text-1">
+        <span className="font-medium text-info">Capitalizzazione composta attiva.</span>{' '}
+        Ogni variazione si applica al saldo aggiornato: 200 € → +5% = 210 € → +5% = 220,50 €. Le perdite funzionano allo stesso modo. Nel test i pesi vengono riportati al target con frequenza <span className="font-medium text-text-0">{rebalanceLabel[portfolio.rebalance]}</span>.
+      </div>
+      <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
+        <div><p className="text-caption font-medium text-text-0">Capitale possibile tra {horizonLabel}</p><p className="text-micro text-text-2">Partenza: {money(fromUsd(portfolio.budgetUsd), displayCurrency)} · nessun nuovo versamento</p></div>
+        <div className="flex overflow-x-auto rounded-md border border-hairline bg-bg-0 p-0.5" aria-label="Orizzonte simulazione strategia">
+          {[12, 18, 24, 36].map((value) => <button key={value} type="button" onClick={() => setMonths(value)} className={cn('shrink-0 rounded px-2 py-1 text-micro', months === value ? 'bg-bg-3 text-text-0' : 'text-text-2 hover:text-text-1')}>{value === 12 ? '1A' : value === 18 ? '18M' : `${value / 12}A`}</button>)}
+        </div>
+      </div>
+      <div className="mt-2 grid gap-2 sm:grid-cols-3">
+        {scenarioCards.map((card) => <div key={card.key} className="rounded-md border border-hairline bg-bg-0 p-2.5"><div className="text-micro font-medium text-text-1">{card.key} · {card.title}</div><div className={cn('mt-1 font-mono text-body-strong', card.tone)}>{money(fromUsd(card.value), displayCurrency)}</div><div className={cn('font-mono text-micro', card.tone)}>{pct(card.change)}</div><p className="mt-1 text-micro text-text-2">{card.copy}</p></div>)}
+      </div>
+      {Math.abs(projection.p50ChangePct) < 2 ? <p className="mt-2 rounded-md border border-warn/25 bg-warn/5 px-2.5 py-2 text-micro text-warn">P50 resta vicino al budget perché il rendimento geometrico del campione è vicino a zero ({pct(simulation.annualizedMedianPct ?? simulation.p50Pct)} annuo). Non significa che il saldo rimarrà fermo.</p> : null}
+      <div className="mt-2 rounded-md border border-hairline bg-bg-1 p-2">
+        <p className={cn('text-micro font-medium', simulation.coveragePct >= 80 ? 'text-gain' : 'text-warn')}>Copertura dati storici: {simulation.coveragePct}% dei pesi · {simulation.coveragePct >= 80 ? 'attivazione consentita' : 'serve almeno 80% per attivare'}</p>
+        <p className="mt-1 text-micro text-text-2">{simulation.assets?.map((asset) => `${asset.symbol} ${asset.weightPct}%: ${asset.status === 'coperto' ? `${asset.observations} giorni` : asset.status === 'cash' ? 'liquidità' : asset.status === 'non-trovato' ? 'non disponibile per questo account eToro' : asset.status === 'errore-dati' ? 'dati temporaneamente non disponibili' : 'storico insufficiente'}`).join(' · ')}</p>
+        {simulation.partial ? <p className="mt-1 text-micro text-text-2">Non è copertura geografica: indica quanto del capitale target ha uno storico utilizzabile. La parte senza dati resta ferma, quindi capitale finale e percentili descrivono solo un modello parziale.</p> : null}
+      </div>
+      <p className="mt-2 text-micro leading-relaxed text-text-2">P10/P50/P90 sono percentili della distribuzione costruita dalle variazioni giornaliere del test. Non includono dividendi, tasse, costi, nuovi versamenti o futuri ribilanciamenti.</p>
+    </div>
+  );
+}
+
 export function StrategyPortfolioStudio({
   fromUsd,
   toUsd,
@@ -69,7 +140,7 @@ export function StrategyPortfolioStudio({
   displayCurrency: DisplayCurrency;
   realExecutionActive: boolean;
 }) {
-  const { settings, instruments, getCandles } = useAppData();
+  const { settings, instruments, getCandles, searchInstruments } = useAppData();
   const [portfolios, setPortfolios] = useState<StrategyPortfolioConfig[]>(() => loadStrategyPortfolios());
   const [editing, setEditing] = useState<StrategyPortfolioConfig | null>(null);
   const [confirming, setConfirming] = useState<StrategyPortfolioConfig | null>(null);
@@ -109,9 +180,9 @@ export function StrategyPortfolioStudio({
     toast.success(`Strategia ${getStrategyTemplate(next.templateId).name} salvata`, { description: 'Nessun ordine è stato inviato.' });
   };
 
-  const syncRemote = async () => {
+  const syncRemote = useCallback(async (showFeedback = true) => {
     if (!liveReady) {
-      toast.error('Configura prima le chiavi e il proxy nella sezione Impostazioni.');
+      if (showFeedback) toast.error('Configura prima le chiavi e il proxy nella sezione Impostazioni.');
       return;
     }
     setRemoteLoading(true);
@@ -119,38 +190,57 @@ export function StrategyPortfolioStudio({
       const result = await listAgentPortfolios(settings.live);
       setRemote(result);
       setRemoteChecked(true);
-      toast.success(`${result.length} Agent Portfolio trovati su eToro`);
+      if (showFeedback) toast.success(`${result.length} Agent Portfolio trovati su eToro`);
     } catch (error) {
-      toast.error('Impossibile leggere gli Agent Portfolio', { description: error instanceof Error ? error.message : 'Errore del proxy o di eToro' });
+      if (showFeedback) toast.error('Impossibile leggere gli Agent Portfolio', { description: error instanceof Error ? error.message : 'Errore del proxy o di eToro' });
     } finally {
       setRemoteLoading(false);
     }
-  };
+  }, [liveReady, settings.live]);
+
+  useEffect(() => {
+    if (!liveReady || remoteChecked) return;
+    void syncRemote(false);
+  }, [liveReady, remoteChecked, syncRemote]);
 
   const simulateStrategy = async (portfolio: StrategyPortfolioConfig) => {
     const template = getStrategyTemplate(portfolio.templateId);
     const allocations = template.allocations.filter((allocation) => allocation.symbol !== 'Cash');
-    const resolved = allocations.flatMap((allocation) => {
-      const instrument = instruments.find((item) => item.symbol.toUpperCase() === allocation.symbol.toUpperCase());
-      return instrument ? [{ allocation, instrument }] : [];
-    });
-    if (resolved.length === 0) {
-      toast.error('Nessun asset della strategia è disponibile nel catalogo eToro.');
-      return;
-    }
     setSimulatingId(portfolio.id);
     try {
-      const settled = await Promise.allSettled(resolved.map(async ({ allocation, instrument }) => ({ allocation, candles: await getCandles(instrument.instrumentId, 'OneDay', 365) })));
-      const valid = settled.flatMap((entry) => entry.status === 'fulfilled' && entry.value.candles.length >= 30 ? [entry.value] : []);
+      const resolved = (await Promise.all(allocations.map(async (allocation) => {
+        const local = instruments.find((item) => item.symbol.toUpperCase() === allocation.symbol.toUpperCase());
+        const remote = local ? [] : await searchInstruments(allocation.symbol);
+        const instrument = local ?? remote.find((item) => item.symbol.toUpperCase() === allocation.symbol.toUpperCase());
+        return instrument ? { allocation, instrument } : null;
+      }))).filter((item): item is NonNullable<typeof item> => item != null);
+      if (resolved.length === 0) throw new Error('Nessun asset della strategia è disponibile nel catalogo eToro.');
+      const settled = await Promise.allSettled(resolved.map(async ({ allocation, instrument }) => ({ allocation, candles: await getCandles(instrument.instrumentId, 'OneDay', 756) })));
+      const valid = settled.flatMap((entry) => entry.status === 'fulfilled' && entry.value.candles.length >= 60 ? [entry.value] : []);
+      const failedSymbols = new Set(settled.flatMap((entry, index) => entry.status === 'rejected' ? [resolved[index].allocation.symbol] : []));
       const coveragePct = valid.reduce((sum, item) => sum + item.allocation.weightPct, template.allocations.find((allocation) => allocation.symbol === 'Cash')?.weightPct ?? 0);
-      if (valid.length === 0 || coveragePct < 80) throw new Error(`Copertura dati ${coveragePct}%: serve almeno l’80% dei pesi.`);
-      const observations = Math.min(...valid.map((item) => item.candles.length));
-      const trailing = valid.map((item) => ({ ...item, candles: item.candles.slice(-observations) }));
+      if (valid.length === 0) throw new Error('Nessun asset ha almeno 60 candele giornaliere disponibili.');
+      const candleMaps = valid.map((item) => ({ ...item, prices: new Map(item.candles.map((candle) => [candle.time, candle.close])) }));
+      const commonTimes = [...candleMaps[0].prices.keys()].filter((time) => candleMaps.every((item) => item.prices.has(time))).sort((a, b) => a - b);
+      if (commonTimes.length < 60) throw new Error('Gli asset non hanno almeno 60 sedute storiche comuni.');
+      const observations = commonTimes.length;
       const cashWeight = (template.allocations.find((allocation) => allocation.symbol === 'Cash')?.weightPct ?? 0) / 100;
-      const values = Array.from({ length: observations }, (_, index) => cashWeight + trailing.reduce((sum, item) => {
-        const base = item.candles[0].close;
-        return sum + (item.allocation.weightPct / 100) * (base > 0 ? item.candles[index].close / base : 1);
-      }, 0));
+      const missingWeight = Math.max(0, (100 - coveragePct) / 100);
+      const rebalanceEvery = portfolio.rebalance === 'giornaliero' ? 1 : portfolio.rebalance === 'settimanale' ? 5 : 21;
+      const units = new Map(candleMaps.map((item) => [item.allocation.symbol, (item.allocation.weightPct / 100) / (item.prices.get(commonTimes[0]) ?? 1)]));
+      let cashBalance = cashWeight + missingWeight;
+      const values: number[] = [];
+      commonTimes.forEach((time, index) => {
+        const value = cashBalance + candleMaps.reduce((sum, item) => sum + (units.get(item.allocation.symbol) ?? 0) * (item.prices.get(time) ?? 0), 0);
+        values.push(value);
+        if (index < commonTimes.length - 1 && (index + 1) % rebalanceEvery === 0) {
+          cashBalance = value * (cashWeight + missingWeight);
+          for (const item of candleMaps) {
+            const price = item.prices.get(time) ?? 0;
+            if (price > 0) units.set(item.allocation.symbol, (value * item.allocation.weightPct / 100) / price);
+          }
+        }
+      });
       let peak = values[0];
       let maxDrawdownPct = 0;
       const returns: number[] = [];
@@ -163,20 +253,39 @@ export function StrategyPortfolioStudio({
       const variance = returns.reduce((sum, value) => sum + (value - mean) ** 2, 0) / Math.max(1, returns.length - 1);
       const volatilityPct = Math.sqrt(variance) * Math.sqrt(252) * 100;
       const returnPct = (values[values.length - 1] / values[0] - 1) * 100;
-      const annualized = (Math.pow(values[values.length - 1] / values[0], 252 / Math.max(1, observations - 1)) - 1) * 100;
+      const stats = logReturnStats(values);
+      if (!stats) throw new Error('Servono almeno 20 variazioni valide per costruire gli scenari.');
+      const annualProjection = projectPercentiles(1, stats, 12);
       const simulation = {
+        modelVersion: STRATEGY_SIMULATION_MODEL_VERSION,
         returnPct,
         maxDrawdownPct,
         volatilityPct,
-        p10Pct: annualized - 1.2816 * volatilityPct,
-        p50Pct: annualized,
-        p90Pct: annualized + 1.2816 * volatilityPct,
+        p10Pct: annualProjection.p10ChangePct,
+        p50Pct: annualProjection.p50ChangePct,
+        p90Pct: annualProjection.p90ChangePct,
+        dailyMeanLog: stats.meanLog,
+        dailyVolatilityLog: stats.volatilityLog,
+        annualizedMedianPct: stats.annualizedMedianPct,
         coveragePct,
         observations,
+        partial: coveragePct < 80,
+        assets: template.allocations.map((allocation) => {
+          if (allocation.symbol === 'Cash') return { symbol: allocation.symbol, weightPct: allocation.weightPct, status: 'cash' as const, observations };
+          const found = resolved.find((item) => item.allocation.symbol === allocation.symbol);
+          const covered = valid.find((item) => item.allocation.symbol === allocation.symbol);
+          return {
+            symbol: allocation.symbol,
+            weightPct: allocation.weightPct,
+            status: covered ? 'coperto' as const : failedSymbols.has(allocation.symbol) ? 'errore-dati' as const : found ? 'senza-storico' as const : 'non-trovato' as const,
+            observations: covered?.candles.length ?? 0,
+          };
+        }),
         asOf: Date.now(),
       };
       setPortfolios((current) => current.map((item) => item.id === portfolio.id ? { ...item, status: 'simulato', simulation, updatedAt: Date.now() } : item));
-      toast.success('Simulazione strategia completata', { description: `${observations} osservazioni reali · copertura ${coveragePct}%` });
+      if (coveragePct >= 80) toast.success('Simulazione strategia completata', { description: `${observations} osservazioni reali · copertura ${coveragePct}%` });
+      else toast.warning('Simulazione parziale completata', { description: `${coveragePct}% dei pesi coperti. Il restante ${100 - coveragePct}% è stato mantenuto costante e l’attivazione resta bloccata.` });
     } catch (error) {
       toast.error('Simulazione strategia non disponibile', { description: error instanceof Error ? error.message : 'Dati storici insufficienti.' });
     } finally {
@@ -185,7 +294,7 @@ export function StrategyPortfolioStudio({
   };
 
   const activateRemote = async () => {
-    if (!confirming || confirming.status !== 'simulato' || !confirming.simulation || !realExecutionActive || !ackReal) return;
+    if (!confirming || confirming.status !== 'simulato' || !confirming.simulation || confirming.simulation.coveragePct < 80 || !realExecutionActive || !ackReal) return;
     setCreatingId(confirming.id);
     try {
       const created = await createAgentPortfolio(settings.live, confirming);
@@ -229,13 +338,19 @@ export function StrategyPortfolioStudio({
         </div>
         <button
           type="button"
-          onClick={() => void syncRemote()}
+          onClick={() => void syncRemote(true)}
           disabled={remoteLoading}
           className="flex items-center gap-2 rounded-lg border border-hairline-strong px-3 py-2 text-caption text-text-1 transition-colors hover:bg-bg-2 hover:text-text-0 disabled:cursor-wait disabled:opacity-60"
         >
           {remoteLoading ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <CloudDownload className="h-4 w-4" aria-hidden />}
           Leggi da eToro
         </button>
+      </div>
+
+      <div className="grid gap-2 rounded-xl border border-hairline bg-bg-0/50 p-3 text-micro md:grid-cols-3">
+        <div className="rounded-lg bg-bg-1 p-3"><div className="flex items-center gap-1.5 font-medium text-gain"><CloudDownload className="h-3.5 w-3.5" aria-hidden /> Su eToro · multi-dispositivo</div><p className="mt-1 leading-relaxed text-text-2">Gli Agent Portfolio già creati vivono sull’account e vengono letti automaticamente anche da un altro telefono o computer.</p></div>
+        <div className="rounded-lg bg-bg-1 p-3"><div className="flex items-center gap-1.5 font-medium text-warn"><WalletCards className="h-3.5 w-3.5" aria-hidden /> Nel browser corrente</div><p className="mt-1 leading-relaxed text-text-2">Bozze, pesi Torino e regole restano locali. Export/import permette il trasferimento manuale, ma non una sincronizzazione continua.</p></div>
+        <div className="rounded-lg bg-bg-1 p-3"><div className="flex items-center gap-1.5 font-medium text-agent"><LockKeyhole className="h-3.5 w-3.5" aria-hidden /> AI e operatività 24/7</div><p className="mt-1 leading-relaxed text-text-2">Richiedono un processo sempre acceso. La soluzione prevista è estendere il tuo Cloudflare Worker con stato cifrato, pianificazione e controlli di rischio.</p></div>
       </div>
 
       <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
@@ -300,7 +415,11 @@ export function StrategyPortfolioStudio({
                     <Metric label="Max entrata" value={money(fromUsd(portfolio.maxOrderUsd), displayCurrency)} />
                     <Metric label="Posizioni" value={`${portfolio.maxPositions}`} />
                   </div>
-                  <div className="mt-3 rounded-lg border border-hairline bg-bg-0/60 p-3"><p className="text-micro text-text-2">Pesi target · {template.horizon} · ribilanciamento {portfolio.rebalance}</p><p className="mt-1 text-caption text-text-1">{template.allocations.map((allocation) => `${allocation.symbol} ${allocation.weightPct}%`).join(' · ')}</p>{portfolio.simulation ? <div className="mt-3 grid grid-cols-3 gap-2 border-t border-hairline pt-2"><Metric label="Rendimento storico" value={`${portfolio.simulation.returnPct.toFixed(1).replace('.', ',')}%`} /><Metric label="Drawdown max" value={`−${portfolio.simulation.maxDrawdownPct.toFixed(1).replace('.', ',')}%`} /><Metric label="Volatilità ann." value={`${portfolio.simulation.volatilityPct.toFixed(1).replace('.', ',')}%`} /><Metric label="Scenario P10" value={`${portfolio.simulation.p10Pct.toFixed(1).replace('.', ',')}%`} /><Metric label="Scenario P50" value={`${portfolio.simulation.p50Pct.toFixed(1).replace('.', ',')}%`} /><Metric label="Scenario P90" value={`${portfolio.simulation.p90Pct.toFixed(1).replace('.', ',')}%`} /><p className="col-span-3 text-micro text-text-2">{portfolio.simulation.observations} osservazioni reali · copertura {portfolio.simulation.coveragePct}% · scenario, non previsione garantita</p></div> : <p className="mt-2 text-caption text-text-2">Rendimento, perdita e scenari saranno calcolati su dati reali dopo la simulazione.</p>}</div>
+                  <div className="mt-3 rounded-lg border border-hairline bg-bg-0/60 p-3">
+                    <p className="text-micro text-text-2">Pesi target · {template.horizon} · controllo ribilanciamento {portfolio.rebalance}</p>
+                    <p className="mt-1 text-caption text-text-1">{template.allocations.map((allocation) => `${allocation.symbol} ${allocation.weightPct}%`).join(' · ')}</p>
+                    <StrategySimulationPanel portfolio={portfolio} fromUsd={fromUsd} displayCurrency={displayCurrency} />
+                  </div>
                   <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-hairline pt-3">
                     <span className="flex items-center gap-1.5 text-micro text-text-2"><Target className="h-3.5 w-3.5 text-agent" aria-hidden /> Fino a {preview.affordablePositions} posizioni finanziabili ai minimi impostati</span>
                     <div className="flex gap-2">
@@ -317,11 +436,11 @@ export function StrategyPortfolioStudio({
                       {portfolio.status !== 'attivo' ? (
                         <button
                           type="button"
-                          onClick={() => { if (portfolio.status === 'simulato' && portfolio.simulation) { setAckReal(false); setConfirming(portfolio); } }}
-                          disabled={portfolio.status !== 'simulato' || !portfolio.simulation}
+                          onClick={() => { if (portfolio.status === 'simulato' && portfolio.simulation && portfolio.simulation.coveragePct >= 80) { setAckReal(false); setConfirming(portfolio); } }}
+                          disabled={portfolio.status !== 'simulato' || !portfolio.simulation || portfolio.simulation.coveragePct < 80}
                           className="flex items-center gap-1.5 rounded-lg bg-agent px-2.5 py-1.5 text-micro font-medium text-bg-0 transition-colors hover:bg-agent/90 disabled:cursor-not-allowed disabled:opacity-40"
                         >
-                          <Play className="h-3.5 w-3.5" aria-hidden /> {portfolio.status === 'simulato' ? 'Attiva su eToro' : 'Simula prima'}
+                          <Play className="h-3.5 w-3.5" aria-hidden /> {portfolio.status === 'simulato' && (portfolio.simulation?.coveragePct ?? 0) >= 80 ? 'Attiva su eToro' : portfolio.simulation ? 'Copertura insufficiente' : 'Simula prima'}
                         </button>
                       ) : (
                         <span className="flex items-center gap-1.5 rounded-lg bg-gain/10 px-2.5 py-1.5 text-micro text-gain"><Check className="h-3.5 w-3.5" aria-hidden /> Collegato</span>
@@ -342,7 +461,7 @@ export function StrategyPortfolioStudio({
               <h3 className="text-body-strong text-text-0">Agent Portfolio già presenti su eToro</h3>
               <p className="text-caption text-text-2">Lettura tramite il proxy configurato. Nessuna modifica viene eseguita da questo elenco.</p>
             </div>
-            <button type="button" onClick={() => void syncRemote()} className="rounded-lg p-2 text-text-2 transition-colors hover:bg-bg-2 hover:text-text-0" aria-label="Aggiorna Agent Portfolio">
+            <button type="button" onClick={() => void syncRemote(true)} className="rounded-lg p-2 text-text-2 transition-colors hover:bg-bg-2 hover:text-text-0" aria-label="Aggiorna Agent Portfolio">
               <RefreshCw className="h-4 w-4" aria-hidden />
             </button>
           </div>
@@ -397,7 +516,7 @@ export function StrategyPortfolioStudio({
               <Field label="Massimo ordini al giorno" hint="Kill switch operativo aggiuntivo">
                 <Input type="number" min={1} max={100} step={1} value={editing.maxOrdersPerDay} onChange={numberInput((value) => updateEditing('maxOrdersPerDay', Math.max(1, Math.round(value))))} />
               </Field>
-              <Field label="Ribilanciamento" hint="Frequenza di controllo della strategia">
+              <Field label="Ribilanciamento" hint="Cadenza target salvata. In questa versione non genera ancora ordini automatici.">
                 <select value={editing.rebalance} onChange={(event) => updateEditing('rebalance', event.target.value as StrategyPortfolioConfig['rebalance'])} className="flex h-10 w-full rounded-lg border border-hairline-strong bg-bg-1 px-3 text-caption text-text-0 outline-none focus:border-agent">
                   <option value="giornaliero">Giornaliero</option><option value="settimanale">Settimanale</option><option value="mensile">Mensile</option>
                 </select>

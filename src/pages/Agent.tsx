@@ -8,11 +8,12 @@
  * Modali: RuleBuilder, GroupEditor, KillSwitchDialog, presa visione auto-esecuzione.
  */
 import { useEffect, useMemo, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
 import { useSearchParams } from 'react-router';
 import { motion } from 'framer-motion';
 import {
-  Bot, Copy, Download, EllipsisVertical, OctagonX, Pencil, Play, Plus, Power,
-  Trash2, Zap, Info,
+  Bot, BrainCircuit, Clock3, Copy, Download, EllipsisVertical, OctagonX, Pencil, Play, Plus, Power,
+  Scale, Trash2, Zap, Info,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { Toaster } from '@/components/ui/sonner';
@@ -370,6 +371,26 @@ export default function Agent() {
         cur={cur}
       />
 
+      <motion.section {...stagger(1)} className="card-surface density-pad col-span-12 p-5">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h2 className="text-title text-text-0">Come decide l’Agent, oggi</h2>
+            <p className="mt-1 max-w-3xl text-caption leading-relaxed text-text-1">
+              Non c’è un’AI che sceglie liberamente cosa comprare. Il motore applica esclusivamente le regole, gli strumenti e i limiti che configuri tu.
+            </p>
+          </div>
+          <span className="rounded-full border border-info/35 bg-info/10 px-2.5 py-1 text-micro font-medium text-info">Motore deterministico · non AI</span>
+        </div>
+        <div className="mt-4 grid gap-3 md:grid-cols-3">
+          <AgentMechanic icon={<BrainCircuit className="h-4 w-4" aria-hidden />} title="1. Legge i segnali" copy="Prezzo live eToro e, per media mobile o RSI, candele giornaliere reali. Non inventa previsioni né cambia gli asset della regola." />
+          <AgentMechanic icon={<Scale className="h-4 w-4" aria-hidden />} title="2. Applica i limiti" copy="Controlla budget del gruppo, importo per ordine, cooldown, massimo ordini giornalieri e kill switch prima di creare un ordine." />
+          <AgentMechanic icon={<Clock3 className="h-4 w-4" aria-hidden />} title="3. Esegue solo mentre è operativo" copy="In questa versione il motore gira quando Torino è aperto. La cadenza di ribilanciamento delle strategie è salvata, ma non invia ancora ribilanciamenti automatici." />
+        </div>
+        <div className="mt-3 rounded-lg border border-agent/25 bg-agent/5 px-3 py-2.5 text-caption leading-relaxed text-text-1">
+          <span className="font-medium text-agent">Come deve entrare l’AI:</span> analizza regime di mercato, volatilità, correlazioni, trend e fondamentali; propone nuovi pesi con motivazione e confidenza. Un motore deterministico separato applica universo consentito, turnover massimo, riserva cash e limiti di perdita prima di autorizzare qualsiasi ordine. L’AI non deve poter aggirare questi vincoli.
+        </div>
+      </motion.section>
+
       {/* ── Portafogli strategici reali ───────────────────────────── */}
       <StrategyPortfolioStudio
         fromUsd={fromUsd}
@@ -588,6 +609,15 @@ export default function Agent() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+    </div>
+  );
+}
+
+function AgentMechanic({ icon, title, copy }: { icon: ReactNode; title: string; copy: string }) {
+  return (
+    <div className="rounded-xl border border-hairline bg-bg-1 p-3.5">
+      <div className="flex items-center gap-2 text-body-strong text-text-0"><span className="text-agent">{icon}</span>{title}</div>
+      <p className="mt-1.5 text-caption leading-relaxed text-text-2">{copy}</p>
     </div>
   );
 }

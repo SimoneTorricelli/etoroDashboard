@@ -49,14 +49,28 @@ export interface StrategyPortfolioConfig {
   tokenAvailable?: boolean;
   activatedAt?: number;
   simulation?: {
+    /** Versione del resolver e del modello di ribilanciamento usati. */
+    modelVersion?: number;
     returnPct: number;
     maxDrawdownPct: number;
     volatilityPct: number;
     p10Pct: number;
     p50Pct: number;
     p90Pct: number;
+    /** Parametri giornalieri usati per proiettare orizzonti diversi. */
+    dailyMeanLog?: number;
+    dailyVolatilityLog?: number;
+    annualizedMedianPct?: number;
     coveragePct: number;
     observations: number;
+    /** true se una parte dei pesi è stata mantenuta costante per assenza di storico. */
+    partial?: boolean;
+    assets?: Array<{
+      symbol: string;
+      weightPct: number;
+      status: 'coperto' | 'senza-storico' | 'non-trovato' | 'errore-dati' | 'cash';
+      observations: number;
+    }>;
     asOf: number;
   };
   createdAt: number;
@@ -69,6 +83,7 @@ export interface StrategyValidation {
 }
 
 const STORAGE_KEY = 'torino.strategy-portfolios.v1';
+export const STRATEGY_SIMULATION_MODEL_VERSION = 3;
 
 export const STRATEGY_TEMPLATES: StrategyTemplate[] = [
   {
@@ -196,7 +211,24 @@ export function loadStrategyPortfolios(): StrategyPortfolioConfig[] {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw) as unknown;
-    return Array.isArray(parsed) ? parsed as StrategyPortfolioConfig[] : [];
+    if (!Array.isArray(parsed)) return [];
+    return (parsed as StrategyPortfolioConfig[]).map((portfolio) => {
+      const simulation = portfolio.simulation;
+      if (!simulation) return portfolio;
+      const migratedCurrent = simulation.modelVersion == null
+        && simulation.observations >= 500
+        && !(simulation.assets ?? []).some((asset) => asset.status === 'non-trovato');
+      if (simulation.modelVersion === STRATEGY_SIMULATION_MODEL_VERSION || migratedCurrent) {
+        return { ...portfolio, simulation: { ...simulation, modelVersion: STRATEGY_SIMULATION_MODEL_VERSION } };
+      }
+      // Non mostrare esiti salvati con un resolver o un modello precedente:
+      // un vecchio "strumento non trovato" non deve sopravvivere agli aggiornamenti.
+      return {
+        ...portfolio,
+        status: portfolio.status === 'attivo' ? 'attivo' : 'pronto',
+        simulation: undefined,
+      };
+    });
   } catch {
     return [];
   }

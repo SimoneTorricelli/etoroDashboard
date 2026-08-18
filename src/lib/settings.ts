@@ -25,6 +25,8 @@ export interface AppSettings {
   density: Density;
   /** Soglia target EUR/USD per l'advisor prelievo (modulo FX). */
   fxTargetRate: number;
+  /** Chiave opzionale Financial Modeling Prep per il calendario dividendi dichiarati. */
+  fmpApiKey: string;
 }
 
 const STORAGE_KEY = 'torino.settings.v1';
@@ -41,6 +43,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   displayCurrency: 'EUR',
   density: 'comfy',
   fxTargetRate: 1.08,
+  fmpApiKey: '',
 };
 
 export function loadSettings(): AppSettings {

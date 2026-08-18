@@ -3,8 +3,9 @@
  * Dimensione tile = market cap/peso, colore = Δ 1g su scala divergente
  * rosso → neutro → verde. Hover: bordo strong + tooltip; click: apre drawer.
  */
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { motion } from 'framer-motion';
+import { memo, useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { Minus, Plus } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { formatPercent, formatPrice } from '@/lib/format';
 import type { MarketRow } from './meta';
@@ -29,7 +30,10 @@ function layoutRow<T>(row: Item<T>[], rect: Rect, out: [T, Rect][]): Rect {
   const strip = len > 0 ? total / len : 0;
   let offset = 0;
   for (const it of row) {
-    const side = total > 0 ? (it.value / total) * strip : 0;
+    // `strip` is the fixed width/height of this row. The other side must
+    // preserve the item's area (`value = strip * side`). Using a share of
+    // `strip` here leaves most of the treemap empty and distorts every tile.
+    const side = strip > 0 ? it.value / strip : 0;
     out.push([
       it.data,
       horizontal
@@ -89,8 +93,6 @@ function changeColor(changePct: number | undefined): string {
 export interface HeatmapProps {
   rows: MarketRow[];
   height?: number;
-  hoveredId: number | null;
-  onHover(id: number | null): void;
   onSelect(id: number): void;
 }
 
@@ -100,10 +102,13 @@ interface SectorBlock { sector: string; rect: Rect; tiles: Tile[] }
 const GAP = 2;
 const HEADER_H = 20;
 
-export function Heatmap({ rows, height = 420, hoveredId, onHover, onSelect }: HeatmapProps) {
+function HeatmapComponent({ rows, height = 420, onSelect }: HeatmapProps) {
   const hostRef = useRef<HTMLDivElement>(null);
+  const tooltipRef = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(900);
-  const [tooltip, setTooltip] = useState<{ x: number; y: number; row: MarketRow } | null>(null);
+  const [tooltip, setTooltip] = useState<MarketRow | null>(null);
+  const [zoom, setZoom] = useState(1);
+  const [focusSector, setFocusSector] = useState<string | null>(null);
 
   useEffect(() => {
     const el = hostRef.current;
@@ -113,9 +118,18 @@ export function Heatmap({ rows, height = 420, hoveredId, onHover, onSelect }: He
     return () => ro.disconnect();
   }, []);
 
+  const sectorOptions = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const row of rows) counts.set(row.sector, (counts.get(row.sector) ?? 0) + 1);
+    return [...counts.entries()].map(([sector, count]) => ({ sector, count }));
+  }, [rows]);
+
+  const activeSector = focusSector && sectorOptions.some((option) => option.sector === focusSector) ? focusSector : null;
+  const visibleRows = useMemo(() => activeSector ? rows.filter((row) => row.sector === activeSector) : rows, [activeSector, rows]);
+
   const sectors = useMemo(() => {
     const bySector = new Map<string, MarketRow[]>();
-    for (const r of rows) {
+    for (const r of visibleRows) {
       const arr = bySector.get(r.sector) ?? [];
       arr.push(r);
       bySector.set(r.sector, arr);
@@ -125,7 +139,15 @@ export function Heatmap({ rows, height = 420, hoveredId, onHover, onSelect }: He
       list,
       value: list.reduce((a, r) => a + (r.marketCap ?? 1), 0),
     }));
-  }, [rows]);
+  }, [visibleRows]);
+
+  const moveTooltip = (clientX: number, clientY: number) => {
+    const node = tooltipRef.current;
+    if (!node) return;
+    const x = Math.min(clientX + 14, window.innerWidth - 290);
+    const y = Math.min(clientY + 14, window.innerHeight - 110);
+    node.style.transform = `translate3d(${Math.max(8, x)}px, ${Math.max(8, y)}px, 0)`;
+  };
 
   const blocks = useMemo<SectorBlock[]>(() => {
     const W = 1000;
@@ -153,8 +175,8 @@ export function Heatmap({ rows, height = 420, hoveredId, onHover, onSelect }: He
   const px = (x: number) => `${(x / 1000) * 100}%`;
   const py = (y: number) => `${(y / vH) * 100}%`;
 
-  return (
-    <div ref={hostRef} className="relative w-full overflow-hidden" style={{ height }}>
+  const canvas = (
+    <div ref={hostRef} className="relative min-w-[620px]" style={{ width: `${zoom * 100}%`, height: height * zoom }}>
       {/* header settori */}
       {blocks.map((b) => (
         <span
@@ -168,7 +190,7 @@ export function Heatmap({ rows, height = 420, hoveredId, onHover, onSelect }: He
 
       {/* tile */}
       {blocks.flatMap((b) =>
-        b.tiles.map((t, i) => {
+        b.tiles.map((t) => {
           const pctW = (t.rect.w / 1000) * 100;
           const pctH = (t.rect.h / vH) * 100;
           const big = pctW > 7 && pctH > 9;
@@ -176,24 +198,17 @@ export function Heatmap({ rows, height = 420, hoveredId, onHover, onSelect }: He
           const change = t.row.quote?.changePct;
           const id = t.row.instrument.instrumentId;
           return (
-            <motion.button
+            <button
               key={id}
               type="button"
-              initial={{ opacity: 0, scale: 0.92 }}
-              animate={{ opacity: 1, scale: 1 }}
-              transition={{ duration: 0.3, delay: Math.min(i * 0.025, 0.6), ease: [0.2, 0.8, 0.2, 1] }}
               onClick={() => onSelect(id)}
               onMouseEnter={(e) => {
-                onHover(id);
-                const host = hostRef.current?.getBoundingClientRect();
-                const r = e.currentTarget.getBoundingClientRect();
-                if (host) setTooltip({ x: r.left - host.left + r.width / 2, y: r.top - host.top, row: t.row });
+                setTooltip(t.row);
+                requestAnimationFrame(() => moveTooltip(e.clientX, e.clientY));
               }}
-              onMouseLeave={() => { onHover(null); setTooltip(null); }}
-              className={cn(
-                'absolute flex flex-col items-center justify-center overflow-hidden rounded-[4px] border text-center',
-                hoveredId === id ? 'z-10 border-hairline-strong' : 'border-bg-0',
-              )}
+              onMouseMove={(e) => moveTooltip(e.clientX, e.clientY)}
+              onMouseLeave={() => setTooltip(null)}
+              className="absolute flex flex-col items-center justify-center overflow-hidden rounded-[4px] border border-bg-0 text-center hover:z-10 hover:border-hairline-strong focus-visible:z-10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-info"
               style={{
                 left: px(t.rect.x),
                 top: py(t.rect.y),
@@ -211,31 +226,46 @@ export function Heatmap({ rows, height = 420, hoveredId, onHover, onSelect }: He
               {big && change != null && (
                 <span className="text-micro tabular-nums text-text-0/80">{formatPercent(change, 1)}</span>
               )}
-            </motion.button>
+            </button>
           );
         }),
       )}
 
-      {/* Tooltip */}
-      {tooltip && (
-        <div
-          className="pointer-events-none absolute z-20 -translate-x-1/2 -translate-y-full rounded-lg border border-hairline-strong bg-bg-2 px-3 py-2"
-          style={{ left: tooltip.x, top: tooltip.y - 6 }}
-        >
-          <div className="text-body-strong text-text-0">{tooltip.row.instrument.name}</div>
-          <div className="mt-0.5 flex items-center gap-2 text-caption text-text-1">
-            <span className="font-mono">{tooltip.row.instrument.symbol}</span>
-            {tooltip.row.quote && (
-              <>
-                <span className="tabular-nums">{formatPrice(tooltip.row.quote.last)}</span>
-                <span className={cn('tabular-nums', tooltip.row.quote.changePct >= 0 ? 'text-gain' : 'text-loss')}>
-                  {formatPercent(tooltip.row.quote.changePct)}
-                </span>
-              </>
-            )}
-          </div>
+    </div>
+  );
+
+  return (
+    <div className="relative">
+      <div className="mb-2 flex items-center gap-2">
+        <div className="flex min-w-0 flex-1 gap-1 overflow-x-auto pb-1" aria-label="Categorie heatmap">
+          <button type="button" onClick={() => setFocusSector(null)} aria-pressed={activeSector == null} className={cn('shrink-0 rounded-md border px-2 py-1 text-micro', activeSector == null ? 'border-info/40 bg-info/10 text-info' : 'border-hairline text-text-2 hover:text-text-0')}>Tutti · {rows.length}</button>
+          {sectorOptions.map((option) => <button key={option.sector} type="button" onClick={() => setFocusSector(option.sector)} aria-pressed={activeSector === option.sector} className={cn('shrink-0 rounded-md border px-2 py-1 text-micro', activeSector === option.sector ? 'border-info/40 bg-info/10 text-info' : 'border-hairline text-text-2 hover:text-text-0')}>{option.sector} · {option.count}</button>)}
         </div>
+        <div className="z-30 flex shrink-0 items-center rounded-lg border border-hairline-strong bg-bg-0/90 p-1 shadow-lg">
+          <button type="button" aria-label="Riduci zoom heatmap" disabled={zoom <= 1} onClick={() => setZoom((value) => Math.max(1, value - 0.25))} className="rounded-md p-1.5 text-text-1 hover:bg-bg-2 disabled:opacity-30"><Minus className="h-3.5 w-3.5" aria-hidden /></button>
+          <span className="w-11 text-center font-mono text-micro text-text-2">{Math.round(zoom * 100)}%</span>
+          <button type="button" aria-label="Aumenta zoom heatmap" disabled={zoom >= 1.75} onClick={() => setZoom((value) => Math.min(1.75, value + 0.25))} className="rounded-md p-1.5 text-text-1 hover:bg-bg-2 disabled:opacity-30"><Plus className="h-3.5 w-3.5" aria-hidden /></button>
+        </div>
+      </div>
+      <div className="w-full overflow-auto rounded-lg" style={{ height }} aria-label="Heatmap navigabile; aumenta lo zoom per scorrere">
+        {canvas}
+      </div>
+      {tooltip && createPortal(
+        <div
+          ref={tooltipRef}
+          className="pointer-events-none fixed z-[200] w-max max-w-[280px] rounded-lg border border-hairline-strong bg-bg-2 px-3 py-2 shadow-2xl"
+          style={{ left: 0, top: 0, willChange: 'transform' }}
+        >
+          <div className="text-body-strong text-text-0">{tooltip.instrument.name}</div>
+          <div className="mt-0.5 flex items-center gap-2 text-caption text-text-1">
+            <span className="font-mono">{tooltip.instrument.symbol}</span>
+            {tooltip.quote ? <><span className="tabular-nums">{formatPrice(tooltip.quote.last)}</span><span className={cn('tabular-nums', tooltip.quote.changePct >= 0 ? 'text-gain' : 'text-loss')}>{formatPercent(tooltip.quote.changePct)}</span></> : null}
+          </div>
+        </div>,
+        document.body,
       )}
     </div>
   );
 }
+
+export const Heatmap = memo(HeatmapComponent);

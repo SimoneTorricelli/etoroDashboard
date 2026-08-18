@@ -11,13 +11,28 @@ import { useAppData } from '@/lib/data/store';
 import { Section } from './common';
 
 const CONFIG_PREFIX = 'torino.';
+const SETTINGS_KEY = 'torino.settings.v1';
+
+function withoutSecrets(key: string, value: string): string {
+  if (key !== SETTINGS_KEY) return value;
+  try {
+    const settings = JSON.parse(value) as Record<string, unknown> & { live?: Record<string, unknown> };
+    return JSON.stringify({
+      ...settings,
+      fmpApiKey: '',
+      live: { ...(settings.live ?? {}), apiKey: '', userKey: '' },
+    });
+  } catch {
+    return value;
+  }
+}
 
 function exportConfig() {
   const data: Record<string, string> = {};
   for (let i = 0; i < localStorage.length; i++) {
     const key = localStorage.key(i);
     if (key && key.startsWith(CONFIG_PREFIX)) {
-      data[key] = localStorage.getItem(key) ?? '';
+      data[key] = withoutSecrets(key, localStorage.getItem(key) ?? '');
     }
   }
   const blob = new Blob([JSON.stringify({ app: 'torino', exportedAt: new Date().toISOString(), data }, null, 2)], {
@@ -44,7 +59,7 @@ export function RiskSection() {
       if (!parsed.data || typeof parsed.data !== 'object') throw new Error('formato');
       for (const [key, value] of Object.entries(parsed.data)) {
         if (key.startsWith(CONFIG_PREFIX) && typeof value === 'string') {
-          localStorage.setItem(key, value);
+          localStorage.setItem(key, withoutSecrets(key, value));
         }
       }
       setImportMsg('Configurazione importata — ricarico l\u2019app…');
@@ -81,14 +96,14 @@ export function RiskSection() {
             <h3 className="text-body-strong text-text-0">Tutto gira nel tuo browser</h3>
             <p className="mt-1 text-caption text-text-1">
               Chiavi, regole e dati restano in localStorage sul tuo dispositivo. Nessun account, nessun server nostro,
-              nessun tracciamento.
+              nessun tracciamento. L’export trasferisce strategie e regole ma rimuove sempre le chiavi API.
             </p>
             <div className="mt-3 flex flex-wrap gap-2">
               <button
                 onClick={exportConfig}
                 className="flex items-center gap-1.5 rounded-lg border border-hairline px-3 py-1.5 text-caption text-text-1 transition-colors hover:bg-bg-2 hover:text-text-0"
               >
-                <Download className="h-3.5 w-3.5" aria-hidden /> Esporta configurazione
+                <Download className="h-3.5 w-3.5" aria-hidden /> Esporta configurazione senza chiavi
               </button>
               <button
                 onClick={() => fileRef.current?.click()}

@@ -12,7 +12,7 @@ import { motion } from 'framer-motion';
 import { createChart, AreaSeries, LineSeries } from 'lightweight-charts';
 import type { IChartApi, ISeriesApi, UTCTimestamp } from 'lightweight-charts';
 import {
-  ArrowRight, Bell, Bot, CircleAlert, Lightbulb, Pencil, Plus, TrendingUp, TriangleAlert,
+  ArrowRight, Bell, Bot, CircleAlert, Database, Lightbulb, Loader2, Pencil, Plus, TrendingUp, TriangleAlert,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useAppData } from '@/lib/data/store';
@@ -33,9 +33,10 @@ import { TickValue } from '@/components/shared/TickValue';
 import { FreshnessBadge } from '@/components/shared/FreshnessBadge';
 import { CopyPortfolioTable } from '@/components/portfolio/CopyPortfolioTable';
 import { enrichLookThroughPositions } from '@/components/portfolio/analytics';
-import type { Candle, Position, PriceAlert } from '@/lib/data/types';
+import type { Candle, EquityPoint, PnlSummary, Portfolio, Position, PriceAlert } from '@/lib/data/types';
 import { externalCryptoSymbol } from '@/lib/data/ExternalPriceProvider';
 import { AgentMasterSwitch } from '@/components/agent/AgentMasterSwitch';
+import { logReturnStats, projectPercentiles } from '@/lib/finance/scenario';
 
 const WATCHLIST_SYMBOLS = ['AAPL', 'META', 'BTC', 'ETH', 'SPY', 'EURUSD'];
 const TIMEFRAMES = [
@@ -49,15 +50,133 @@ const stagger = (i: number) => ({
   transition: { duration: 0.28, delay: i * 0.05, ease: [0.2, 0.8, 0.2, 1] as [number, number, number, number] },
 });
 
+type TrendResult = {
+  points: EquityPoint[];
+  source: 'etoro' | 'reconstructed' | 'loading' | 'unavailable';
+  coveragePct: number;
+  projectionPoints: EquityPoint[];
+  projectionCoveragePct: number;
+  projectionSource: 'reconstructed' | 'account' | 'loading' | 'unavailable';
+};
+
+function usePortfolioTrend(
+  portfolio: Portfolio | null,
+  pnl: PnlSummary | null,
+  getCandles: ReturnType<typeof useAppData>['getCandles'],
+): TrendResult {
+  const official = pnl?.historySource === 'etoro-balances' ? pnl.equityHistory : [];
+  const [result, setResult] = useState<TrendResult>({
+    points: official,
+    source: official.length >= 20 ? 'etoro' : 'loading',
+    coveragePct: official.length >= 20 ? 100 : 0,
+    projectionPoints: [],
+    projectionCoveragePct: 0,
+    projectionSource: 'loading',
+  });
+  const holdingsKey = portfolio
+    ? `${portfolio.asOf}:${portfolio.positions.map((position) => position.positionId).join(',')}:${(portfolio.copyPortfolios ?? []).map((copy) => copy.copyId).join(',')}`
+    : '';
+
+  useEffect(() => {
+    if (!portfolio || portfolio.totalValue <= 0) {
+      setResult({
+        points: official,
+        source: official.length >= 2 ? 'etoro' : 'unavailable',
+        coveragePct: official.length >= 2 ? 100 : 0,
+        projectionPoints: official,
+        projectionCoveragePct: official.length >= 20 ? 100 : 0,
+        projectionSource: official.length >= 20 ? 'account' : 'unavailable',
+      });
+      return;
+    }
+    const controller = new AbortController();
+    const allRows = enrichLookThroughPositions(portfolio).filter((row) => row.instrumentId > 0 && row.value > 0).sort((a, b) => b.value - a.value);
+    // Prova le dieci esposizioni maggiori: fermarsi appena raggiunto il 90%
+    // poteva lasciare la copertura sotto soglia se uno dei primi asset non aveva storico.
+    const selected = allRows.slice(0, 10);
+    setResult((current) => ({
+      ...current,
+      points: official.length >= 20 ? official : current.points,
+      source: official.length >= 20 ? 'etoro' : 'loading',
+      coveragePct: official.length >= 20 ? 100 : current.coveragePct,
+      projectionSource: 'loading',
+    }));
+    void Promise.allSettled(selected.map(async (row) => ({ row, candles: await getCandles(row.instrumentId, 'OneDay', 756, controller.signal) })))
+      .then((settled) => {
+        if (controller.signal.aborted) return;
+        const valid = settled.flatMap((entry) => entry.status === 'fulfilled' && entry.value.candles.length >= 20 ? [entry.value] : []);
+        if (valid.length === 0) {
+          setResult({
+            points: official,
+            source: official.length >= 2 ? 'etoro' : 'unavailable',
+            coveragePct: official.length >= 2 ? 100 : 0,
+            projectionPoints: official,
+            projectionCoveragePct: official.length >= 20 ? 100 : 0,
+            projectionSource: official.length >= 20 ? 'account' : 'unavailable',
+          });
+          return;
+        }
+        const anchor = [...valid].sort((a, b) => b.candles.length - a.candles.length)[0].candles;
+        const series = valid.map(({ row, candles }) => ({
+          row,
+          candles,
+          latest: candles[candles.length - 1].close,
+        })).filter((item) => item.latest > 0);
+        const dynamicValue = series.reduce((sum, item) => sum + item.row.value, 0);
+        const staticValue = Math.max(0, portfolio.totalValue - dynamicValue);
+        const commonStart = Math.max(...series.map((item) => item.candles[0].time));
+        const points = anchor.filter((anchorCandle) => anchorCandle.time >= commonStart).map((anchorCandle) => {
+          let value = staticValue;
+          for (const item of series) {
+            let candle = item.candles[0];
+            for (const candidate of item.candles) {
+              if (candidate.time > anchorCandle.time) break;
+              candle = candidate;
+            }
+            value += item.row.value * (candle.close / item.latest);
+          }
+          return { time: anchorCandle.time, value };
+        }).filter((point) => Number.isFinite(point.value) && point.value > 0);
+        points.push({ time: Math.floor(Date.now() / 1000), value: portfolio.totalValue });
+        const knownStatic = Math.max(0, portfolio.cash + (portfolio.copyPortfolios ?? []).reduce((sum, copy) => sum + copy.availableCash, 0));
+        const coveragePct = Math.round(Math.min(100, ((dynamicValue + knownStatic) / portfolio.totalValue) * 100));
+        setResult({
+          points: official.length >= 20 ? official : points,
+          source: official.length >= 20 ? 'etoro' : 'reconstructed',
+          coveragePct: official.length >= 20 ? 100 : coveragePct,
+          projectionPoints: points,
+          projectionCoveragePct: coveragePct,
+          projectionSource: 'reconstructed',
+        });
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setResult({
+          points: official,
+          source: official.length >= 2 ? 'etoro' : 'unavailable',
+          coveragePct: official.length >= 2 ? 100 : 0,
+          projectionPoints: official,
+          projectionCoveragePct: official.length >= 20 ? 100 : 0,
+          projectionSource: official.length >= 20 ? 'account' : 'unavailable',
+        });
+      });
+    return () => controller.abort();
+    // La firma cambia solo quando cambia lo snapshot autorevole o la composizione.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [getCandles, holdingsKey, official.length]);
+
+  return result;
+}
+
 export default function Overview() {
   const navigate = useNavigate();
   const {
     portfolio, pnl, loading, status,
-    displayCurrency, fromUsd, realExecutionActive, agent,
+    displayCurrency, fromUsd, realExecutionActive, agent, getCandles,
   } = useAppData();
 
   const cur = displayCurrency;
   const [timeframe, setTimeframe] = useState<(typeof TIMEFRAMES)[number]['key']>('1M');
+  const trend = usePortfolioTrend(portfolio, pnl, getCandles);
 
   /* ── Empty state: Live senza connessione e nessun dato ──────────── */
   if (!loading && !portfolio) {
@@ -168,12 +287,13 @@ export default function Overview() {
           </div>
         </div>
         <PnlChart
-          data={pnl?.equityHistory ?? []}
+          data={trend.points}
           days={TIMEFRAMES.find((t) => t.key === timeframe)!.days}
           fromUsd={fromUsd}
         />
-        <PnlStats history={pnl?.equityHistory ?? []} />
-        <ProjectionScenario history={pnl?.equityHistory ?? []} fromUsd={fromUsd} currency={cur} />
+        <TrendSource source={trend.source} coveragePct={trend.coveragePct} />
+        <PnlStats history={trend.points} />
+        <ProjectionScenario history={trend.projectionPoints} coveragePct={trend.projectionCoveragePct} source={trend.projectionSource} fromUsd={fromUsd} currency={cur} />
       </motion.div>
 
       <SuggestionsCard />
@@ -259,60 +379,76 @@ function HeroNumber({ value, currency }: { value: number; currency: 'EUR' | 'USD
   );
 }
 
-function ProjectionScenario({ history, fromUsd, currency }: { history: { time: number; value: number }[]; fromUsd(value: number): number; currency: 'EUR' | 'USD' }) {
-  const [months, setMonths] = useState(3);
+function TrendSource({ source, coveragePct }: { source: TrendResult['source']; coveragePct: number }) {
+  if (source === 'loading') {
+    return <div className="mt-2 flex items-center gap-2 text-caption text-text-2"><Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> Ricostruzione dello storico dai prezzi reali in corso…</div>;
+  }
+  if (source === 'etoro') {
+    return <div className="mt-2 flex items-center gap-2 text-caption text-gain"><Database className="h-3.5 w-3.5" aria-hidden /> Storico equity ufficiale eToro, fine giornata.</div>;
+  }
+  if (source === 'reconstructed') {
+    return (
+      <div className="mt-2 rounded-lg border border-info/25 bg-info/5 px-3 py-2 text-caption leading-relaxed text-text-1">
+        <span className="font-medium text-info">Ricostruzione sui prezzi reali · copertura {coveragePct}%.</span>{' '}
+        Applica la composizione attuale ai prezzi storici eToro; non ricostruisce acquisti, vendite, versamenti o dividendi passati.
+      </div>
+    );
+  }
+  return <div className="mt-2 text-caption text-warn">Storico non ancora disponibile: mantengo visibile il valore corrente senza inventare punti.</div>;
+}
+
+function ProjectionScenario({ history, coveragePct, source, fromUsd, currency }: { history: { time: number; value: number }[]; coveragePct: number; source: TrendResult['projectionSource']; fromUsd(value: number): number; currency: 'EUR' | 'USD' }) {
+  const [months, setMonths] = useState(12);
+  const qualityReason = source === 'loading'
+    ? 'Sto ricostruendo lo storico della composizione attuale.'
+    : source === 'account'
+      ? 'Lo storico del saldo può contenere versamenti e prelievi: non lo uso per proiettare rendimenti di mercato.'
+      : source !== 'reconstructed'
+        ? 'Non è disponibile uno storico della composizione corrente.'
+        : coveragePct < 80
+          ? `Copertura dati ${coveragePct}%: serve almeno l’80% del valore corrente.`
+          : history.length < 126
+            ? `Sono disponibili ${history.length} sedute: ne servono almeno 126 per evitare una proiezione troppo fragile.`
+            : null;
   const scenario = useMemo(() => {
-    if (history.length < 20) return null;
-    const returns: number[] = [];
-    for (let index = 1; index < history.length; index += 1) {
-      const previous = history[index - 1].value;
-      const current = history[index].value;
-      if (previous > 0 && current > 0) returns.push(Math.log(current / previous));
-    }
-    if (returns.length < 19) return null;
-    const sorted = [...returns].sort((a, b) => a - b);
-    const low = sorted[Math.floor(sorted.length * 0.05)];
-    const high = sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * 0.95))];
-    const cleaned = returns.map((value) => Math.max(low, Math.min(high, value)));
-    const mean = cleaned.reduce((sum, value) => sum + value, 0) / cleaned.length;
-    const variance = cleaned.reduce((sum, value) => sum + (value - mean) ** 2, 0) / Math.max(1, cleaned.length - 1);
-    const horizonDays = months * 30;
-    const medianLog = mean * horizonDays;
-    const dispersion = Math.sqrt(variance * horizonDays) * 1.2816;
+    if (qualityReason) return null;
+    const stats = logReturnStats(history.map((point) => point.value));
+    if (!stats) return null;
     const base = history[history.length - 1].value;
-    return {
-      p10: base * Math.exp(medianLog - dispersion),
-      p50: base * Math.exp(medianLog),
-      p90: base * Math.exp(medianLog + dispersion),
-      observations: cleaned.length,
-    };
-  }, [history, months]);
+    return { base, stats, ...projectPercentiles(base, stats, months) };
+  }, [history, months, qualityReason]);
+
+  const horizonLabel = months < 12 ? `${months} mesi` : months === 12 ? '1 anno' : months === 18 ? '18 mesi' : `${months / 12} anni`;
 
   return (
     <div className="mt-4 rounded-lg border border-hairline bg-bg-0/60 p-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div>
-          <div className="flex items-center gap-1.5 text-body-strong text-text-0"><TriangleAlert className="h-4 w-4 text-warn" aria-hidden /> Scenario probabilistico</div>
-          <p className="mt-0.5 text-micro text-text-2">Scenario, non previsione garantita · rendimenti reali giornalieri winsorizzati</p>
+          <div className="flex items-center gap-1.5 text-body-strong text-text-0"><TriangleAlert className="h-4 w-4 text-warn" aria-hidden /> Quanto potrebbe valere il portafoglio?</div>
+          <p className="mt-0.5 text-micro text-text-2">Capitale di oggi proiettato sui prezzi reali della composizione attuale · capitalizzazione composta · scenario statistico, non previsione</p>
         </div>
-        <div className="flex rounded-md border border-hairline bg-bg-1 p-0.5" aria-label="Orizzonte scenario">
-          {[1, 3, 6, 12].map((value) => <button key={value} type="button" onClick={() => setMonths(value)} className={cn('rounded px-2 py-1 text-micro', months === value ? 'bg-bg-3 text-text-0' : 'text-text-2 hover:text-text-1')}>{value}M</button>)}
+        <div className="flex max-w-full overflow-x-auto rounded-md border border-hairline bg-bg-1 p-0.5" aria-label="Orizzonte scenario">
+          {[3, 6, 12, 18, 24, 36].map((value) => <button key={value} type="button" onClick={() => setMonths(value)} className={cn('shrink-0 rounded px-2 py-1 text-micro', months === value ? 'bg-bg-3 text-text-0' : 'text-text-2 hover:text-text-1')}>{value < 12 ? `${value}M` : value === 12 ? '1A' : value === 18 ? '18M' : `${value / 12}A`}</button>)}
         </div>
       </div>
       {scenario ? (
-        <div className="mt-3 grid grid-cols-3 gap-2">
-          <ScenarioMetric label="P10 · prudente" value={formatCurrency(fromUsd(scenario.p10), currency)} tone="loss" />
-          <ScenarioMetric label="P50 · mediano" value={formatCurrency(fromUsd(scenario.p50), currency)} />
-          <ScenarioMetric label="P90 · favorevole" value={formatCurrency(fromUsd(scenario.p90), currency)} tone="gain" />
-          <p className="col-span-3 text-micro text-text-2">Campione: {scenario.observations} rendimenti reali. Non include versamenti, prelievi, costi futuri o cambi di composizione.</p>
+        <div className="mt-3">
+          <p className="mb-2 text-caption text-text-1">Partendo da <span className="font-mono font-medium text-text-0">{formatCurrency(fromUsd(scenario.base), currency)}</span>, tra <span className="font-medium text-text-0">{horizonLabel}</span> il modello produce questa fascia:</p>
+          <div className="grid gap-2 sm:grid-cols-3">
+            <ScenarioMetric label="P10 · scenario debole" probability="Il 10% degli esiti simulati è sotto questo valore" value={formatCurrency(fromUsd(scenario.p10), currency)} delta={`${formatSignedCurrency(fromUsd(scenario.p10 - scenario.base), currency)} · ${formatPercent(scenario.p10ChangePct, 1)}`} tone="loss" />
+            <ScenarioMetric label="P50 · scenario mediano" probability="Metà degli esiti è sopra e metà sotto" value={formatCurrency(fromUsd(scenario.p50), currency)} delta={`${formatSignedCurrency(fromUsd(scenario.p50 - scenario.base), currency)} · ${formatPercent(scenario.p50ChangePct, 1)}`} />
+            <ScenarioMetric label="P90 · scenario forte" probability="Solo il 10% degli esiti simulati è sopra questo valore" value={formatCurrency(fromUsd(scenario.p90), currency)} delta={`${formatSignedCurrency(fromUsd(scenario.p90 - scenario.base), currency)} · ${formatPercent(scenario.p90ChangePct, 1)}`} tone="gain" />
+          </div>
+          {Math.abs(scenario.p50ChangePct) < 2 ? <p className="mt-2 rounded-md border border-warn/25 bg-warn/5 px-2.5 py-2 text-micro leading-relaxed text-warn">Perché la mediana resta quasi uguale? Il campione disponibile ha un rendimento geometrico annualizzato vicino a zero ({formatPercent(scenario.stats.annualizedMedianPct, 1)}). Il modello lo ripete: non sta dicendo che il mercato “deve” restare fermo.</p> : null}
+          <div className="mt-2 rounded-md bg-bg-1 px-2.5 py-2 text-micro leading-relaxed text-text-2"><span className="font-medium text-text-1">Metodo:</span> ogni rendimento giornaliero si applica al saldo del giorno precedente, quindi guadagni e perdite si compongono. P10, P50 e P90 sono percentili, non tre saldi promessi. Campione: {scenario.stats.observations} variazioni giornaliere · copertura {coveragePct}% · circa {scenario.tradingDays} sedute proiettate. Non include versamenti, prelievi, dividendi, costi futuri o cambi di composizione.</div>
         </div>
-      ) : <p className="mt-3 text-caption text-text-2">Servono almeno 20 punti reali di storico per costruire una banda attendibile.</p>}
+      ) : <p className="mt-3 rounded-md border border-warn/25 bg-warn/5 px-3 py-2 text-caption leading-relaxed text-warn"><span className="font-medium">Scenario non pubblicato.</span> {qualityReason ?? 'I dati disponibili non superano i controlli minimi di qualità.'} Preferisco non mostrare un saldo futuro apparentemente preciso ma fuorviante.</p>}
     </div>
   );
 }
 
-function ScenarioMetric({ label, value, tone }: { label: string; value: string; tone?: 'gain' | 'loss' }) {
-  return <div className="min-w-0 rounded-md bg-bg-1 p-2"><div className="text-micro text-text-2">{label}</div><div className={cn('mt-1 truncate font-mono text-caption tabular-nums', tone === 'gain' ? 'text-gain' : tone === 'loss' ? 'text-loss' : 'text-text-0')}>{value}</div></div>;
+function ScenarioMetric({ label, probability, value, delta, tone }: { label: string; probability: string; value: string; delta: string; tone?: 'gain' | 'loss' }) {
+  return <div className="min-w-0 rounded-md bg-bg-1 p-2.5"><div className="text-micro font-medium text-text-1">{label}</div><div className={cn('mt-1 font-mono text-body-strong tabular-nums', tone === 'gain' ? 'text-gain' : tone === 'loss' ? 'text-loss' : 'text-text-0')}>{value}</div><div className={cn('mt-0.5 font-mono text-micro tabular-nums', tone === 'gain' ? 'text-gain' : tone === 'loss' ? 'text-loss' : 'text-text-2')}>{delta}</div><p className="mt-1.5 text-micro leading-snug text-text-2">{probability}</p></div>;
 }
 
 /* ── Grafico P&L (lightweight-charts area) ─────────────────────────── */
@@ -354,7 +490,8 @@ function PnlChart({ data, days, fromUsd }: { data: { time: number; value: number
     const chart = chartRef.current;
     if (!chart || data.length < 2) return;
     const cutoff = Date.now() / 1000 - days * 86400;
-    const filtered = data.filter((p) => p.time >= cutoff);
+    const inRange = data.filter((p) => p.time >= cutoff);
+    const filtered = inRange.length >= 2 ? inRange : data.slice(-2);
     const positive = filtered[filtered.length - 1].value >= filtered[0].value;
     const color = positive ? '#00C390' : '#F4556B';
 
@@ -399,7 +536,8 @@ function PnlChart({ data, days, fromUsd }: { data: { time: number; value: number
     if (benchRef.current) { chart.removeSeries(benchRef.current); benchRef.current = null; }
     if (!showBenchmark || benchmark.length < 2) return;
     const cutoff = Date.now() / 1000 - days * 86400;
-    const filtered = data.filter((p) => p.time >= cutoff);
+    const inRange = data.filter((p) => p.time >= cutoff);
+    const filtered = inRange.length >= 2 ? inRange : data.slice(-2);
     if (filtered.length < 2) return;
     const base = fromUsdRef.current(filtered[0].value);
     const benchmarkBase = benchmark[0].close;
@@ -411,7 +549,14 @@ function PnlChart({ data, days, fromUsd }: { data: { time: number; value: number
 
   return (
     <div className="mt-3">
-      <div ref={containerRef} className="w-full" />
+      <div className="relative min-h-[260px]">
+        <div ref={containerRef} className="w-full" />
+        {data.length < 2 ? (
+          <div className="absolute inset-0 flex items-center justify-center rounded-lg border border-dashed border-hairline text-caption text-text-2">
+            In attesa di almeno due punti reali per disegnare il grafico.
+          </div>
+        ) : null}
+      </div>
       <label className="mt-1 flex cursor-pointer items-center gap-2 text-caption text-text-2">
         <input
           type="checkbox"
