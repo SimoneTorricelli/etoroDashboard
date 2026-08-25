@@ -71,19 +71,28 @@ function snapshotFromRoot(root, {
   cashKeys = ['Credit', 'credit'],
   source = 'account',
   mirrorId = null,
+  calculateEquity = false,
 } = {}) {
   const positions = normalizePositions(pick(root, 'Positions', 'positions'));
   const cashUsd = num(pick(root, ...cashKeys));
   const investedUsd = positions.reduce((sum, item) => sum + item.invested, 0);
   const positionsValue = positions.reduce((sum, item) => sum + item.valueUsd, 0);
   const reportedEquity = num(pick(root, 'Equity', 'equity'), 0);
-  const equityUsd = reportedEquity > 0 ? reportedEquity : cashUsd + positionsValue;
+  const calculatedEquity = cashUsd + positionsValue;
+  // La documentazione eToro definisce l'equity del mirror come capitale
+  // disponibile + Amount + PnL delle sue posizioni. Un eventuale campo
+  // `Equity` nella riga mirror non fa parte di quel contratto e può riferirsi
+  // al conto owner complessivo: per i mirror usiamo sempre il calcolo locale.
+  const equityUsd = calculateEquity ? calculatedEquity : reportedEquity > 0 ? reportedEquity : calculatedEquity;
   return {
     takenAt: Date.now(),
     cashUsd: Math.round(cashUsd * 100) / 100,
     investedUsd: Math.round(investedUsd * 100) / 100,
     positionsValueUsd: Math.round(positionsValue * 100) / 100,
     equityUsd: Math.round(equityUsd * 100) / 100,
+    reportedEquityUsd: reportedEquity > 0 ? Math.round(reportedEquity * 100) / 100 : null,
+    calculatedEquityUsd: Math.round(calculatedEquity * 100) / 100,
+    equitySource: calculateEquity || reportedEquity <= 0 ? 'calculated' : 'reported',
     positions,
     source,
     mirrorId: mirrorId == null ? null : String(mirrorId),
@@ -252,6 +261,7 @@ export class EtoroClient {
       cashKeys: ['AvailableAmount', 'availableAmount', 'Credit', 'credit'],
       source: 'owner-mirror',
       mirrorId: wanted,
+      calculateEquity: true,
     });
   }
 

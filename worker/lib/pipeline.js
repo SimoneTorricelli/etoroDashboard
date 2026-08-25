@@ -92,9 +92,47 @@ export function scaleAgentSnapshotToReal(virtualSnapshot, realMirrorSnapshot) {
     positions,
     source: 'owner-mirror',
     mirrorId: realMirrorSnapshot.mirrorId,
+    reportedEquityUsd: realMirrorSnapshot.reportedEquityUsd ?? null,
+    calculatedEquityUsd: realMirrorSnapshot.calculatedEquityUsd ?? realEquity,
+    equitySource: realMirrorSnapshot.equitySource ?? 'calculated',
     executionScale: virtualEquity / realEquity,
     virtualEquityUsd: roundMoney(virtualEquity),
   };
+}
+
+/**
+ * Il portfolio selezionato è l'identità stabile; il mirrorId è una relazione
+ * remota che va ricontrollata a ogni run. In caso di divergenza non scegliamo
+ * automaticamente uno dei due valori: il binding deve essere riverificato.
+ */
+export function resolveVerifiedAgentMirror(config, portfolios) {
+  const fail = (message) => {
+    const error = new Error(message);
+    error.code = 'agent_mirror_binding';
+    throw error;
+  };
+  const portfolioId = String(config?.activeAgentPortfolioId ?? '').trim();
+  const configuredMirrorId = String(config?.activeAgentPortfolioMirrorId ?? '').trim();
+  const remote = (portfolios ?? []).find((item) => String(item?.id ?? '') === portfolioId) ?? null;
+  if (!remote) fail(`Agent Portfolio ${portfolioId || 'non configurato'} non trovato sul conto eToro`);
+  const remoteMirrorId = String(remote.mirrorId ?? '').trim();
+  if (!remoteMirrorId) fail('eToro non ha restituito il mirrorId del portfolio: impossibile leggere il capitale reale');
+  if (!configuredMirrorId) {
+    fail('binding mirror incompleto: rigenera il token dell’Agent Portfolio prima di eseguire una nuova run');
+  }
+  if (configuredMirrorId !== remoteMirrorId) {
+    fail(`binding mirror eToro cambiato (${configuredMirrorId} → ${remoteMirrorId}): rigenera e verifica il token prima di continuare`);
+  }
+  return remote;
+}
+
+/** Una nuova verifica dell'Agent inaugura sempre una nuova serie di capitale. */
+export function capitalTrackingResetReason(config, hasVerifiedAgent) {
+  const trackingStartedAt = Number(config?.realCapitalTrackingStartedAt) || 0;
+  if (!trackingStartedAt) return 'baseline assente';
+  const verifiedAt = Number(config?.agentTokenVerifiedAt) || 0;
+  if (hasVerifiedAgent && verifiedAt > trackingStartedAt) return 'Agent Portfolio riverificato';
+  return '';
 }
 
 /** Capacità massima investibile della shortlist entro cap per asset, classe e settore. */
@@ -1273,20 +1311,14 @@ async function runPipelineWithLock({
     try {
       virtualSnapshot = await client.portfolio(portfolioUserKey);
       if (hasVerifiedAgent) {
-        let mirrorId = String(config.activeAgentPortfolioMirrorId ?? '');
-        let remote = null;
-        if (!mirrorId) {
-          remote = (await client.agentPortfolios()).find((item) => item.id === config.activeAgentPortfolioId) ?? null;
-          mirrorId = String(remote?.mirrorId ?? '');
-        }
-        if (!mirrorId) throw new Error('eToro non ha restituito il mirrorId del portfolio: impossibile leggere il capitale reale');
+        const remote = resolveVerifiedAgentMirror(config, await client.agentPortfolios());
+        const mirrorId = String(remote.mirrorId);
         const realMirrorSnapshot = await client.mirrorPortfolio(mirrorId);
         snapshot = scaleAgentSnapshotToReal(virtualSnapshot, realMirrorSnapshot);
-        if (mirrorId !== config.activeAgentPortfolioMirrorId || remote?.virtualBalanceUsd) {
-          config.activeAgentPortfolioMirrorId = mirrorId;
+        snapshot.agentPortfolioId = remote.id;
+        if (remote.virtualBalanceUsd) {
           config.activeAgentPortfolioVirtualBalanceUsd = remote?.virtualBalanceUsd || virtualSnapshot.equityUsd;
           await saveConfig(db, {
-            activeAgentPortfolioMirrorId: mirrorId,
             activeAgentPortfolioVirtualBalanceUsd: config.activeAgentPortfolioVirtualBalanceUsd,
           });
         }
@@ -1317,9 +1349,15 @@ async function runPipelineWithLock({
       }
       throw error;
     }
-    if (!Number(config.realCapitalTrackingStartedAt)) {
+    const baselineResetReason = capitalTrackingResetReason(config, hasVerifiedAgent);
+    if (baselineResetReason) {
       config.realCapitalTrackingStartedAt = Date.now();
       await saveConfig(db, { realCapitalTrackingStartedAt: config.realCapitalTrackingStartedAt });
+      await audit(db, runId, 'warn', 'capital-baseline', `Nuova baseline del capitale reale: ${baselineResetReason}`, {
+        trackingStartedAt: config.realCapitalTrackingStartedAt,
+        agentTokenVerifiedAt: Number(config.agentTokenVerifiedAt) || 0,
+        mirrorId: snapshot.mirrorId,
+      });
     }
     equityUsd = snapshot.equityUsd;
     await saveSnapshot(db, runId, snapshot);
@@ -1331,7 +1369,14 @@ async function runPipelineWithLock({
       config.realCapitalTrackingStartedAt,
     );
     await audit(db, runId, 'info', 'snapshot', `Capitale reale eToro: equity ${snapshot.equityUsd} USD, cash ${snapshot.cashUsd} USD, ${snapshot.positions.length} posizioni`, {
-      hwm, drawdown, source: snapshot.source, mirrorId: snapshot.mirrorId,
+      hwm,
+      drawdown,
+      source: snapshot.source,
+      agentPortfolioId: snapshot.agentPortfolioId ?? null,
+      mirrorId: snapshot.mirrorId,
+      equitySource: snapshot.equitySource ?? null,
+      reportedEquityUsd: snapshot.reportedEquityUsd ?? null,
+      calculatedEquityUsd: snapshot.calculatedEquityUsd ?? snapshot.equityUsd,
     });
     await renewLease('analisi');
 
@@ -2026,6 +2071,29 @@ async function runPipelineWithLock({
     const message = error instanceof Error ? error.message : String(error);
     if (!livePhaseEntered) {
       try { await releasePendingDryRun(); } catch { /* nessun effetto Live da compensare */ }
+    }
+    if (persistentMode === 'live' && error?.code === 'agent_mirror_binding' && !livePhaseEntered) {
+      const safety = await freezeLiveRun({
+        db,
+        runId,
+        credentials,
+        equityUsd,
+        reason: `binding del capitale reale non verificabile: ${message}`,
+        stage: 'capital-binding',
+        data: { error: message },
+      });
+      return {
+        runId,
+        status: safety.status,
+        mode: safety.config?.executionMode ?? null,
+        safetyPersisted: safety.safetyPersisted,
+        reason: safety.reason,
+        safety,
+        error: message,
+        decisionSource,
+        reusedDryRunId,
+        reuseFallbackReason,
+      };
     }
     if (mode === 'live' && livePhaseEntered) {
       const safety = await freezeLiveRun({

@@ -232,6 +232,21 @@ export async function saveVerifiedAgentToken(db, env, {
     agentTokenFingerprint: fingerprint,
     agentTokenOrigin: 'vault',
   };
+  // Il chiamante verifica il mirror reale prima di arrivare qui. Questi campi
+  // fanno parte della stessa transazione del nuovo binding: se restassero
+  // quelli precedenti, il primo snapshot del nuovo Agent verrebbe confrontato
+  // con il vecchio massimo storico e potrebbe generare un falso drawdown.
+  for (const key of [
+    'lastManagedCapitalUsd',
+    'lastManagedCapitalEur',
+    'lastManagedCapitalAt',
+    'lastManagedEurUsd',
+    'realCapitalTrackingStartedAt',
+  ]) {
+    if (Object.prototype.hasOwnProperty.call(currentConfig ?? {}, key)) {
+      configPatch[key] = Number(currentConfig[key]) || 0;
+    }
+  }
   const now = Date.now();
   const baseConfigJson = JSON.stringify(currentConfig ?? {});
   const configPatchJson = JSON.stringify(configPatch);

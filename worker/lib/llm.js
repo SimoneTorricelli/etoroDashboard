@@ -46,6 +46,10 @@ const WORKERS_JSON_MODE_MODEL_SET = new Set([
   '@cf/deepseek-ai/deepseek-r1-distill-qwen-32b',
 ]);
 const WORKERS_NEMOTRON_MODEL = '@cf/nvidia/nemotron-3-120b-a12b';
+const WORKERS_MISTRAL_SMALL_MODEL = '@cf/mistralai/mistral-small-3.1-24b-instruct';
+const WORKERS_GUIDED_JSON_MODEL_SET = new Set([
+  WORKERS_MISTRAL_SMALL_MODEL,
+]);
 const WORKERS_REASONING_MODEL_SET = new Set([
   '@cf/openai/gpt-oss-120b',
   WORKERS_NEMOTRON_MODEL,
@@ -344,8 +348,18 @@ function modelOutputKind(value) {
 
 export function supportsNativeJson(provider, model) {
   if (provider === 'openrouter') return STRUCTURED_MODEL_SET.has(model);
-  if (provider === 'workers-ai') return WORKERS_JSON_MODE_MODEL_SET.has(model);
+  if (provider === 'workers-ai') return WORKERS_JSON_MODE_MODEL_SET.has(model) || WORKERS_GUIDED_JSON_MODEL_SET.has(model);
   return ['gemini', 'groq'].includes(provider);
+}
+
+function structuredModeFor(provider, model, jsonMode, responseSchema) {
+  if (!jsonMode) return 'none';
+  if (!supportsNativeJson(provider, model)) return 'prompt_only';
+  if (provider === 'workers-ai' && WORKERS_GUIDED_JSON_MODEL_SET.has(model)) {
+    return responseSchema ? 'guided_json' : 'prompt_only';
+  }
+  if (responseSchema && ['openrouter', 'workers-ai'].includes(provider)) return 'json_schema';
+  return 'json_object';
 }
 
 function modelContentPath(payload) {
@@ -505,7 +519,7 @@ export function extractModelText(payload) {
   return '';
 }
 
-async function callOpenRouter({ apiKey, model, messages, temperature, maxTokens, jsonMode, referer, signal }) {
+async function callOpenRouter({ apiKey, model, messages, temperature, maxTokens, jsonMode, responseSchema, referer, signal }) {
   if (!apiKey) throw new Error('chiave OpenRouter non configurata');
   const nativeJson = jsonMode && supportsNativeJson('openrouter', model);
   const reasoningEffort = OPENROUTER_REASONING_EFFORT.get(model) ?? 'medium';
@@ -526,7 +540,15 @@ async function callOpenRouter({ apiKey, model, messages, temperature, maxTokens,
       max_tokens: maxTokens,
       ...(REASONING_MODEL_SET.has(model) ? { reasoning: { effort: reasoningEffort, exclude: true } } : {}),
       ...(nativeJson ? {
-        response_format: { type: 'json_object' },
+        response_format: responseSchema ? {
+          type: 'json_schema',
+          json_schema: {
+            name: 'portfolio_allocation',
+            strict: true,
+            schema: responseSchema,
+          },
+        } : { type: 'json_object' },
+        ...(responseSchema ? { provider: { require_parameters: true } } : {}),
         plugins: [{ id: 'response-healing' }],
       } : {}),
     }),
@@ -566,7 +588,7 @@ async function callOpenRouter({ apiKey, model, messages, temperature, maxTokens,
   };
 }
 
-async function callWorkersAi({ ai, model, messages, temperature, maxTokens, jsonMode }) {
+async function callWorkersAi({ ai, model, messages, temperature, maxTokens, jsonMode, responseSchema }) {
   if (!ai) throw new Error('binding AI non configurato: aggiungi "ai": { "binding": "AI" } a wrangler.jsonc');
   const isNemotron = model === WORKERS_NEMOTRON_MODEL;
   const result = await ai.run(model, {
@@ -577,7 +599,13 @@ async function callWorkersAi({ ai, model, messages, temperature, maxTokens, json
     ...(isNemotron
       ? { max_completion_tokens: maxTokens, reasoning_effort: 'low' }
       : { max_tokens: maxTokens }),
-    ...(jsonMode ? { response_format: { type: 'json_object' } } : {}),
+    ...(jsonMode && WORKERS_GUIDED_JSON_MODEL_SET.has(model) && responseSchema
+      ? { guided_json: responseSchema }
+      : jsonMode ? {
+          response_format: responseSchema
+            ? { type: 'json_schema', json_schema: responseSchema }
+            : { type: 'json_object' },
+        } : {}),
   });
   const responseDebug = payloadDebug(result);
   const embeddedError = result?.error ?? result?.result?.error;
@@ -725,12 +753,13 @@ export function buildAttemptPlan({ config, credentials, env }) {
 
 /**
  * Esegue una chiamata su un provider specifico.
- * @param {{jsonMode?: boolean, minimumMaxTokens?: number}} options
+ * @param {{jsonMode?: boolean, minimumMaxTokens?: number, responseSchema?: object}} options
  */
-export async function callModel({ provider, model, messages, config, credentials, env, jsonMode = true, timeoutMs = 60_000, minimumMaxTokens = 0 }) {
+export async function callModel({ provider, model, messages, config, credentials, env, jsonMode = true, timeoutMs = 60_000, minimumMaxTokens = 0, responseSchema = null }) {
   const attemptId = makeAttemptId();
   const startedAt = Date.now();
-  const nativeJson = jsonMode && supportsNativeJson(provider, model);
+  const structuredMode = structuredModeFor(provider, model, jsonMode, responseSchema);
+  const nativeJson = ['json_object', 'json_schema', 'guided_json'].includes(structuredMode);
   const reasoningEffort = provider === 'openrouter' && REASONING_MODEL_SET.has(model)
     ? OPENROUTER_REASONING_EFFORT.get(model) ?? 'medium'
     : provider === 'groq' && /^openai\/gpt-oss-(?:20b|120b)$/.test(model)
@@ -772,7 +801,7 @@ export async function callModel({ provider, model, messages, config, credentials
     timeoutMs,
     provider,
     requestedModel: model,
-    structuredMode: nativeJson ? 'json_object' : jsonMode ? 'prompt_only' : 'none',
+    structuredMode,
     messageCount: Array.isArray(messages) ? messages.length : 0,
     promptChars: messageChars(messages),
     maxTokens: effectiveMaxTokens,
@@ -785,6 +814,7 @@ export async function callModel({ provider, model, messages, config, credentials
     temperature: config.llmTemperature,
     maxTokens: effectiveMaxTokens,
     jsonMode: nativeJson,
+    responseSchema,
     signal: controller.signal,
   };
   try {

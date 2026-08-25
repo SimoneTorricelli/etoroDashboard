@@ -7,6 +7,7 @@ const SAFE_DEBUG_KEYS = [
   'bodyChars', 'payloadKeys', 'payloadShape', 'responseId', 'requestId',
   'generationId', 'cfRay', 'retryAfter', 'requestedModel', 'resolvedModel',
   'choiceCount', 'finishReason', 'nativeFinishReason', 'contentChars', 'contentKind', 'candidateCount',
+  'candidateKeys',
   'incompleteReason', 'contentPath', 'reasoningChars', 'usage', 'router',
   'errorName', 'errorCode', 'errorMessage', 'parseError', 'validationError',
 ] as const satisfies ReadonlyArray<keyof LlmAttemptDebug>;
@@ -84,7 +85,7 @@ function sanitizeDebug(debug: LlmAttemptDebug | undefined): Record<string, unkno
     } else if (key === 'router') {
       const router = sanitizeRouter(value);
       if (router) safe[key] = router;
-    } else if (key === 'payloadKeys' && Array.isArray(value)) {
+    } else if (['payloadKeys', 'candidateKeys'].includes(key) && Array.isArray(value)) {
       safe[key] = value.filter((item): item is string => typeof item === 'string').slice(0, 20).map((item) => redactText(item, 80));
     } else if (typeof value === 'string') {
       safe[key] = redactText(value);
@@ -163,6 +164,14 @@ export function llmAttemptDebugFacts(attempt: LlmAttempt): string[] {
     const finish = finishReason || nativeFinishReason;
     const native = nativeFinishReason && nativeFinishReason !== finish ? `/${nativeFinishReason}` : '';
     facts.push(`finish ${finish}${native}`);
+  }
+
+  if (Array.isArray(debug?.candidateKeys) && debug.candidateKeys.length) {
+    facts.push(`chiavi JSON: ${debug.candidateKeys.slice(0, 6).join(', ')}`);
+  }
+
+  if (debug?.retryAfter !== undefined && debug.retryAfter !== null && String(debug.retryAfter).trim()) {
+    facts.push(`retry-after ${String(debug.retryAfter).slice(0, 40)}`);
   }
 
   if (debug?.timerFired === true && !category.toLowerCase().includes('timeout')) facts.push('timer scaduto');

@@ -34,8 +34,9 @@ import {
   llmErrorDebug, safeModelOutputPreview, supportsNativeJson,
 } from './lib/llm.js';
 import {
-  buildCandleRefreshQueue, buildFailedProposalRetryContext, decideKind, romeParts,
-  freezeLiveRun, runPipeline, runWatcher, scaleAgentSnapshotToReal, shortlistDeploymentCapacity,
+  buildCandleRefreshQueue, buildFailedProposalRetryContext, capitalTrackingResetReason, decideKind, romeParts,
+  freezeLiveRun, resolveVerifiedAgentMirror, runPipeline, runWatcher, scaleAgentSnapshotToReal,
+  shortlistDeploymentCapacity,
 } from './lib/pipeline.js';
 import { buildStrategyActivationNotification } from './lib/notify.js';
 import { EtoroClient } from './lib/etoro.js';
@@ -835,7 +836,7 @@ test('eToro: il mirrorId collega l’Agent Portfolio al capitale reale del propr
     }
     return new Response(JSON.stringify({
       clientPortfolio: {
-        Mirrors: [{ MirrorID: 771, AvailableAmount: 428.45, Positions: [] }],
+        Mirrors: [{ MirrorID: 771, AvailableAmount: 428.45, Equity: 2_087.23, Positions: [] }],
       },
     }), { status: 200 });
   };
@@ -847,10 +848,39 @@ test('eToro: il mirrorId collega l’Agent Portfolio al capitale reale del propr
     assert.equal(remote.virtualBalanceUsd, 10_000);
     assert.equal(remote.mirrorId, '771');
     assert.equal(real.equityUsd, 428.45);
+    assert.equal(real.reportedEquityUsd, 2_087.23);
+    assert.equal(real.calculatedEquityUsd, 428.45);
+    assert.equal(real.equitySource, 'calculated');
     assert.equal(real.source, 'owner-mirror');
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test('binding capitale: il mirror remoto deve coincidere con quello verificato', () => {
+  const config = { activeAgentPortfolioId: 'portfolio-A', activeAgentPortfolioMirrorId: '500' };
+  const remote = resolveVerifiedAgentMirror(config, [{ id: 'portfolio-A', mirrorId: '500' }]);
+  assert.equal(remote.mirrorId, '500');
+  assert.throws(
+    () => resolveVerifiedAgentMirror(config, [{ id: 'portfolio-A', mirrorId: '2087' }]),
+    (error) => error.code === 'agent_mirror_binding' && /binding mirror eToro cambiato/.test(error.message),
+  );
+  assert.throws(
+    () => resolveVerifiedAgentMirror({ ...config, activeAgentPortfolioMirrorId: '' }, [{ id: 'portfolio-A', mirrorId: '500' }]),
+    /binding mirror incompleto/,
+  );
+});
+
+test('baseline capitale: una riverifica Agent invalida il vecchio massimo storico', () => {
+  assert.equal(capitalTrackingResetReason({ realCapitalTrackingStartedAt: 0 }, true), 'baseline assente');
+  assert.equal(capitalTrackingResetReason({
+    realCapitalTrackingStartedAt: 1_000,
+    agentTokenVerifiedAt: 2_000,
+  }, true), 'Agent Portfolio riverificato');
+  assert.equal(capitalTrackingResetReason({
+    realCapitalTrackingStartedAt: 3_000,
+    agentTokenVerifiedAt: 2_000,
+  }, true), '');
 });
 
 test('eToro: la chiusura legacy non viene ritentata dopo timeout o errori ambigui', async () => {
@@ -1005,6 +1035,22 @@ test('normalizzazione accetta pesi espressi in percentuale', () => {
   assert.equal(result.value.confidence, 0.8);
 });
 
+test('normalizzazione recupera alias allocativi sicuri senza saltare i controlli', () => {
+  const result = normalizeProposal({ allocation: { SPY: 0.6, CASH: 0.4 }, confidence: 0.8, rationale: 'ok' }, ['SPY']);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.value.targetWeights, { SPY: 0.6, CASH: 0.4 });
+
+  const invalid = normalizeProposal({ portfolio: { TSLA: 1 }, confidence: 0.8 }, ['SPY']);
+  assert.equal(invalid.ok, false);
+  assert.match(invalid.error, /simboli non ammessi: TSLA/);
+});
+
+test('schema error espone soltanto le chiavi candidate utili al debug', () => {
+  const result = findNormalizedProposal('{"analysis":"ok","portfolioPlan":[]}', ['SPY']);
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.candidateKeys, ['analysis', 'portfolioPlan']);
+});
+
 test('GPT-OSS: estrae il testo finale dal formato Responses API', () => {
   const text = extractModelText({
     output: [
@@ -1081,6 +1127,46 @@ test('Workers AI: JSON nativo è limitato ai modelli documentati', async () => {
   assert.equal(result.debug.structuredMode, 'json_object');
 });
 
+test('Mistral Small Workers usa guided_json con lo schema allocativo', async () => {
+  const model = '@cf/mistralai/mistral-small-3.1-24b-instruct';
+  const schema = {
+    type: 'object',
+    properties: { targetWeights: { type: 'object', additionalProperties: { type: 'number' } } },
+    required: ['targetWeights'],
+  };
+  assert.equal(supportsNativeJson('workers-ai', model), true);
+  let input;
+  const result = await callModel({
+    provider: 'workers-ai', model,
+    messages: [{ role: 'user', content: 'test' }],
+    config: { llmTemperature: 0.1, llmMaxTokens: 1600 }, credentials: {},
+    env: { AI: { run: async (_model, payload) => {
+      input = payload;
+      return { response: { targetWeights: { CASH: 1 } } };
+    } } },
+    jsonMode: true,
+    responseSchema: schema,
+  });
+  assert.deepEqual(input.guided_json, schema);
+  assert.equal(input.response_format, undefined);
+  assert.equal(result.debug.structuredMode, 'guided_json');
+
+  let promptOnlyInput;
+  const promptOnly = await callModel({
+    provider: 'workers-ai', model,
+    messages: [{ role: 'user', content: 'test' }],
+    config: { llmTemperature: 0.1, llmMaxTokens: 1600 }, credentials: {},
+    env: { AI: { run: async (_model, payload) => {
+      promptOnlyInput = payload;
+      return { response: '{"ok":true}' };
+    } } },
+    jsonMode: true,
+  });
+  assert.equal(promptOnlyInput.guided_json, undefined);
+  assert.equal(promptOnlyInput.response_format, undefined);
+  assert.equal(promptOnly.debug.structuredMode, 'prompt_only');
+});
+
 test('cascata Workers: reasoning model prompt-only una volta e fallback JSON selettivo', async () => {
   const calls = [];
   const llama = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
@@ -1111,8 +1197,60 @@ test('cascata Workers: reasoning model prompt-only una volta e fallback JSON sel
       assert.equal(calls.find((call) => call.model === model).nativeJson, false);
       assert.ok(calls.find((call) => call.model === model).maxTokens >= 3_200);
     }
+    assert.ok(calls.find((call) => call.model === '@cf/openai/gpt-oss-120b').maxTokens >= 5_120);
     assert.deepEqual(calls.filter((call) => call.model === llama).map((call) => call.nativeJson), [true, false]);
     assert.equal(result.attempts.at(-1).ok, true);
+  } finally {
+    console.warn = originalWarn;
+  }
+});
+
+test('GPT-OSS Workers classifica finish length come troncamento e conserva il budget', async () => {
+  const originalWarn = console.warn;
+  console.warn = () => {};
+  try {
+    await assert.rejects(callModel({
+      provider: 'workers-ai', model: '@cf/openai/gpt-oss-120b',
+      messages: [{ role: 'user', content: 'test' }],
+      config: { llmTemperature: 0.1, llmMaxTokens: 1600 }, credentials: {},
+      env: { AI: { run: async () => ({
+        finish_reason: 'length',
+        output: [{ type: 'reasoning', summary: [{ type: 'summary_text', text: 'analisi' }] }],
+      }) } },
+      jsonMode: true,
+      minimumMaxTokens: 5_120,
+    }), (error) => {
+      assert.match(error.message, /troncata/);
+      assert.equal(error.debug.category, 'truncated');
+      assert.equal(error.debug.maxTokens, 5_120);
+      return true;
+    });
+  } finally {
+    console.warn = originalWarn;
+  }
+});
+
+test('cascata AI corregge una risposta senza targetWeights prima di arrendersi', async () => {
+  const calls = [];
+  const allocation = { targetWeights: { CASH: 1 }, confidence: 0.4, rationale: 'attesa', risks: [], watch: [] };
+  const originalWarn = console.warn;
+  console.warn = () => {};
+  try {
+    const result = await askBrain({
+      config: DEFAULT_CONFIG,
+      credentials: {},
+      env: { AI: { run: async (model, payload) => {
+        calls.push({ model, payload });
+        return calls.length <= 3 ? { response: { summary: 'nessuna allocazione' } } : { response: allocation };
+      } } },
+      featuresPrompt: 'STRUMENTI\nCASH', allowedSymbols: [],
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.attempts.length, 4);
+    assert.match(result.attempts[0].error, /targetWeights assente/);
+    assert.equal(result.attempts[0].debug.candidateKeys[0], 'summary');
+    assert.match(result.attempts.at(-1).format, /repair/);
+    assert.match(calls.at(-1).payload.messages.at(-1).content, /prima chiave deve essere esattamente "targetWeights"/);
   } finally {
     console.warn = originalWarn;
   }
@@ -1196,6 +1334,73 @@ test('OpenRouter: GLM usa effort high, budget adeguato e metadata/healing', asyn
     assert.equal(result.debug.structuredMode, 'json_object');
     assert.equal(result.debug.requestId, 'req-test');
   } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('OpenRouter usa JSON Schema stretto quando il flusso fornisce il contratto', async () => {
+  const originalFetch = globalThis.fetch;
+  let body;
+  const schema = {
+    type: 'object',
+    additionalProperties: false,
+    properties: { targetWeights: { type: 'object', additionalProperties: { type: 'number' } } },
+    required: ['targetWeights'],
+  };
+  globalThis.fetch = async (_url, init) => {
+    body = JSON.parse(init.body);
+    return new Response(JSON.stringify({ choices: [{ message: { content: '{"targetWeights":{"CASH":1}}' } }] }), { status: 200 });
+  };
+  try {
+    const result = await callModel({
+      provider: 'openrouter', model: 'z-ai/glm-5.2:free',
+      messages: [{ role: 'user', content: 'test' }],
+      config: { llmTemperature: 0.1, llmMaxTokens: 1600 },
+      credentials: { openrouterApiKey: 'test-key' }, env: {}, jsonMode: true,
+      responseSchema: schema,
+    });
+    assert.equal(body.response_format.type, 'json_schema');
+    assert.equal(body.response_format.json_schema.strict, true);
+    assert.deepEqual(body.response_format.json_schema.schema, schema);
+    assert.equal(body.provider.require_parameters, true);
+    assert.equal(result.debug.structuredMode, 'json_schema');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('un 429 OpenRouter non blocca i modelli successivi dello stesso provider', async () => {
+  const originalFetch = globalThis.fetch;
+  const models = [];
+  globalThis.fetch = async (_url, init) => {
+    const body = JSON.parse(init.body);
+    models.push(body.model);
+    if (models.length === 1) {
+      return new Response(JSON.stringify({ error: { code: 429, message: 'Provider returned error' } }), {
+        status: 429,
+        statusText: 'Too Many Requests',
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    return new Response(JSON.stringify({
+      choices: [{ finish_reason: 'stop', message: { content: '{"targetWeights":{"CASH":1},"confidence":0.4,"rationale":"attesa","risks":[],"watch":[]}' } }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  const originalWarn = console.warn;
+  console.warn = () => {};
+  try {
+    const result = await askBrain({
+      config: DEFAULT_CONFIG,
+      credentials: { openrouterApiKey: 'test-key' },
+      env: {},
+      featuresPrompt: 'STRUMENTI\nCASH', allowedSymbols: [],
+    });
+    assert.equal(result.ok, true);
+    assert.ok(models.length >= 2);
+    assert.notEqual(models[0], models[1]);
+    assert.equal(result.attempts[0].debug.category, 'rate_limit');
+  } finally {
+    console.warn = originalWarn;
     globalThis.fetch = originalFetch;
   }
 });

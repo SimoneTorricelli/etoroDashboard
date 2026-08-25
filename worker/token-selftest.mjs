@@ -242,6 +242,48 @@ test('binding: salvataggi concorrenti lasciano una sola tupla atomica', async ()
   assert.equal(resolved.values.etoroAgentToken, expectedToken);
 });
 
+test('binding: la riverifica azzera atomicamente la vecchia baseline del capitale', async () => {
+  const db = memoryD1();
+  db.rows.set('autopilot', JSON.stringify({
+    executionMode: 'shadow',
+    decisionRevision: 4,
+    lastManagedCapitalUsd: 2_087.23,
+    lastManagedCapitalEur: 1_789.77,
+    lastManagedCapitalAt: 1_000,
+    lastManagedEurUsd: 1.1662,
+    realCapitalTrackingStartedAt: 900,
+  }));
+  const env = {
+    CONTROL_TOKEN: 'vault-test-control-token',
+    ETORO_API_KEY: API_KEY,
+    ETORO_USER_KEY: USER_KEY,
+  };
+  const expectedVaultRevision = (await resolveCredentials(db, env)).vaultRevision;
+  await saveVerifiedAgentToken(db, env, {
+    token: SECRET,
+    etoroApiKey: API_KEY,
+    etoroUserKey: USER_KEY,
+    portfolioId: 'portfolio-A',
+    mirrorId: '500',
+    verifiedAt: 2_000,
+    currentConfig: {
+      executionMode: 'shadow',
+      lastManagedCapitalUsd: 500,
+      lastManagedCapitalEur: 428.7,
+      lastManagedCapitalAt: 1_900,
+      lastManagedEurUsd: 1.1662,
+      realCapitalTrackingStartedAt: 0,
+    },
+    expectedVaultRevision,
+  });
+  const config = JSON.parse(db.rows.get('autopilot'));
+  assert.equal(config.activeAgentPortfolioMirrorId, '500');
+  assert.equal(config.lastManagedCapitalUsd, 500);
+  assert.equal(config.lastManagedCapitalAt, 1_900);
+  assert.equal(config.realCapitalTrackingStartedAt, 0);
+  assert.equal(config.decisionRevision, 5);
+});
+
 test('binding: un errore batch conserva integralmente la tupla precedente', async () => {
   const db = memoryD1();
   const env = {

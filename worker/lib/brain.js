@@ -18,6 +18,7 @@ const SYSTEM_PROMPT = `Sei un risk manager quantitativo. Ricevi lo stato di un p
 Il tuo unico output è un'allocazione TARGET in percentuale, in JSON valido, senza testo attorno.
 
 Regole non negoziabili:
+- La prima chiave deve chiamarsi esattamente "targetWeights": non rinominarla in allocation, portfolio, positions o altri alias.
 - Usa esclusivamente i simboli elencati in STRUMENTI, più la voce CASH.
 - I pesi sono numeri decimali fra 0 e 1 e la loro somma deve fare esattamente 1.
 - Non superare mai il peso massimo indicato nella colonna max% di ciascuno strumento.
@@ -34,6 +35,7 @@ const DYNAMIC_SYSTEM_PROMPT = `Sei un gestore di portafoglio quantitativo. Ricev
 Il tuo compito: scegliere quali strumenti tenere e con quale peso. Output in JSON valido, senza testo attorno.
 
 Regole non negoziabili:
+- La prima chiave deve chiamarsi esattamente "targetWeights": non rinominarla in allocation, portfolio, positions o altri alias.
 - Puoi usare SOLO i simboli presenti in CANDIDATI, più la voce CASH.
 - I pesi sono decimali fra 0 e 1 e devono sommare esattamente a 1.
 - Rispetta il numero minimo e massimo di strumenti indicato nei vincoli.
@@ -59,13 +61,18 @@ Schema di output:
 const RESPONSE_SCHEMA = {
   type: 'object',
   additionalProperties: false,
-  required: ['targetWeights', 'confidence', 'rationale'],
+  required: ['targetWeights', 'confidence', 'rationale', 'risks', 'watch'],
   properties: {
-    targetWeights: { type: 'object', additionalProperties: { type: 'number' } },
-    confidence: { type: 'number' },
-    rationale: { type: 'string' },
-    risks: { type: 'array', items: { type: 'string' } },
-    watch: { type: 'array', items: { type: 'string' } },
+    targetWeights: {
+      type: 'object',
+      description: 'Pesi target per simbolo e CASH; ogni valore è tra 0 e 1 e la somma è esattamente 1.',
+      minProperties: 1,
+      additionalProperties: { type: 'number', minimum: 0, maximum: 1 },
+    },
+    confidence: { type: 'number', minimum: 0, maximum: 1 },
+    rationale: { type: 'string', maxLength: 700 },
+    risks: { type: 'array', maxItems: 6, items: { type: 'string' } },
+    watch: { type: 'array', maxItems: 6, items: { type: 'string' } },
   },
 };
 
@@ -168,7 +175,20 @@ export function extractJsonCandidates(input, limit = 32) {
 /** Normalizza e verifica la forma della proposta. Non applica regole di rischio. */
 export function normalizeProposal(raw, allowedSymbols) {
   if (!raw || typeof raw !== 'object') return { ok: false, error: 'risposta non è un oggetto' };
-  const weightsRaw = raw.targetWeights ?? raw.target_weights ?? raw.weights;
+  const aliases = [
+    raw.targetWeights,
+    raw.target_weights,
+    raw.targetAllocation,
+    raw.target_allocation,
+    raw.portfolioWeights,
+    raw.portfolio_weights,
+    raw.weights,
+  ];
+  const looksLikeWeightMap = (value) => value && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).length > 0
+    && Object.values(value).every((item) => Number.isFinite(Number(item)));
+  const wrapper = [raw.allocation, raw.allocations, raw.portfolio, raw.positions].find(looksLikeWeightMap);
+  const weightsRaw = aliases.find((value) => value && typeof value === 'object' && !Array.isArray(value)) ?? wrapper;
   if (!weightsRaw || typeof weightsRaw !== 'object') return { ok: false, error: 'targetWeights assente' };
 
   const allowed = new Set([...allowedSymbols, 'CASH']);
@@ -241,7 +261,11 @@ export function findNormalizedProposal(input, allowedSymbols) {
     return { ok: false, kind: 'invalid_json', error: 'risposta non è un oggetto', parseError: extracted.error };
   }
   let bestFailure = null;
+  const candidateKeys = [];
   for (const candidate of extracted.values) {
+    for (const key of Object.keys(candidate).slice(0, 12)) {
+      if (!candidateKeys.includes(key)) candidateKeys.push(key);
+    }
     const normalized = normalizeProposal(candidate, allowedSymbols);
     if (normalized.ok) return { ok: true, value: normalized.value, candidateCount: extracted.values.length };
     if (!bestFailure || candidate?.targetWeights || candidate?.target_weights || candidate?.weights) bestFailure = normalized;
@@ -252,6 +276,7 @@ export function findNormalizedProposal(input, allowedSymbols) {
     error: bestFailure?.error ?? 'targetWeights assente',
     details: bestFailure?.details ?? null,
     candidateCount: extracted.values.length,
+    candidateKeys: candidateKeys.slice(0, 20),
   };
 }
 
@@ -308,10 +333,40 @@ function debugWithOutput(debug, content, category, phase, extra = {}) {
 }
 
 function shouldRetryAsText(attempt) {
-  if (!attempt?.debug || attempt.debug.structuredMode !== 'json_object') return false;
-  if (['invalid_json', 'schema_error', 'empty_content'].includes(attempt.debug.category)) return true;
+  if (!attempt?.debug || !['json_object', 'json_schema', 'guided_json'].includes(attempt.debug.structuredMode)) return false;
+  if (['invalid_json', 'empty_content'].includes(attempt.debug.category)) return true;
   return ['http_error', 'provider_error'].includes(attempt.debug.category)
-    && /response[_ -]?format|json[_ -]?(?:mode|schema)|structured/i.test(`${attempt.error ?? ''} ${attempt.debug.errorMessage ?? ''}`);
+    && /response[_ -]?format|guided[_ -]?json|json[_ -]?(?:mode|schema)|structured/i.test(`${attempt.error ?? ''} ${attempt.debug.errorMessage ?? ''}`);
+}
+
+function decisionMinimumMaxTokens(entry) {
+  if (entry?.provider === 'workers-ai' && entry?.model === '@cf/openai/gpt-oss-120b') return 5_120;
+  return isWorkersReasoningModel(entry?.model) ? 3_200 : 0;
+}
+
+function responseWasTruncated(debug) {
+  const stop = `${debug?.finishReason ?? ''} ${debug?.nativeFinishReason ?? ''} ${debug?.incompleteReason ?? ''}`;
+  return /length|max[_ -]?(?:output[_ -]?)?tokens?|token[_ -]?limit|incomplete/i.test(stop);
+}
+
+function buildCorrectionMessages(messages, previousContent, error, details = null) {
+  const total = Number(details?.total);
+  const arithmetic = Number.isFinite(total)
+    ? ` Il totale precedente era ${(total * 100).toFixed(1)}%: ricalcola tutti i pesi e verifica che la nuova somma sia 1.0000.`
+    : ' Calcola numericamente la somma dei pesi e verifica che sia 1.0000.';
+  const correction = [
+    `La risposta precedente è stata rifiutata: ${String(error ?? 'output non valido').slice(0, 300)}.`,
+    'Rispondi di nuovo SOLO con un unico oggetto JSON completo; la prima chiave deve essere esattamente "targetWeights".',
+    'Non usare alias come allocation, portfolio o positions. Usa soltanto simboli consentiti e CASH, con valori decimali tra 0 e 1.',
+    `${arithmetic} Non aggiungere spiegazioni fuori dal JSON.`,
+  ].join(' ');
+  return [
+    ...messages,
+    ...(typeof previousContent === 'string' && previousContent.trim()
+      ? [{ role: 'assistant', content: previousContent.slice(0, 6_000) }]
+      : []),
+    { role: 'user', content: correction },
+  ];
 }
 
 /**
@@ -412,29 +467,41 @@ export async function askBrain({ config, credentials, env, featuresPrompt, allow
   }
 
   const attempts = [];
-  const runAttempt = async (entry, jsonMode, label) => {
+  const runAttempt = async (entry, jsonMode, label, attemptMessages = messages, minimumMaxTokens = decisionMinimumMaxTokens(entry)) => {
     try {
       const response = await callModel({
         ...entry,
-        messages,
+        messages: attemptMessages,
         config,
         credentials,
         env,
         jsonMode,
-        minimumMaxTokens: isWorkersReasoningModel(entry.model) ? 3_200 : 0,
+        minimumMaxTokens,
+        responseSchema: RESPONSE_SCHEMA,
+        timeoutMs: entry.provider === 'workers-ai' && entry.model === '@cf/openai/gpt-oss-120b' ? 75_000 : 60_000,
       });
       const found = findNormalizedProposal(response.content, allowedSymbols);
       if (!found.ok && found.kind === 'invalid_json') {
-        const debug = debugWithOutput(response.debug, response.content, 'invalid_json', 'parse', { parseError: found.parseError });
-        const attempt = { ...entry, format: label, ok: false, error: 'risposta non è un oggetto', usage: response.usage, debug };
+        const truncated = responseWasTruncated(response.debug);
+        const category = truncated ? 'truncated' : 'invalid_json';
+        const error = truncated ? 'risposta troncata prima del JSON completo' : 'risposta non è un oggetto';
+        const debug = debugWithOutput(response.debug, response.content, category, 'parse', { parseError: found.parseError });
+        const attempt = { ...entry, format: label, ok: false, error, usage: response.usage, debug };
         attempts.push(attempt);
         console.warn('llm_attempt_invalid_output', JSON.stringify({ provider: entry.provider, model: entry.model, ...debug }));
-        return { attempt };
+        return {
+          attempt,
+          retry: {
+            messages: buildCorrectionMessages(attemptMessages, response.content, error),
+            minimumMaxTokens: truncated ? Math.max(minimumMaxTokens, 8_000) : minimumMaxTokens,
+          },
+        };
       }
       if (!found.ok) {
         const debug = debugWithOutput(response.debug, response.content, 'schema_error', 'normalize', {
           validationError: found.error,
           candidateCount: found.candidateCount,
+          candidateKeys: found.candidateKeys,
         });
         const attempt = {
           ...entry,
@@ -447,7 +514,13 @@ export async function askBrain({ config, credentials, env, featuresPrompt, allow
         };
         attempts.push(attempt);
         console.warn('llm_attempt_invalid_output', JSON.stringify({ provider: entry.provider, model: entry.model, ...debug }));
-        return { attempt };
+        return {
+          attempt,
+          retry: {
+            messages: buildCorrectionMessages(attemptMessages, response.content, found.error, found.details),
+            minimumMaxTokens,
+          },
+        };
       }
       attempts.push({ ...entry, format: label, ok: true, usage: response.usage, debug: response.debug });
       return {
@@ -465,13 +538,19 @@ export async function askBrain({ config, credentials, env, featuresPrompt, allow
       const message = error instanceof Error ? error.message : String(error);
       const attempt = { ...entry, format: label, ok: false, error: message, debug: llmErrorDebug(error) };
       attempts.push(attempt);
-      return { attempt };
+      const retry = attempt.debug?.category === 'truncated'
+        ? {
+            messages: buildCorrectionMessages(attemptMessages, '', message),
+            minimumMaxTokens: Math.max(minimumMaxTokens, 8_000),
+          }
+        : null;
+      return { attempt, retry };
     }
   };
 
-  // Prima passata: più route indipendenti. Gli ultimi due slot restano ai
-  // fallback testuali soltanto quando il JSON nativo è stato il vero problema.
-  const textFallbacks = [];
+  // Prima passata: più route indipendenti. Gli slot residui vengono usati per
+  // correggere output malformati o per uscire da un JSON mode incompatibile.
+  const correctiveRetries = [];
   const blockedProviders = new Set();
   let primaryCalls = 0;
   for (const entry of plan) {
@@ -481,14 +560,31 @@ export async function askBrain({ config, credentials, env, featuresPrompt, allow
     const result = await runAttempt(entry, true, nativeJson ? 'json' : 'text');
     primaryCalls += 1;
     if (result.success) return result.success;
-    if (shouldRetryAsText(result.attempt)) textFallbacks.push(entry);
+    if (shouldRetryAsText(result.attempt)) {
+      correctiveRetries.push({ entry, jsonMode: false, label: 'text-fallback', messages, minimumMaxTokens: decisionMinimumMaxTokens(entry) });
+    } else if (result.retry) {
+      correctiveRetries.push({
+        entry,
+        jsonMode: true,
+        label: `${nativeJson ? 'json' : 'text'}-repair`,
+        ...result.retry,
+      });
+    }
     const status = Number(result.attempt?.debug?.httpStatus);
-    if (result.attempt?.debug?.category === 'rate_limit' || [401, 402].includes(status)) blockedProviders.add(entry.provider);
+    // Un 429 può appartenere soltanto al modello/upstream corrente. Bloccare
+    // l'intero provider impedirebbe di provare gli altri endpoint gratuiti.
+    if ([401, 402].includes(status)) blockedProviders.add(entry.provider);
   }
-  for (const entry of textFallbacks) {
+  for (const retry of correctiveRetries) {
     if (attempts.length >= 10) break;
-    if (blockedProviders.has(entry.provider)) continue;
-    const result = await runAttempt(entry, false, 'text');
+    if (blockedProviders.has(retry.entry.provider)) continue;
+    const result = await runAttempt(
+      retry.entry,
+      retry.jsonMode,
+      retry.label,
+      retry.messages,
+      retry.minimumMaxTokens,
+    );
     if (result.success) return result.success;
   }
 

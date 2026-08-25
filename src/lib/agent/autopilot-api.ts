@@ -234,6 +234,7 @@ export interface LlmAttemptDebug {
   contentChars?: number;
   contentKind?: string;
   candidateCount?: number;
+  candidateKeys?: string[];
   reasoningChars?: number;
   usage?: Record<string, unknown> | null;
   router?: string | Record<string, unknown> | null;
