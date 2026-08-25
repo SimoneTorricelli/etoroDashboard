@@ -169,7 +169,7 @@ export const DEFAULT_CONFIG = {
   llmModels: {
     'workers-ai': ['@cf/openai/gpt-oss-120b', '@cf/nvidia/nemotron-3-120b-a12b', '@cf/qwen/qwen3-30b-a3b-fp8'],
     gemini: ['gemini-3.7-flash', 'gemini-3.6-flash'],
-    groq: ['llama-3.3-70b-versatile'],
+    groq: ['openai/gpt-oss-120b', 'qwen/qwen3.6-27b'],
     openrouter: [],
   },
   /** Mantiene l'ordine dichiarato: modelli migliori prima, fallback solo in caso di errore. */

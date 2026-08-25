@@ -159,6 +159,74 @@ export interface LlmProvider {
   defaultModels: string[];
 }
 
+/**
+ * Telemetria sicura e best-effort di un singolo tentativo LLM.
+ *
+ * Il Worker non inserisce qui prompt, body completi, header o credenziali. I
+ * campi restano opzionali per mantenere leggibili anche le run precedenti.
+ */
+export interface LlmAttemptDebug {
+  [key: string]: unknown;
+  version?: number;
+  attemptId?: string;
+  category?: string;
+  phase?: string;
+  startedAt?: number;
+  elapsedMs?: number;
+  timeoutMs?: number;
+  timerFired?: boolean;
+  structuredMode?: boolean | string;
+  messageCount?: number;
+  promptChars?: number;
+  maxTokens?: number;
+  temperature?: number;
+  reasoningEffort?: string;
+  httpStatus?: number;
+  statusText?: string;
+  contentType?: string;
+  bodyChars?: number;
+  payloadKeys?: string[];
+  payloadShape?: string | string[] | Record<string, unknown>;
+  responseId?: string;
+  requestId?: string;
+  generationId?: string;
+  cfRay?: string;
+  retryAfter?: string | number;
+  requestedModel?: string;
+  resolvedModel?: string;
+  choiceCount?: number;
+  finishReason?: string;
+  nativeFinishReason?: string;
+  incompleteReason?: string;
+  contentPath?: string;
+  contentChars?: number;
+  contentKind?: string;
+  candidateCount?: number;
+  reasoningChars?: number;
+  usage?: Record<string, unknown> | null;
+  router?: string | Record<string, unknown> | null;
+  errorName?: string;
+  errorCode?: string | number;
+  errorMessage?: string;
+  parseError?: string;
+  validationError?: string;
+}
+
+export interface LlmAttempt {
+  provider?: string;
+  model: string;
+  format?: string;
+  ok: boolean;
+  error?: string;
+  details?: unknown;
+  ms?: number;
+  resolvedModel?: string;
+  reasoningScore?: number;
+  reasoningTier?: string;
+  usage?: Record<string, unknown> | null;
+  debug?: LlmAttemptDebug;
+}
+
 export interface CredentialStatus {
   key: CredentialKey;
   label: string;
@@ -201,7 +269,7 @@ export interface RunBundle {
     news: { net: number; top: Array<{ t: string; s: number; topic: string }> };
     sourceDiagnostics: Array<{ name: string; ok: boolean; error?: string; ms: number }>;
   } | null;
-  proposal: { model: string | null; parsed: { targetWeights: Record<string, number>; confidence: number; rationale: string; risks: string[]; watch: string[]; repairs?: Array<{ code: string; originalTotal: number; message: string }> } | null; error: string | null; attempts: unknown[] } | null;
+  proposal: { model: string | null; parsed: { targetWeights: Record<string, number>; confidence: number; rationale: string; risks: string[]; watch: string[]; repairs?: Array<{ code: string; originalTotal: number; message: string }> } | null; error: string | null; attempts: LlmAttempt[] } | null;
   validation: { ok: boolean; violations: Array<{ code: string; message: string; severity: string }>; plan: { orders: PlanOrder[]; targets: Record<string, number>; turnoverPct: number } | null } | null;
   orders: Array<{ symbol: string; side: string; amount_usd: number; state: string; message: string | null }>;
   logs: Array<{ at: number; level: string; stage: string; message: string }>;
@@ -226,6 +294,8 @@ export interface AgentPortfolioSummary {
   createdAt: string;
 }
 
+export type DiagnosticData = LlmAttempt[] | Record<string, unknown> | Array<Record<string, unknown>>;
+
 export interface DiagnosticCheck {
   id: string;
   label: string;
@@ -234,7 +304,7 @@ export interface DiagnosticCheck {
   detail?: string;
   error?: string;
   hint?: string;
-  data?: unknown;
+  data?: DiagnosticData;
 }
 
 export interface DiagnosticsReport {
@@ -253,7 +323,7 @@ export interface GuidedStrategyBundle<TDraft = Record<string, unknown>> {
   generation: {
     source: 'ai' | 'deterministic';
     model: string | null;
-    attempts: Array<{ provider: string; model: string; ok: boolean; error?: string }>;
+    attempts: LlmAttempt[];
   };
   collaboration: StrategyCollaboration;
 }

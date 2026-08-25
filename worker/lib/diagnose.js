@@ -13,8 +13,8 @@ import { hasVerifiedAgentBinding } from './vault.js';
 function ok(id, label, detail, extra = {}) {
   return { id, label, ok: true, detail, ...extra };
 }
-function ko(id, label, error, hint) {
-  return { id, label, ok: false, error: String(error).slice(0, 400), hint };
+function ko(id, label, error, hint, extra = {}) {
+  return { id, label, ok: false, error: String(error).slice(0, 400), hint, ...extra };
 }
 function skip(id, label, reason) {
   return { id, label, ok: null, detail: reason };
@@ -155,7 +155,8 @@ export async function runDiagnostics(resolved, config, env = {}) {
         { data: probes })
     : ko('models', 'Provider AI',
         broken.map((item) => `${item.provider}/${item.model}: ${item.error}`).join(' · '),
-        'Verifica il binding Workers AI e le chiavi dei provider esterni. La cascata prova automaticamente Gemini, Groq e OpenRouter quando sono configurati.'));
+        'Verifica il binding Workers AI e le chiavi dei provider esterni. La cascata prova automaticamente Gemini, Groq e OpenRouter quando sono configurati.',
+        { data: probes }));
 
   // --- Notifiche ----------------------------------------------------------
   if (!credentials.telegramBotToken && !credentials.telegramChatId && !credentials.notifyWebhookUrl) {

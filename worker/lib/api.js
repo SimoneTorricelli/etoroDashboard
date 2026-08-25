@@ -13,7 +13,9 @@ import {
 import { runDiagnostics } from './diagnose.js';
 import { EtoroClient } from './etoro.js';
 import { applyProfile, listProfiles } from './profiles.js';
-import { PROVIDERS, buildAttemptPlan, callModel, prioritizeReviewPlan } from './llm.js';
+import {
+  PROVIDERS, buildAttemptPlan, callModel, llmErrorDebug, prioritizeReviewPlan,
+} from './llm.js';
 import {
   buildDeterministicScenarioSummary, buildSafeStrategySpec, buildStrategyPrompt, checkStrategyFeasibility,
   createDefaultOnboardingAnswers, normalizeAiStrategySpec, normalizeOnboardingAnswers,
@@ -619,7 +621,18 @@ async function generateGuidedStrategy({ rawAnswers, config, credentials, env, on
       const resolvedAttemptModel = `${attempt.provider}/${response.resolvedModel ?? attempt.model}`;
       const normalized = normalizeAiStrategySpec(response.content, answers);
       if (!normalized.ok) {
-        attempts.push({ ...attempt, ok: false, error: normalized.error });
+        attempts.push({
+          ...attempt,
+          ok: false,
+          error: normalized.error,
+          debug: {
+            ...response.debug,
+            category: 'schema_error',
+            phase: 'normalize',
+            contentChars: response.content.length,
+            validationError: normalized.error,
+          },
+        });
         emit('lead', 'failed', 'Proposta non conforme', 'La risposta non rispettava schema o consenso ed è stata scartata senza applicarla.', { model: attemptModel });
         continue;
       }
@@ -627,14 +640,19 @@ async function generateGuidedStrategy({ rawAnswers, config, credentials, env, on
       source = 'ai';
       model = resolvedAttemptModel;
       leadAttempt = attempt;
-      attempts.push({ ...attempt, ok: true });
+      attempts.push({ ...attempt, ok: true, debug: response.debug });
       emit('lead', 'passed', 'Prima proposta pronta', 'La policy è completa e può passare ai revisori indipendenti.', {
         model: resolvedAttemptModel,
         handoff: ['StrategySpec strutturata', 'Limiti di rischio', 'Regole di universo dinamico'],
       });
       break;
     } catch (error) {
-      attempts.push({ ...attempt, ok: false, error: error instanceof Error ? error.message : String(error) });
+      attempts.push({
+        ...attempt,
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+        debug: llmErrorDebug(error),
+      });
       emit('lead', 'failed', 'Modello non disponibile', 'Il router passa al provider successivo senza interrompere la creazione.', {
         model: attemptModel,
         details: [error instanceof Error ? error.message : String(error)],

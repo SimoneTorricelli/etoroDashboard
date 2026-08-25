@@ -4,11 +4,14 @@
  */
 import { useState } from 'react';
 import { toast } from 'sonner';
-import { CheckCircle2, CircleDashed, Loader2, Stethoscope, XCircle } from 'lucide-react';
+import { CheckCircle2, CircleDashed, Copy, Loader2, Stethoscope, XCircle } from 'lucide-react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { autopilot, type DiagnosticsReport } from '@/lib/agent/autopilot-api';
+import {
+  buildLlmTechnicalReport, copyJsonToClipboard, isLlmAttemptArray, llmAttemptDebugFacts,
+} from '@/lib/agent/llm-diagnostics';
 
 interface Props {
   onReport?: (report: DiagnosticsReport) => void;
@@ -17,6 +20,9 @@ interface Props {
 export function DiagnosticsPanel({ onReport }: Props) {
   const [report, setReport] = useState<DiagnosticsReport | null>(null);
   const [running, setRunning] = useState(false);
+
+  const modelAttempts = report?.checks.find((check) => check.id === 'models')?.data;
+  const canCopyModelReport = isLlmAttemptArray(modelAttempts) && modelAttempts.length > 0;
 
   const run = async () => {
     setRunning(true);
@@ -34,6 +40,20 @@ export function DiagnosticsPanel({ onReport }: Props) {
     }
   };
 
+  const copyReport = async () => {
+    if (!report || !isLlmAttemptArray(modelAttempts)) return;
+    try {
+      await copyJsonToClipboard(buildLlmTechnicalReport({
+        source: 'diagnostics',
+        checkedAt: report.checkedAt,
+        attempts: modelAttempts,
+      }));
+      toast.success('Report tecnico copiato negli appunti');
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Impossibile copiare il report tecnico.');
+    }
+  };
+
   return (
     <Card>
       <CardHeader className="pb-3">
@@ -46,10 +66,17 @@ export function DiagnosticsPanel({ onReport }: Props) {
               Prova una per una le credenziali e le fonti dati, e dice esattamente cosa non funziona.
             </CardDescription>
           </div>
-          <Button size="sm" onClick={() => void run()} disabled={running}>
-            {running ? <Loader2 className="size-4 animate-spin" /> : <Stethoscope className="size-4" />}
-            {running ? 'Controllo in corso…' : 'Esegui controlli'}
-          </Button>
+          <div className="flex flex-wrap gap-2">
+            {report ? (
+              <Button variant="outline" size="sm" onClick={() => void copyReport()} disabled={!canCopyModelReport}>
+                <Copy className="size-4" /> Copia report JSON
+              </Button>
+            ) : null}
+            <Button size="sm" onClick={() => void run()} disabled={running}>
+              {running ? <Loader2 className="size-4 animate-spin" /> : <Stethoscope className="size-4" />}
+              {running ? 'Controllo in corso…' : 'Esegui controlli'}
+            </Button>
+          </div>
         </div>
       </CardHeader>
       <CardContent className="space-y-2">
@@ -87,6 +114,24 @@ export function DiagnosticsPanel({ onReport }: Props) {
                     {check.hint && (
                       <p className="mt-1 text-xs leading-relaxed text-warn">Come risolvere: {check.hint}</p>
                     )}
+                    {check.id === 'models' && isLlmAttemptArray(check.data) && check.data.length > 0 ? (
+                      <div className="mt-2 space-y-1.5 border-t border-current/10 pt-2">
+                        {check.data.map((attempt, index) => {
+                          const facts = llmAttemptDebugFacts(attempt);
+                          return (
+                            <div key={`${attempt.provider ?? 'provider'}-${attempt.model}-${attempt.format ?? 'probe'}-${index}`} className="rounded-md bg-bg-0/70 px-2 py-1.5">
+                              <div className="flex flex-wrap items-baseline justify-between gap-x-2 gap-y-0.5">
+                                <p className={`min-w-0 break-all font-mono text-[11px] ${attempt.ok ? 'text-gain' : 'text-text-1'}`}>
+                                  {attempt.ok ? '✓' : '✗'} {attempt.provider ? `${attempt.provider}/` : ''}{attempt.model}{attempt.format ? ` [${attempt.format}]` : ''}
+                                </p>
+                                {facts.length > 0 ? <p className="text-[10px] text-text-2">{facts.join(' · ')}</p> : null}
+                              </div>
+                              {attempt.error ? <p className="mt-0.5 break-words text-[11px] leading-relaxed text-text-2">{attempt.error}</p> : null}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    ) : null}
                   </div>
                 </div>
               </div>

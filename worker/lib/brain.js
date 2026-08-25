@@ -6,7 +6,10 @@
  * Non conosce l'esistenza degli ordini e non può richiederne l'invio.
  */
 
-import { buildAttemptPlan, callModel } from './llm.js';
+import {
+  buildAttemptPlan, callModel, isWorkersReasoningModel, llmErrorDebug, modelVendor,
+  supportsNativeJson,
+} from './llm.js';
 
 export { listFreeModels } from './llm.js';
 
@@ -66,30 +69,100 @@ const RESPONSE_SCHEMA = {
   },
 };
 
-/** Estrae il primo oggetto JSON bilanciato presente nel testo. */
-export function extractJson(text) {
-  if (!text) return null;
-  const cleaned = text.replace(/```(?:json)?/gi, '').trim();
-  const start = cleaned.indexOf('{');
-  if (start < 0) return null;
+function jsonParseDiagnostic(error) {
+  const message = error instanceof Error ? error.message : '';
+  const position = message.match(/position\s+(\d+)/i)?.[1];
+  const line = message.match(/line\s+(\d+)/i)?.[1];
+  const column = message.match(/column\s+(\d+)/i)?.[1];
+  if (position) return `JSON non valido alla posizione ${position}`;
+  if (line && column) return `JSON non valido alla riga ${line}, colonna ${column}`;
+  return 'JSON non valido';
+}
+
+/** Estrae un oggetto JSON bilanciato e conserva il motivo del fallimento. */
+export function extractJsonResult(input) {
+  if (input && typeof input === 'object' && !Array.isArray(input)) return { value: input, error: null };
+  if (typeof input !== 'string' || !input.trim()) return { value: null, error: 'contenuto vuoto' };
+  const cleaned = input.replace(/```(?:json)?/gi, '').trim();
+  let lastError = 'nessun oggetto JSON trovato';
+  let start = -1;
   let depth = 0;
   let inString = false;
   let escaped = false;
-  for (let i = start; i < cleaned.length; i += 1) {
+  for (let i = 0; i < cleaned.length; i += 1) {
     const char = cleaned[i];
+    if (start < 0) {
+      if (char === '{') {
+        start = i;
+        depth = 1;
+        inString = false;
+        escaped = false;
+      }
+      continue;
+    }
     if (escaped) { escaped = false; continue; }
-    if (char === '\\') { escaped = true; continue; }
+    if (inString && char === '\\') { escaped = true; continue; }
     if (char === '"') { inString = !inString; continue; }
     if (inString) continue;
-    if (char === '{') depth += 1;
-    if (char === '}') {
-      depth -= 1;
-      if (depth === 0) {
-        try { return JSON.parse(cleaned.slice(start, i + 1)); } catch { return null; }
-      }
+    if (char === '{') { depth += 1; continue; }
+    if (char !== '}') continue;
+    depth -= 1;
+    if (depth !== 0) continue;
+    try { return { value: JSON.parse(cleaned.slice(start, i + 1)), error: null }; } catch (error) {
+      lastError = jsonParseDiagnostic(error);
+      start = -1;
+      inString = false;
+      escaped = false;
     }
   }
-  return null;
+  if (start >= 0) lastError = 'oggetto JSON incompleto o troncato';
+  return { value: null, error: String(lastError).slice(0, 240) };
+}
+
+/** Compatibilità con i chiamanti esistenti. */
+export function extractJson(text) {
+  return extractJsonResult(text).value;
+}
+
+/**
+ * Elenca oggetti JSON bilanciati anche dopo esempi o preamboli malformati.
+ * Il limite evita scansioni quadratiche su output ostili o accidentalmente enormi.
+ */
+export function extractJsonCandidates(input, limit = 32) {
+  if (input && typeof input === 'object' && !Array.isArray(input)) return { values: [input], error: null };
+  if (typeof input !== 'string' || !input.trim()) return { values: [], error: 'contenuto vuoto' };
+  const cleaned = input.replace(/```(?:json)?/gi, '').trim();
+  const values = [];
+  let checked = 0;
+  let lastError = 'nessun oggetto JSON trovato';
+  for (let start = cleaned.indexOf('{'); start >= 0 && checked < limit; start = cleaned.indexOf('{', start + 1)) {
+    checked += 1;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    let closed = false;
+    for (let i = start; i < cleaned.length; i += 1) {
+      const char = cleaned[i];
+      if (escaped) { escaped = false; continue; }
+      if (inString && char === '\\') { escaped = true; continue; }
+      if (char === '"') { inString = !inString; continue; }
+      if (inString) continue;
+      if (char === '{') { depth += 1; continue; }
+      if (char !== '}') continue;
+      depth -= 1;
+      if (depth !== 0) continue;
+      closed = true;
+      try {
+        const parsed = JSON.parse(cleaned.slice(start, i + 1));
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) values.push(parsed);
+      } catch (error) {
+        lastError = jsonParseDiagnostic(error);
+      }
+      break;
+    }
+    if (!closed) lastError = 'oggetto JSON incompleto o troncato';
+  }
+  return { values, error: values.length ? null : lastError };
 }
 
 /** Normalizza e verifica la forma della proposta. Non applica regole di rischio. */
@@ -161,31 +234,134 @@ export function normalizeProposal(raw, allowedSymbols) {
   };
 }
 
+/** Seleziona il primo candidato JSON che rispetta davvero lo schema allocativo. */
+export function findNormalizedProposal(input, allowedSymbols) {
+  const extracted = extractJsonCandidates(input);
+  if (!extracted.values.length) {
+    return { ok: false, kind: 'invalid_json', error: 'risposta non è un oggetto', parseError: extracted.error };
+  }
+  let bestFailure = null;
+  for (const candidate of extracted.values) {
+    const normalized = normalizeProposal(candidate, allowedSymbols);
+    if (normalized.ok) return { ok: true, value: normalized.value, candidateCount: extracted.values.length };
+    if (!bestFailure || candidate?.targetWeights || candidate?.target_weights || candidate?.weights) bestFailure = normalized;
+  }
+  return {
+    ok: false,
+    kind: 'schema_error',
+    error: bestFailure?.error ?? 'targetWeights assente',
+    details: bestFailure?.details ?? null,
+    candidateCount: extracted.values.length,
+  };
+}
+
+function routeKey(entry) {
+  return `${entry?.provider ?? ''}/${entry?.model ?? ''}`;
+}
+
+/**
+ * Mantiene la qualità, ma riserva spazio ai provider e ai vendor indipendenti
+ * prima di riempire il budget con altri modelli dello stesso gruppo.
+ */
+export function selectDiverseAttemptPlan(plan, limit = 8) {
+  const unique = [];
+  const routeSeen = new Set();
+  for (const entry of Array.isArray(plan) ? plan : []) {
+    const key = routeKey(entry);
+    if (!entry?.provider || !entry?.model || routeSeen.has(key)) continue;
+    routeSeen.add(key);
+    unique.push(entry);
+  }
+  const selected = [];
+  const selectedRoutes = new Set();
+  const providers = new Set();
+  const vendors = new Set();
+  const add = (entry) => {
+    const key = routeKey(entry);
+    if (selected.length >= limit || selectedRoutes.has(key)) return false;
+    selected.push(entry);
+    selectedRoutes.add(key);
+    providers.add(entry.provider);
+    vendors.add(modelVendor(entry));
+    return true;
+  };
+  for (const entry of unique) if (!providers.has(entry.provider)) add(entry);
+  for (const entry of unique) if (!vendors.has(modelVendor(entry))) add(entry);
+  for (const entry of unique) add(entry);
+  return selected;
+}
+
+/** In un retry porta davanti le route che la run precedente non ha raggiunto. */
+export function prioritizeUntriedPlan(plan, previousAttempts = []) {
+  const attempted = new Set((Array.isArray(previousAttempts) ? previousAttempts : []).map(routeKey));
+  return [...plan].sort((left, right) => Number(attempted.has(routeKey(left))) - Number(attempted.has(routeKey(right))));
+}
+
+function debugWithOutput(debug, content, category, phase, extra = {}) {
+  return {
+    ...(debug ?? {}),
+    category,
+    phase,
+    contentChars: typeof content === 'string' ? content.length : undefined,
+    ...extra,
+  };
+}
+
+function shouldRetryAsText(attempt) {
+  if (!attempt?.debug || attempt.debug.structuredMode !== 'json_object') return false;
+  if (['invalid_json', 'schema_error', 'empty_content'].includes(attempt.debug.category)) return true;
+  return ['http_error', 'provider_error'].includes(attempt.debug.category)
+    && /response[_ -]?format|json[_ -]?(?:mode|schema)|structured/i.test(`${attempt.error ?? ''} ${attempt.debug.errorMessage ?? ''}`);
+}
+
 /**
  * Prova ogni coppia provider/modello con una richiesta minima e riporta
  * l'errore esatto. È il modo più diretto per scoprire che un modello gratuito
  * è stato ritirato: i cataloghi cambiano di continuo.
  */
 export async function probeModels({ config, credentials, env }) {
-  const plan = buildAttemptPlan({ config, credentials, env });
+  const plan = selectDiverseAttemptPlan(buildAttemptPlan({ config, credentials, env }), 8);
   if (!plan.length) return [{ provider: '—', model: '—', ok: false, error: 'nessun provider configurato o chiave mancante' }];
   const results = [];
   // Il piano gratuito di Cloudflare concede 50 subrequest per invocazione:
   // un probe illimitato le esaurirebbe da solo.
   for (const attempt of plan.slice(0, 8)) {
     const startedAt = Date.now();
+    const jsonMode = supportsNativeJson(attempt.provider, attempt.model);
     try {
-      const { content } = await callModel({
+      const response = await callModel({
         ...attempt,
         messages: [{ role: 'user', content: 'Rispondi solo con: {"ok":true}' }],
-        config: { ...config, llmMaxTokens: 32 },
+        // 32 token non lasciano spazio alla risposta finale dei reasoning model.
+        config: { ...config, llmMaxTokens: Math.max(1_600, Number(config.llmMaxTokens) || 0) },
         credentials,
         env,
+        jsonMode: true,
         timeoutMs: 20_000,
+        minimumMaxTokens: isWorkersReasoningModel(attempt.model) ? 3_200 : 0,
       });
-      results.push({ ...attempt, ok: Boolean(content), ms: Date.now() - startedAt });
+      const parsed = extractJson(response.content);
+      if (parsed?.ok !== true) {
+        results.push({
+          ...attempt,
+          format: jsonMode ? 'json' : 'text',
+          ok: false,
+          error: 'risposta di probe non valida',
+          ms: Date.now() - startedAt,
+          debug: debugWithOutput(response.debug, response.content, 'invalid_json', 'parse'),
+        });
+        continue;
+      }
+      results.push({ ...attempt, format: jsonMode ? 'json' : 'text', ok: true, ms: Date.now() - startedAt, debug: response.debug });
     } catch (error) {
-      results.push({ ...attempt, ok: false, error: error instanceof Error ? error.message : String(error), ms: Date.now() - startedAt });
+      results.push({
+        ...attempt,
+        format: jsonMode ? 'json' : 'text',
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+        ms: Date.now() - startedAt,
+        debug: llmErrorDebug(error),
+      });
     }
   }
   return results;
@@ -205,10 +381,10 @@ export function prioritizeAlternativeProvider(plan, previousModel = '') {
 }
 
 /**
- * Cascata multi-provider. Per ogni coppia provider/modello prova prima la
- * modalità JSON nativa, poi il testo libero con estrazione.
+ * Cascata multi-provider. Prova route diverse e usa il fallback testuale solo
+ * quando una risposta JSON nativa è arrivata ma non era valida.
  */
-export async function askBrain({ config, credentials, env, featuresPrompt, allowedSymbols, dynamic = false, profileDescription = '', ledgerNotes = [], revisionContext = '', previousModel = '' }) {
+export async function askBrain({ config, credentials, env, featuresPrompt, allowedSymbols, dynamic = false, profileDescription = '', ledgerNotes = [], revisionContext = '', previousModel = '', previousAttempts = [] }) {
   const horizon = config.cadence === 'daily' ? 'giornaliero' : config.cadence === 'monthly' ? 'mensile' : 'settimanale';
   const userPrompt = [
     featuresPrompt,
@@ -228,42 +404,92 @@ export async function askBrain({ config, credentials, env, featuresPrompt, allow
   ];
 
   const basePlan = buildAttemptPlan({ config, credentials, env });
-  const plan = previousModel ? prioritizeAlternativeProvider(basePlan, previousModel) : basePlan;
+  const alternativeFirst = previousModel ? prioritizeAlternativeProvider(basePlan, previousModel) : basePlan;
+  const untriedFirst = prioritizeUntriedPlan(alternativeFirst, previousAttempts);
+  const plan = selectDiverseAttemptPlan(untriedFirst, 10);
   if (!plan.length) {
     return { ok: false, attempts: [], error: 'nessun provider AI disponibile: attiva Workers AI o inserisci una chiave', promptChars: userPrompt.length };
   }
 
   const attempts = [];
-  // Due tentativi per modello e un tetto complessivo: il Worker ha un budget
-  // di subrequest da rispettare.
-  for (const entry of plan.slice(0, 5)) {
-    for (const jsonMode of [true, false]) {
-      if (attempts.length >= 10) break;
-      const label = jsonMode ? 'json' : 'text';
-      try {
-        const { content, usage, resolvedModel } = await callModel({ ...entry, messages, config, credentials, env, jsonMode });
-        const normalized = normalizeProposal(extractJson(content), allowedSymbols);
-        if (!normalized.ok) {
-          attempts.push({ ...entry, format: label, ok: false, error: normalized.error, details: normalized.details ?? null });
-          continue;
-        }
-        attempts.push({ ...entry, format: label, ok: true, usage });
-        return {
-          ok: true,
-          model: `${entry.provider}/${resolvedModel ?? entry.model}`,
-          attempts,
-          rawText: content,
-          promptChars: userPrompt.length + systemPrompt.length,
-          parsed: normalized.value,
-          usage,
-        };
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        attempts.push({ ...entry, format: label, ok: false, error: message });
-        // Modello ritirato o budget esaurito: inutile insistere sul formato.
-        if (/unavailable|not found|404|no endpoints|subrequest|rate limit|429/i.test(message)) break;
+  const runAttempt = async (entry, jsonMode, label) => {
+    try {
+      const response = await callModel({
+        ...entry,
+        messages,
+        config,
+        credentials,
+        env,
+        jsonMode,
+        minimumMaxTokens: isWorkersReasoningModel(entry.model) ? 3_200 : 0,
+      });
+      const found = findNormalizedProposal(response.content, allowedSymbols);
+      if (!found.ok && found.kind === 'invalid_json') {
+        const debug = debugWithOutput(response.debug, response.content, 'invalid_json', 'parse', { parseError: found.parseError });
+        const attempt = { ...entry, format: label, ok: false, error: 'risposta non è un oggetto', usage: response.usage, debug };
+        attempts.push(attempt);
+        console.warn('llm_attempt_invalid_output', JSON.stringify({ provider: entry.provider, model: entry.model, ...debug }));
+        return { attempt };
       }
+      if (!found.ok) {
+        const debug = debugWithOutput(response.debug, response.content, 'schema_error', 'normalize', {
+          validationError: found.error,
+          candidateCount: found.candidateCount,
+        });
+        const attempt = {
+          ...entry,
+          format: label,
+          ok: false,
+          error: found.error,
+          details: found.details ?? null,
+          usage: response.usage,
+          debug,
+        };
+        attempts.push(attempt);
+        console.warn('llm_attempt_invalid_output', JSON.stringify({ provider: entry.provider, model: entry.model, ...debug }));
+        return { attempt };
+      }
+      attempts.push({ ...entry, format: label, ok: true, usage: response.usage, debug: response.debug });
+      return {
+        success: {
+          ok: true,
+          model: `${entry.provider}/${response.resolvedModel ?? entry.model}`,
+          attempts,
+          rawText: response.content,
+          promptChars: userPrompt.length + systemPrompt.length,
+          parsed: found.value,
+          usage: response.usage,
+        },
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const attempt = { ...entry, format: label, ok: false, error: message, debug: llmErrorDebug(error) };
+      attempts.push(attempt);
+      return { attempt };
     }
+  };
+
+  // Prima passata: più route indipendenti. Gli ultimi due slot restano ai
+  // fallback testuali soltanto quando il JSON nativo è stato il vero problema.
+  const textFallbacks = [];
+  const blockedProviders = new Set();
+  let primaryCalls = 0;
+  for (const entry of plan) {
+    if (attempts.length >= 10 || primaryCalls >= 8) break;
+    if (blockedProviders.has(entry.provider)) continue;
+    const nativeJson = supportsNativeJson(entry.provider, entry.model);
+    const result = await runAttempt(entry, true, nativeJson ? 'json' : 'text');
+    primaryCalls += 1;
+    if (result.success) return result.success;
+    if (shouldRetryAsText(result.attempt)) textFallbacks.push(entry);
+    const status = Number(result.attempt?.debug?.httpStatus);
+    if (result.attempt?.debug?.category === 'rate_limit' || [401, 402].includes(status)) blockedProviders.add(entry.provider);
+  }
+  for (const entry of textFallbacks) {
+    if (attempts.length >= 10) break;
+    if (blockedProviders.has(entry.provider)) continue;
+    const result = await runAttempt(entry, false, 'text');
+    if (result.success) return result.success;
   }
 
   const perModel = [];

@@ -8,14 +8,20 @@
 import assert from 'node:assert/strict';
 import { buildFeatures, renderFeaturesPrompt, rsi, maxDrawdown, annualizedVol } from './lib/features.js';
 import { clampWeights, collapseEquivalentTargets, validateProposal } from './lib/validator.js';
-import { extractJson, normalizeProposal, prioritizeAlternativeProvider } from './lib/brain.js';
+import {
+  askBrain, extractJson, extractJsonResult, findNormalizedProposal, normalizeProposal, prioritizeAlternativeProvider,
+  prioritizeUntriedPlan, selectDiverseAttemptPlan,
+} from './lib/brain.js';
 import { DEFAULT_CONFIG } from './lib/db.js';
 import { PROFILES, applyProfile, describeProfile, listProfiles } from './lib/profiles.js';
 import { checkChurnRules, filterMarginalSubstitutions, isWorthTheCost } from './lib/churn.js';
 import { buildShortlist, scoreInstrument } from './lib/screening.js';
 import { decideWatcherAction, detectAnomalies, isStabilized, relevantHeadlines } from './lib/watcher.js';
 import { executePlan, reconcile } from './lib/executor.js';
-import { buildAttemptPlan, callModel, extractModelText, listFreeModels, prioritizeReviewPlan } from './lib/llm.js';
+import {
+  buildAttemptPlan, callModel, extractModelText, listFreeModels, prioritizeReviewPlan,
+  llmErrorDebug, safeModelOutputPreview, supportsNativeJson,
+} from './lib/llm.js';
 import { buildCandleRefreshQueue, buildFailedProposalRetryContext, scaleAgentSnapshotToReal, shortlistDeploymentCapacity } from './lib/pipeline.js';
 import { buildStrategyActivationNotification } from './lib/notify.js';
 import { EtoroClient } from './lib/etoro.js';
@@ -172,6 +178,19 @@ test('router AI: usa solo endpoint OpenRouter gratuiti e mette i reasoning model
   assert.ok(plan.some((entry) => entry.model === 'thinkingmachines/inkling:free'));
 });
 
+test('router AI: Groq esclude i modelli ritirati anche da configurazioni salvate', () => {
+  const plan = buildAttemptPlan({
+    config: {
+      ...DEFAULT_CONFIG,
+      llmModels: { ...DEFAULT_CONFIG.llmModels, groq: ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant'] },
+    },
+    credentials: { groqApiKey: 'x' },
+    env: {},
+  });
+  assert.ok(plan.some((entry) => entry.provider === 'groq' && entry.model === 'openai/gpt-oss-120b'));
+  assert.ok(!plan.some((entry) => entry.provider === 'groq' && entry.model.startsWith('llama-3.')));
+});
+
 test('router AI: i revisori privilegiano reasoning forte e laboratori diversi', () => {
   const plan = [
     { provider: 'workers-ai', model: '@cf/openai/gpt-oss-120b' },
@@ -184,6 +203,30 @@ test('router AI: i revisori privilegiano reasoning forte e laboratori diversi', 
     'nvidia/nemotron-3-ultra-550b-a55b:free',
     'z-ai/glm-5.2:free',
   ]);
+});
+
+test('router AI: il budget iniziale include provider diversi', () => {
+  const diverse = selectDiverseAttemptPlan([
+    { provider: 'openrouter', model: 'nvidia/ultra' },
+    { provider: 'openrouter', model: 'z-ai/glm' },
+    { provider: 'workers-ai', model: '@cf/openai/gpt' },
+    { provider: 'openrouter', model: 'nvidia/super' },
+    { provider: 'gemini', model: 'gemini-flash' },
+    { provider: 'groq', model: 'llama-fast' },
+  ], 4);
+  assert.deepEqual(diverse.map((entry) => entry.provider), ['openrouter', 'workers-ai', 'gemini', 'groq']);
+});
+
+test('router AI: un retry porta davanti le route mai provate', () => {
+  const retried = prioritizeUntriedPlan([
+    { provider: 'openrouter', model: 'nvidia/ultra' },
+    { provider: 'workers-ai', model: '@cf/openai/gpt' },
+    { provider: 'gemini', model: 'gemini-flash' },
+  ], [
+    { provider: 'openrouter', model: 'nvidia/ultra', ok: false },
+    { provider: 'workers-ai', model: '@cf/openai/gpt', ok: false },
+  ]);
+  assert.equal(retried[0].provider, 'gemini');
 });
 
 test('catalogo AI: esclude musica e safety anche quando il prezzo token è zero', async () => {
@@ -435,6 +478,27 @@ test('estrazione JSON tollera testo attorno e code fence', () => {
   assert.equal(parsed.confidence, 0.7);
 });
 
+test('estrazione JSON salta un primo blocco invalido e conserva il parse error', () => {
+  const result = extractJsonResult('bozza {non-json} finale {"targetWeights":{"CASH":1},"confidence":0.4,"rationale":"prudente"}');
+  assert.equal(result.error, null);
+  assert.equal(result.value.targetWeights.CASH, 1);
+  const truncated = extractJsonResult('{"targetWeights":{"CASH":1}');
+  assert.equal(truncated.value, null);
+  assert.match(truncated.error, /incompleto|troncato/);
+});
+
+test('estrazione proposta salta esempi validi e preamboli con graffe tronche', () => {
+  const allocation = '{"targetWeights":{"CASH":1},"confidence":0.4,"rationale":"prudente"}';
+  const afterExample = findNormalizedProposal(`esempio {"foo":1} risposta ${allocation}`, ['SPY']);
+  assert.equal(afterExample.ok, true);
+  assert.equal(afterExample.value.targetWeights.CASH, 1);
+  const afterBrokenPreamble = findNormalizedProposal(`premessa {mai chiusa risposta ${allocation}`, ['SPY']);
+  assert.equal(afterBrokenPreamble.ok, true);
+  assert.equal(afterBrokenPreamble.value.targetWeights.CASH, 1);
+  const truncatedOuter = findNormalizedProposal('{"targetWeights":{"CASH":1}', ['SPY']);
+  assert.equal(truncatedOuter.ok, false);
+});
+
 test('normalizzazione rifiuta simboli fuori whitelist', () => {
   const result = normalizeProposal({ targetWeights: { TSLA: 1 }, confidence: 0.9, rationale: '' }, ['SPY', 'GLD', 'BTC']);
   assert.equal(result.ok, false);
@@ -458,7 +522,15 @@ test('GPT-OSS: estrae il testo finale dal formato Responses API', () => {
   assert.equal(text, '{"targetWeights":{"SPY":1}}');
 });
 
-test('GPT-OSS: il binding riceve JSON mode e restituisce output Responses API', async () => {
+test('JSON mode: estrae oggetti Workers AI, message.parsed e choices text', () => {
+  const allocation = { targetWeights: { SPY: 0.6, CASH: 0.4 }, confidence: 0.7, rationale: 'ok' };
+  assert.deepEqual(JSON.parse(extractModelText({ response: allocation })), allocation);
+  assert.deepEqual(JSON.parse(extractModelText({ result: { response: allocation } })), allocation);
+  assert.deepEqual(JSON.parse(extractModelText({ choices: [{ message: { parsed: allocation } }] })), allocation);
+  assert.equal(extractModelText({ choices: [{ text: '{"ok":true}' }] }), '{"ok":true}');
+});
+
+test('GPT-OSS Workers: usa JSON via prompt e restituisce output Responses API', async () => {
   let input;
   const result = await callModel({
     provider: 'workers-ai',
@@ -470,7 +542,257 @@ test('GPT-OSS: il binding riceve JSON mode e restituisce output Responses API', 
     jsonMode: true,
   });
   assert.equal(result.content, '{"ok":true}');
+  assert.equal(input.response_format, undefined);
+  assert.equal(result.debug.structuredMode, 'prompt_only');
+});
+
+test('Nemotron Workers: usa i parametri reasoning documentati e il minimo richiesto dal flusso', async () => {
+  let input;
+  const result = await callModel({
+    provider: 'workers-ai',
+    model: '@cf/nvidia/nemotron-3-120b-a12b',
+    messages: [{ role: 'user', content: 'test' }],
+    config: { llmTemperature: 0.1, llmMaxTokens: 700 },
+    credentials: {},
+    env: { AI: { run: async (_model, payload) => {
+      input = payload;
+      return { response: '{"ok":true}' };
+    } } },
+    jsonMode: true,
+    minimumMaxTokens: 3_200,
+  });
+  assert.equal(input.max_tokens, undefined);
+  assert.equal(input.max_completion_tokens, 3_200);
+  assert.equal(input.reasoning_effort, 'low');
+  assert.equal(result.debug.maxTokens, 3_200);
+  assert.equal(result.debug.reasoningEffort, 'low');
+});
+
+test('Workers AI: JSON nativo è limitato ai modelli documentati', async () => {
+  assert.equal(supportsNativeJson('workers-ai', '@cf/openai/gpt-oss-120b'), false);
+  assert.equal(supportsNativeJson('workers-ai', '@cf/nvidia/nemotron-3-120b-a12b'), false);
+  assert.equal(supportsNativeJson('workers-ai', '@cf/qwen/qwen3-30b-a3b-fp8'), false);
+  assert.equal(supportsNativeJson('workers-ai', '@cf/meta/llama-3.3-70b-instruct-fp8-fast'), true);
+  let input;
+  const result = await callModel({
+    provider: 'workers-ai', model: '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+    messages: [{ role: 'user', content: 'test' }],
+    config: { llmTemperature: 0.1, llmMaxTokens: 1600 }, credentials: {},
+    env: { AI: { run: async (_model, payload) => {
+      input = payload;
+      return { response: { ok: true } };
+    } } },
+    jsonMode: true,
+  });
   assert.equal(input.response_format.type, 'json_object');
+  assert.equal(result.debug.structuredMode, 'json_object');
+});
+
+test('cascata Workers: reasoning model prompt-only una volta e fallback JSON selettivo', async () => {
+  const calls = [];
+  const llama = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
+  const allocation = { targetWeights: { CASH: 1 }, confidence: 0.4, rationale: 'attesa', risks: [], watch: [] };
+  const originalWarn = console.warn;
+  console.warn = () => {};
+  try {
+    const result = await askBrain({
+      config: {
+        ...DEFAULT_CONFIG,
+        llmModels: {
+          ...DEFAULT_CONFIG.llmModels,
+          'workers-ai': [...DEFAULT_CONFIG.llmModels['workers-ai'], llama],
+        },
+      },
+      credentials: {},
+      env: { AI: { run: async (model, payload) => {
+        calls.push({ model, nativeJson: Boolean(payload.response_format), maxTokens: payload.max_tokens ?? payload.max_completion_tokens });
+        if (model === llama && payload.response_format) throw new Error("JSON Mode couldn't be met");
+        if (model === llama) return { response: allocation };
+        return { response: '' };
+      } } },
+      featuresPrompt: 'STRUMENTI\nCASH', allowedSymbols: [],
+    });
+    assert.equal(result.ok, true);
+    for (const model of ['@cf/openai/gpt-oss-120b', '@cf/nvidia/nemotron-3-120b-a12b', '@cf/qwen/qwen3-30b-a3b-fp8']) {
+      assert.equal(calls.filter((call) => call.model === model).length, 1);
+      assert.equal(calls.find((call) => call.model === model).nativeJson, false);
+      assert.ok(calls.find((call) => call.model === model).maxTokens >= 3_200);
+    }
+    assert.deepEqual(calls.filter((call) => call.model === llama).map((call) => call.nativeJson), [true, false]);
+    assert.equal(result.attempts.at(-1).ok, true);
+  } finally {
+    console.warn = originalWarn;
+  }
+});
+
+test('Workers AI: un response oggetto non viene classificato come vuoto', async () => {
+  const allocation = { targetWeights: { CASH: 1 }, confidence: 0.4, rationale: 'attesa' };
+  const result = await callModel({
+    provider: 'workers-ai',
+    model: '@cf/nvidia/nemotron-3-120b-a12b',
+    messages: [{ role: 'user', content: 'test' }],
+    config: { llmTemperature: 0.1, llmMaxTokens: 1600 },
+    credentials: {},
+    env: { AI: { run: async () => ({ response: allocation }) } },
+    jsonMode: true,
+  });
+  assert.deepEqual(JSON.parse(result.content), allocation);
+  assert.equal(result.debug.contentPath, 'response');
+  assert.equal(result.debug.category, 'ok');
+});
+
+test('Workers AI: conserva e classifica i codici operativi Cloudflare', async () => {
+  const originalWarn = console.warn;
+  console.warn = () => {};
+  try {
+    await assert.rejects(callModel({
+      provider: 'workers-ai', model: '@cf/openai/gpt-oss-120b',
+      messages: [{ role: 'user', content: 'test' }],
+      config: { llmTemperature: 0.1, llmMaxTokens: 1600 }, credentials: {},
+      env: { AI: { run: async () => { throw sdkError; } } }, jsonMode: true,
+    }), (error) => {
+      const serialized = JSON.stringify(error.debug);
+      assert.ok(!serialized.includes('secret-token-123'));
+      assert.ok(!serialized.includes('dato riservato'));
+      assert.equal(error.debug.authorization, undefined);
+      assert.equal(error.debug.prompt, undefined);
+      return true;
+    });
+
+    await assert.rejects(callModel({
+      provider: 'workers-ai', model: '@cf/openai/gpt-oss-120b',
+      messages: [{ role: 'user', content: 'test' }],
+      config: { llmTemperature: 0.1, llmMaxTokens: 1600 }, credentials: {},
+      env: { AI: { run: async () => ({ error: { code: 3040, message: 'out of capacity' } }) } },
+      jsonMode: true,
+    }), (error) => {
+      assert.equal(error.debug.category, 'capacity');
+      assert.equal(error.debug.errorCode, 3040);
+      return true;
+    });
+  } finally {
+    console.warn = originalWarn;
+  }
+});
+
+test('OpenRouter: GLM usa effort high, budget adeguato e metadata/healing', async () => {
+  const originalFetch = globalThis.fetch;
+  let request;
+  globalThis.fetch = async (_url, init) => {
+    request = init;
+    return new Response(JSON.stringify({
+      id: 'gen-test',
+      model: 'z-ai/glm-5.2:free',
+      choices: [{ finish_reason: 'stop', message: { content: '{"ok":true}' } }],
+      usage: { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 },
+    }), { status: 200, headers: { 'content-type': 'application/json', 'x-request-id': 'req-test' } });
+  };
+  try {
+    const result = await callModel({
+      provider: 'openrouter', model: 'z-ai/glm-5.2:free',
+      messages: [{ role: 'user', content: 'test' }],
+      config: { llmTemperature: 0.1, llmMaxTokens: 1600 },
+      credentials: { openrouterApiKey: 'test-key' }, env: {}, jsonMode: true,
+    });
+    const body = JSON.parse(request.body);
+    assert.equal(body.reasoning.effort, 'high');
+    assert.ok(body.max_tokens >= 5120);
+    assert.equal(body.response_format.type, 'json_object');
+    assert.deepEqual(body.plugins, [{ id: 'response-healing' }]);
+    assert.equal(request.headers['X-OpenRouter-Metadata'], 'enabled');
+    assert.equal(result.debug.structuredMode, 'json_object');
+    assert.equal(result.debug.requestId, 'req-test');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('OpenRouter: Ultra usa un solo prompt JSON senza fingere supporto nativo', async () => {
+  assert.equal(supportsNativeJson('openrouter', 'nvidia/nemotron-3-ultra-550b-a55b:free'), false);
+  const originalFetch = globalThis.fetch;
+  let body;
+  globalThis.fetch = async (_url, init) => {
+    body = JSON.parse(init.body);
+    return new Response(JSON.stringify({ choices: [{ message: { content: '{"ok":true}' } }] }), { status: 200 });
+  };
+  try {
+    const result = await callModel({
+      provider: 'openrouter', model: 'nvidia/nemotron-3-ultra-550b-a55b:free',
+      messages: [{ role: 'user', content: 'test' }],
+      config: { llmTemperature: 0.1, llmMaxTokens: 1600 },
+      credentials: { openrouterApiKey: 'test-key' }, env: {}, jsonMode: true,
+    });
+    assert.equal(body.response_format, undefined);
+    assert.equal(body.plugins, undefined);
+    assert.equal(result.debug.structuredMode, 'prompt_only');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Groq: i reasoning model usano parametri compatibili con JSON e budget finale', async () => {
+  const originalFetch = globalThis.fetch;
+  const bodies = [];
+  globalThis.fetch = async (_url, init) => {
+    bodies.push(JSON.parse(init.body));
+    return new Response(JSON.stringify({ choices: [{ message: { content: '{"ok":true}' } }] }), { status: 200 });
+  };
+  try {
+    const base = {
+      provider: 'groq', messages: [{ role: 'user', content: 'test' }],
+      config: { llmTemperature: 0.1, llmMaxTokens: 1600 },
+      credentials: { groqApiKey: 'test-key' }, env: {}, jsonMode: true,
+    };
+    const gpt = await callModel({ ...base, model: 'openai/gpt-oss-120b' });
+    const qwen = await callModel({ ...base, model: 'qwen/qwen3.6-27b' });
+    assert.equal(bodies[0].max_tokens, undefined);
+    assert.ok(bodies[0].max_completion_tokens >= 2048);
+    assert.equal(bodies[0].reasoning_effort, 'low');
+    assert.equal(bodies[0].include_reasoning, false);
+    assert.equal(bodies[0].reasoning_format, undefined);
+    assert.equal(gpt.debug.reasoningEffort, 'low');
+    assert.equal(bodies[1].reasoning_effort, 'none');
+    assert.equal(bodies[1].reasoning_format, 'hidden');
+    assert.equal(bodies[1].response_format.type, 'json_object');
+    assert.equal(qwen.debug.reasoningEffort, 'none');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('telemetria AI: timeout esplicito e anteprime senza credenziali', async () => {
+  const preview = safeModelOutputPreview('Bearer secret-token-123 sk-or-v1-supersegreta123 gsk_supersegreta123456 AIzaSuperSegreta123456789012345 eyJabcdefghijklmno.abcdefgh.abcdefgh');
+  assert.ok(!preview.includes('secret-token-123'));
+  assert.ok(!preview.includes('supersegreta123'));
+  assert.ok(!preview.includes('AIzaSuperSegreta'));
+  assert.ok(!preview.includes('eyJabcdefghijklmno'));
+  assert.equal(safeModelOutputPreview(undefined), '');
+  assert.match(safeModelOutputPreview(() => {}), /=>/);
+
+  const hostileDebug = { authorization: 'Bearer secret-token-123', prompt: 'dato riservato' };
+  hostileDebug.self = hostileDebug;
+  const sdkError = new Error('errore SDK');
+  sdkError.debug = hostileDebug;
+  assert.equal(llmErrorDebug(sdkError), undefined);
+
+  const originalWarn = console.warn;
+  console.warn = () => {};
+  try {
+    await assert.rejects(callModel({
+      provider: 'workers-ai', model: '@cf/openai/gpt-oss-120b',
+      messages: [{ role: 'user', content: 'test' }],
+      config: { llmTemperature: 0.1, llmMaxTokens: 1600 }, credentials: {},
+      env: { AI: { run: async () => new Promise(() => {}) } }, jsonMode: true, timeoutMs: 15,
+    }), (error) => {
+      assert.equal(error.message, 'timeout dopo 15 ms');
+      assert.equal(error.debug.category, 'timeout');
+      assert.equal(error.debug.timerFired, true);
+      assert.equal(error.debug.errorName, 'TimeoutError');
+      return true;
+    });
+  } finally {
+    console.warn = originalWarn;
+  }
 });
 
 test('normalizzazione completa in cassa una proposta all’83%', () => {

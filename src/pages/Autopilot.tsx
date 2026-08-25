@@ -8,7 +8,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { motion } from 'framer-motion';
 import { toast, Toaster } from 'sonner';
 import {
-  Activity, ArrowRight, Bot, Circle, CircleCheck, Clock, Eye, FlaskConical,
+  Activity, ArrowRight, Bot, Circle, CircleCheck, Clock, Copy, Eye, FlaskConical,
   Lock, RefreshCw, ShieldAlert, Snowflake, Radio, Sparkles, Unlock, X, XCircle,
 } from 'lucide-react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -41,8 +41,11 @@ import {
   autopilot, getBaseUrl, getControlToken, isTokenRemembered, setBaseUrl, setControlToken,
   AutopilotError,
   type AutopilotState, type ExecutionMode, type RunBundle, type RunSummary,
-  type GuidedStrategyBundle, type StrategyCollaboration, type StrategyTraceEvent,
+  type GuidedStrategyBundle, type LlmAttempt, type StrategyCollaboration, type StrategyTraceEvent,
 } from '@/lib/agent/autopilot-api';
+import {
+  buildLlmTechnicalReport, copyJsonToClipboard, llmAttemptDebugFacts,
+} from '@/lib/agent/llm-diagnostics';
 
 const stagger = (i: number) => ({
   initial: { opacity: 0, y: 12 },
@@ -82,6 +85,61 @@ function explainProposalError(error = '') {
   if (/risposta senza contenuto/i.test(error)) return 'Il provider ha risposto, ma non ha restituito un testo finale leggibile.';
   if (/non è un oggetto|targetWeights assente/i.test(error)) return 'La risposta non conteneva l’oggetto JSON di allocazione richiesto.';
   return error;
+}
+
+function summarizeProposalFailure(attempts: LlmAttempt[]): string {
+  const categories = new Set(attempts.map((attempt) => attempt.debug?.category).filter((value): value is string => typeof value === 'string'));
+  const reasons: string[] = [];
+  if ([...categories].some((item) => ['timeout', 'aborted'].includes(item))) {
+    reasons.push('Uno o più provider hanno superato il tempo limite o interrotto l’inferenza.');
+  }
+  if ([...categories].some((item) => ['rate_limit', 'capacity', 'provider_error', 'http_error'].includes(item))) {
+    reasons.push('Altri tentativi sono stati rifiutati per quota, capacità o errore del servizio a monte.');
+  }
+  if ([...categories].some((item) => ['empty_content', 'truncated'].includes(item))) {
+    reasons.push('Alcune risposte erano vuote o si sono fermate prima del risultato finale.');
+  }
+  if ([...categories].some((item) => ['invalid_json', 'schema_error'].includes(item))) {
+    reasons.push('Alcune risposte non rispettavano il JSON o i vincoli dell’allocazione.');
+  }
+  if (!reasons.length) reasons.push('Nessun modello ha prodotto una proposta utilizzabile; i dettagli tecnici sono elencati sotto.');
+  return `${reasons.join(' ')} Autopilot non ha creato ordini.`;
+}
+
+function ProposalAttemptRow({ attempt, explainError = false }: { attempt: LlmAttempt; explainError?: boolean }) {
+  const facts = llmAttemptDebugFacts(attempt);
+  const explanation = attempt.error ? explainProposalError(attempt.error) : '';
+  return (
+    <div>
+      <p className={cn('break-all font-mono text-[11px]', attempt.ok ? 'text-gain' : 'text-text-1')}>
+        {attempt.ok ? '✓' : '✗'} {attempt.provider ? `${attempt.provider}/` : ''}{attempt.model}
+        {attempt.format ? ` [${attempt.format}]` : ''}
+        {attempt.reasoningTier ? ` · ${attempt.reasoningTier}` : ''}
+        {attempt.error ? ` — ${attempt.error}` : ''}
+      </p>
+      {facts.length > 0 ? <p className="mt-0.5 text-[10px] text-text-2">{facts.join(' · ')}</p> : null}
+      {explainError && explanation && explanation !== attempt.error ? (
+        <p className="mt-0.5 text-xs text-text-2">{explanation}</p>
+      ) : null}
+    </div>
+  );
+}
+
+function CopyTechnicalReportButton({ attempts, runId }: { attempts: LlmAttempt[]; runId: string }) {
+  const copyReport = async () => {
+    try {
+      await copyJsonToClipboard(buildLlmTechnicalReport({ source: 'proposal', attempts, runId }));
+      toast.success('Report tecnico copiato negli appunti');
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Impossibile copiare il report tecnico.');
+    }
+  };
+
+  return (
+    <Button type="button" variant="outline" size="sm" className="gap-2" onClick={() => void copyReport()}>
+      <Copy className="size-3.5" /> Copia report tecnico
+    </Button>
+  );
 }
 
 const MODES: Array<{ id: ExecutionMode; icon: typeof Eye; title: string; short: string; tone: string }> = [
@@ -826,7 +884,7 @@ export default function Autopilot() {
                                 <Badge variant={detail.proposal.parsed.confidence >= config.minConfidence ? 'default' : 'outline'}>
                                   affidabilità {detail.proposal.parsed.confidence.toFixed(2)} (minimo {config.minConfidence})
                                 </Badge>
-                                {(detail.proposal.attempts as Array<{ ok?: boolean; reasoningTier?: string }>).some((attempt) => attempt.ok && attempt.reasoningTier === 'basic-fallback') ? (
+                                {detail.proposal.attempts.some((attempt) => attempt.ok && attempt.reasoningTier === 'basic-fallback') ? (
                                   <Badge variant="outline" className="border-warn/40 text-warn">Fallback: i reasoning model precedenti non erano validi</Badge>
                                 ) : null}
                                 {detail.improvement && <Badge variant="outline">Revisione di {detail.improvement.sourceModel ?? 'un piano precedente'}</Badge>}
@@ -842,13 +900,12 @@ export default function Autopilot() {
                                   <p className="mt-2 text-xs leading-relaxed text-text-2">
                                     L’ordine qui sotto è quello realmente eseguito. Un modello fallback viene usato soltanto se quelli più forti sopra di lui non hanno prodotto una proposta valida.
                                   </p>
+                                  <div className="mt-2">
+                                    <CopyTechnicalReportButton attempts={detail.proposal.attempts} runId={detail.run.id} />
+                                  </div>
                                   <div className="mt-2 space-y-1.5">
-                                    {(detail.proposal.attempts as Array<{ provider?: string; model: string; format: string; ok: boolean; error?: string; reasoningTier?: string }>).map((attempt, index) => (
-                                      <p key={index} className={cn('font-mono text-[11px]', attempt.ok ? 'text-gain' : 'text-text-1')}>
-                                        {attempt.ok ? '✓' : '✗'} {attempt.provider ? `${attempt.provider}/` : ''}{attempt.model}
-                                        {attempt.reasoningTier ? ` · ${attempt.reasoningTier}` : ''}
-                                        {attempt.error ? ` — ${attempt.error}` : ''}
-                                      </p>
+                                    {detail.proposal.attempts.map((attempt, index) => (
+                                      <ProposalAttemptRow key={`${attempt.provider ?? 'provider'}-${attempt.model}-${attempt.format ?? 'attempt'}-${index}`} attempt={attempt} />
                                     ))}
                                   </div>
                                 </details>
@@ -903,9 +960,9 @@ export default function Autopilot() {
                               {Array.isArray(detail.proposal?.attempts) && detail.proposal.attempts.length > 0 && (
                                 <>
                                   <div className="rounded-xl border border-warn/30 bg-warn/5 p-4">
-                                    <p className="text-sm font-medium text-text-0">Non è un errore del tuo portafoglio</p>
+                                    <p className="text-sm font-medium text-text-0">Run fermata in sicurezza</p>
                                     <p className="mt-1 text-xs leading-relaxed text-text-1">
-                                      I provider hanno restituito formati incompleti o percentuali che non chiudevano al 100%. Autopilot non ha creato ordini.
+                                      {summarizeProposalFailure(detail.proposal.attempts)}
                                     </p>
                                     <Button
                                       type="button"
@@ -918,14 +975,12 @@ export default function Autopilot() {
                                     </Button>
                                   </div>
                                   <div className="space-y-2 rounded-lg bg-bg-0 p-3">
-                                    <p className="text-xs text-text-1">Tentativi per modello, in ordine:</p>
-                                    {(detail.proposal.attempts as Array<{ provider?: string; model: string; format: string; ok: boolean; error?: string }>).map((attempt, index) => (
-                                      <div key={index}>
-                                        <p className={cn('font-mono text-[11px]', attempt.ok ? 'text-gain' : 'text-text-1')}>
-                                          {attempt.ok ? '✓' : '✗'} {attempt.provider ? `${attempt.provider}/` : ''}{attempt.model} [{attempt.format}]{attempt.error ? ` — ${attempt.error}` : ''}
-                                        </p>
-                                        {attempt.error && <p className="mt-0.5 text-xs text-text-2">{explainProposalError(attempt.error)}</p>}
-                                      </div>
+                                    <div className="flex flex-wrap items-center justify-between gap-2">
+                                      <p className="text-xs text-text-1">Tentativi per modello, in ordine:</p>
+                                      <CopyTechnicalReportButton attempts={detail.proposal.attempts} runId={detail.run.id} />
+                                    </div>
+                                    {detail.proposal.attempts.map((attempt, index) => (
+                                      <ProposalAttemptRow key={`${attempt.provider ?? 'provider'}-${attempt.model}-${attempt.format ?? 'attempt'}-${index}`} attempt={attempt} explainError />
                                     ))}
                                   </div>
                                 </>

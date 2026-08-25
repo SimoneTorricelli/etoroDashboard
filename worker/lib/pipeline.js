@@ -751,6 +751,7 @@ export async function runPipeline({ env, kind, modeOverride, improveFromRunId = 
       ledgerNotes,
       revisionContext,
       previousModel: previousBundle?.proposal?.model ?? '',
+      previousAttempts: previousBundle?.proposal?.attempts ?? [],
     });
     await saveProposal(db, runId, brain);
     if (!brain.ok) {
