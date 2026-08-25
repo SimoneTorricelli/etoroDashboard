@@ -88,7 +88,9 @@ giudizio) da ciò che non deve sbagliare (i limiti di rischio).
 | `lib/api.js` | Control API autenticata |
 | `lib/mcp.js` | Remote MCP server |
 | `schema.sql` | Schema D1 per migrazione manuale |
-| `selftest.mjs` | 34 test sui guardrail |
+| `lib/strategy.js` | Contratto versionato onboarding → StrategySpec + scenari deterministici |
+| `lib/universe-policy.js` | Catalogo tassonomico e policy dell’universo dinamico |
+| `selftest.mjs` e `*-selftest.mjs` | 77 test deterministici e di regressione |
 
 ### Frontend — `src/`
 
@@ -105,6 +107,7 @@ giudizio) da ciò che non deve sbagliare (i limiti di rischio).
 | `components/autopilot/ModelPicker.tsx` | Provider e modelli AI |
 | `components/autopilot/DiagnosticsPanel.tsx` | Diagnostica |
 | `components/autopilot/WatcherPanel.tsx` | Storico eventi del watcher |
+| `components/autopilot/StrategyOnboarding.tsx` | Onboarding in quattro passi e revisione visuale |
 
 ---
 
@@ -195,6 +198,13 @@ Pool (fino a 200 strumenti)
 Le **posizioni aperte entrano sempre in shortlist**, con qualunque punteggio:
 il modello deve poterle mantenere o vendere, non solo comprare altro.
 
+Con l’onboarding guidato l’utente non sceglie una lista rigida di ticker:
+definisce macro-aree, settori/temi, fascia crypto, consenso separato per meme
+coin, volatilità e concentrazione. Da queste risposte nasce una `StrategySpec`
+versionata; il catalogo genera fino a 60 candidati e lo screening decide nel
+tempo quali portare al modello. Le posizioni già aperte ma fuori policy restano
+visibili e diventano **sell-only**.
+
 Il prompt include i **vincoli temporali** dal registro posizioni, così l'AI non
 propone operazioni che verrebbero comunque bloccate.
 
@@ -227,6 +237,8 @@ Ogni ora: scan deterministico (gratuito)
 - confidence sotto soglia ⇒ si osserva soltanto
 - budget opportunistico separato e piccolo, tetto settimanale, mediazione al
   ribasso limitata
+- lo stesso tetto percentuale per ordine, la riserva di cassa, il massimo
+  posizioni, i cap di classe e l’eligibility eToro valgono anche nel watcher
 
 Costo stimato: 2–5 chiamate AI al mese invece di 720.
 
@@ -287,6 +299,10 @@ cifrate **AES-GCM** su D1, con chiave derivata via SHA-256 da `VAULT_KEY`.
 - i valori non tornano mai indietro: l'API espone solo presenza, provenienza e
   ultime quattro cifre
 - configurabili dalla dashboard senza redeploy
+- il live accetta solo token creati e verificati dal flusso Agent: segreto,
+  portfolio e fingerprint SHA-256 vengono salvati come un’unica tupla atomica
+- sostituire, revocare o far ricadere il token su un Worker Secret invalida il
+  binding e riporta automaticamente l’esecuzione in `shadow`
 
 ### Modifiche difensive al Worker
 
@@ -328,6 +344,8 @@ Tutte le rotte richiedono `Authorization: Bearer <CONTROL_TOKEN>`.
 | POST | `/agent/notify-test` | Test canali di notifica |
 | GET/PUT/DELETE | `/agent/credentials` | Vault |
 | POST | `/agent/agent-token` | Genera token e lo salva nel vault |
+| POST | `/agent/strategy/draft` | Genera e valida la StrategySpec, senza ticker né ordini |
+| POST | `/agent/strategy/activate` | Lega la strategia al portfolio verificato e parte in shadow |
 | GET | `/agent/agent-portfolios` | Elenco Agent Portfolio |
 | GET | `/agent/instruments?q=` | Ricerca nel catalogo eToro |
 | GET | `/agent/models` | Provider e modelli disponibili |
@@ -371,6 +389,10 @@ Telegram e webhook generico, entrambi opzionali e non bloccanti.
 | Modelli musicali in lista | Filtro solo sul prezzo, non sulla modalità | `lyria-3-pro-preview` fra i candidati |
 | 400 sul token | Payload `{name}` invece di `{userTokenName, scopeNames}` | Generazione impossibile |
 | Segreto token non trovato | Lista fissa di chiavi | Token creato ma non recuperabile |
+| Token Agent in 401 immediato | Il parser prendeva `userTokenId` (UUID) prima di `userToken` | Ora accetta solo il segreto ufficiale, lo collauda e non usa fallback GET |
+| Token e portfolio potevano divergere | Segreto e metadata salvati separatamente | Tupla atomica con fingerprint; mismatch bloccato prima dello snapshot |
+| Modalità corrotta poteva inviare ordini | L’executor simulava solo due stringhe e trattava il resto come reale | Fail-closed: solo `live` esatto raggiunge gli endpoint di trading |
+| Riconciliazione congelava piani scalati | Confrontava il target teorico invece degli importi realmente ordinati | Peso atteso ricostruito dagli ordini del piano |
 | Autopilot muto su mobile | `sessionStorage` fallisce su Safari iOS, errore ingoiato, `refresh()` usciva in silenzio | Schermata vuota senza spiegazione |
 | Autopilot invisibile su mobile | Voce solo in sidebar desktop | Pagina irraggiungibile sotto 768px |
 | Artefatti wrangler nel repo | `.gitignore` con tre righe | `.wrangler/tmp/` committato |
@@ -379,8 +401,13 @@ Telegram e webhook generico, entrambi opzionali e non bloccanti.
 
 ## 14. Test
 
-34 test in `worker/selftest.mjs`, eseguibili con `npm run test:worker`. Non
-toccano la rete né il database.
+77 test complessivi, tutti senza rete reale:
+
+- 38 in `worker/selftest.mjs` per feature, guardrail, watcher, executor e
+  riconciliazione
+- 18 in `worker/strategy-selftest.mjs` per onboarding, consenso e StrategySpec
+- 11 in `worker/universe-policy-selftest.mjs` per universo dinamico e sell-only
+- 10 in `worker/token-selftest.mjs` per parsing, 401, fingerprint e atomicità
 
 Coprono: indicatori tecnici, coerenza delle feature, compattezza del prompt,
 estrazione JSON tollerante, normalizzazione delle proposte, tutti i guardrail,
@@ -394,7 +421,7 @@ watcher.
 ```bash
 npm run dev             # dashboard in locale
 npm run build           # build di produzione
-npm run test:worker     # 34 test sui guardrail
+npm run test:worker     # 38 test del motore deterministico
 npm run worker:dev      # Worker in locale
 npm run db:migrate      # schema su D1 remoto
 npm run deploy          # build + deploy su Cloudflare
@@ -417,7 +444,7 @@ diagnostica, vault, UI completa.
 ### Da verificare sul campo
 
 - risoluzione dei simboli dopo la correzione del parser
-- generazione del token dopo la ricerca ricorsiva del segreto
+- generazione e verifica reale di un nuovo token sul portfolio 0405bc2a
 - prima run shadow con una proposta reale
 - comportamento della chiusura parziale su eToro (`action: 'close'` con
   `amount`) — non documentato con certezza, da validare in dry-run

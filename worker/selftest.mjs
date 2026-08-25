@@ -15,6 +15,8 @@ import { checkChurnRules, filterMarginalSubstitutions, isWorthTheCost } from './
 import { buildShortlist, scoreInstrument } from './lib/screening.js';
 import { decideWatcherAction, detectAnomalies, isStabilized, relevantHeadlines } from './lib/watcher.js';
 import { executePlan, reconcile } from './lib/executor.js';
+import { buildAttemptPlan } from './lib/llm.js';
+import { buildCandleRefreshQueue } from './lib/pipeline.js';
 
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -87,6 +89,48 @@ test('prompt compatto sotto i 6000 caratteri', () => {
   const prompt = renderFeaturesPrompt(features, config);
   assert.ok(prompt.length < 6000, `prompt di ${prompt.length} caratteri`);
   assert.ok(prompt.includes('STRUMENTI'));
+});
+
+test('router AI: alterna i provider prima dei modelli secondari', () => {
+  const plan = buildAttemptPlan({
+    config: {
+      ...DEFAULT_CONFIG,
+      llmProviders: ['workers-ai'],
+      llmModels: {
+        'workers-ai': ['workers-legacy'],
+        gemini: ['gemini-custom'],
+        groq: ['groq-custom'],
+        openrouter: ['openrouter/custom'],
+      },
+    },
+    credentials: { geminiApiKey: 'x', groqApiKey: 'x', openrouterApiKey: 'x' },
+    env: { AI: {} },
+  });
+  assert.deepEqual(plan.slice(0, 4).map((entry) => entry.provider), ['workers-ai', 'gemini', 'groq', 'openrouter']);
+  assert.ok(plan.some((entry) => entry.model === 'workers-legacy'));
+});
+
+test('router AI: OpenRouter resta un fallback anche senza modello scelto', () => {
+  const plan = buildAttemptPlan({
+    config: {
+      ...DEFAULT_CONFIG,
+      llmProviders: ['workers-ai'],
+      llmModels: { ...DEFAULT_CONFIG.llmModels, openrouter: [] },
+    },
+    credentials: { openrouterApiKey: 'x' },
+    env: { AI: {} },
+  });
+  assert.ok(plan.some((entry) => entry.provider === 'openrouter' && entry.model === 'openrouter/free'));
+});
+
+test('cache storici: priorità alle posizioni e tetto di refresh', () => {
+  const largeUniverse = new Map(Array.from({ length: 12 }, (_, index) => [
+    `T${index}`,
+    { instrumentId: 3000 + index },
+  ]));
+  const queue = buildCandleRefreshQueue(largeUniverse, {}, { heldInstrumentIds: [3009], limit: 4, now: 1_000 });
+  assert.equal(queue.length, 4);
+  assert.equal(queue[0].meta.instrumentId, 3009);
 });
 
 test('estrazione JSON tollera testo attorno e code fence', () => {

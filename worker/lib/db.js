@@ -41,6 +41,9 @@ export const DEFAULT_CONFIG = {
   strategyName: '',
   strategyGeneratedBy: '',
   strategyScenario: null,
+  strategyDraft: null,
+  strategyCollaboration: null,
+  guidedOnboardingAnswers: null,
   policyUniverse: null,
   shadowStartedAt: 0,
   shadowDays: 14,
@@ -144,10 +147,12 @@ export const DEFAULT_CONFIG = {
   minConfidence: 0.55,
 
   /**
-   * Ordine dei provider AI. Workers AI è primo perché è un binding interno:
-   * non consuma subrequest ed è incluso nel piano gratuito di Cloudflare.
+   * Ordine dei provider AI. Il router prova un modello per provider prima di
+   * tornare al secondo modello dello stesso provider.
    */
   llmProviders: ['workers-ai', 'gemini', 'groq', 'openrouter'],
+  /** Include automaticamente nella cascata gli altri provider con credenziali disponibili. */
+  llmFallbackAcrossProviders: true,
   /** Modelli per provider. Vuoto = si usano i default del provider. */
   llmModels: {
     'workers-ai': ['@cf/openai/gpt-oss-120b', '@cf/nvidia/nemotron-3-120b-a12b', '@cf/qwen/qwen3-30b-a3b-fp8'],
@@ -166,9 +171,12 @@ export const DEFAULT_CONFIG = {
 export const CONFIG_KEY = 'autopilot';
 
 export async function migrate(db) {
-  for (const statement of SCHEMA) {
-    await db.prepare(statement).run();
+  const statements = SCHEMA.map((statement) => db.prepare(statement));
+  if (typeof db.batch === 'function') {
+    await db.batch(statements);
+    return;
   }
+  for (const statement of statements) await statement.run();
 }
 
 function deepMerge(base, override) {
@@ -333,25 +341,36 @@ export async function syncLedger(db, openSymbols) {
   const now = Date.now();
   const ledger = await loadLedger(db);
   const open = new Set(openSymbols);
+  const statements = [];
 
   for (const symbol of open) {
     const row = ledger.get(symbol);
     if (!row) {
-      await db.prepare('INSERT OR REPLACE INTO holdings_ledger (symbol, first_bought_at, last_bought_at, last_sold_at, average_down_count, opportunistic, updated_at) VALUES (?, ?, ?, NULL, 0, 0, ?)')
-        .bind(symbol, now, now, now).run();
+      statements.push(db.prepare('INSERT OR REPLACE INTO holdings_ledger (symbol, first_bought_at, last_bought_at, last_sold_at, average_down_count, opportunistic, updated_at) VALUES (?, ?, ?, NULL, 0, 0, ?)')
+        .bind(symbol, now, now, now));
+      ledger.set(symbol, {
+        symbol, first_bought_at: now, last_bought_at: now, last_sold_at: null,
+        average_down_count: 0, opportunistic: 0, updated_at: now,
+      });
     }
   }
   for (const [symbol, row] of ledger.entries()) {
     if (!open.has(symbol) && !row.last_sold_at) {
-      await db.prepare('UPDATE holdings_ledger SET last_sold_at = ?, updated_at = ? WHERE symbol = ?')
-        .bind(now, now, symbol).run();
+      statements.push(db.prepare('UPDATE holdings_ledger SET last_sold_at = ?, updated_at = ? WHERE symbol = ?')
+        .bind(now, now, symbol));
+      ledger.set(symbol, { ...row, last_sold_at: now, updated_at: now });
     }
     if (open.has(symbol) && row.last_sold_at) {
-      await db.prepare('UPDATE holdings_ledger SET last_sold_at = NULL, last_bought_at = ?, updated_at = ? WHERE symbol = ?')
-        .bind(now, now, symbol).run();
+      statements.push(db.prepare('UPDATE holdings_ledger SET last_sold_at = NULL, last_bought_at = ?, updated_at = ? WHERE symbol = ?')
+        .bind(now, now, symbol));
+      ledger.set(symbol, { ...row, last_sold_at: null, last_bought_at: now, updated_at: now });
     }
   }
-  return loadLedger(db);
+  if (statements.length) {
+    if (typeof db.batch === 'function') await db.batch(statements);
+    else for (const statement of statements) await statement.run();
+  }
+  return ledger;
 }
 
 export async function recordLedgerTrade(db, symbol, side, { opportunistic = false, averagingDown = false } = {}) {
@@ -403,11 +422,12 @@ export async function countOpportunisticThisWeek(db) {
 // ------------------------------------------------------ cache universo
 
 export async function cacheUniverse(db, entries) {
-  for (const entry of entries) {
-    await db.prepare('INSERT OR REPLACE INTO universe_cache (symbol, instrument_id, name, asset_class, matched_as, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
-      .bind(entry.symbol, entry.instrumentId, entry.name ?? '', entry.class ?? '', entry.matchedAs ?? entry.symbol, Date.now())
-      .run();
-  }
+  if (!entries.length) return;
+  const now = Date.now();
+  const statements = entries.map((entry) => db.prepare('INSERT OR REPLACE INTO universe_cache (symbol, instrument_id, name, asset_class, matched_as, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .bind(entry.symbol, entry.instrumentId, entry.name ?? '', entry.class ?? '', entry.matchedAs ?? entry.symbol, now));
+  if (typeof db.batch === 'function') await db.batch(statements);
+  else for (const statement of statements) await statement.run();
 }
 
 export async function loadUniverseCache(db) {

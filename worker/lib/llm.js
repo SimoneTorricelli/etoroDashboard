@@ -2,12 +2,13 @@
  * Astrazione multi-provider per il livello linguistico.
  *
  * OpenRouter sta ritirando progressivamente le varianti `:free`, quindi non può
- * essere l'unica strada. Workers AI gira dentro il Worker come binding: non
- * consuma subrequest, è incluso nel piano gratuito di Cloudflare ed è sempre
- * disponibile. È quindi il provider predefinito, con gli altri come fallback.
+ * essere l'unica strada. Workers AI usa un binding Cloudflare, ma la chiamata al
+ * servizio rientra comunque nel budget dell'invocazione: la cascata deve quindi
+ * poter passare subito anche a provider esterni configurati.
  */
 
 const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
+const PROVIDER_FALLBACK_ORDER = ['workers-ai', 'gemini', 'groq', 'openrouter'];
 
 /**
  * Modelli testuali di Workers AI adatti a ragionamento strutturato.
@@ -24,7 +25,7 @@ export const PROVIDERS = {
   'workers-ai': {
     id: 'workers-ai',
     label: 'Cloudflare Workers AI',
-    note: 'Incluso nel piano gratuito di Cloudflare. Gira dentro il Worker: nessuna chiave, nessun limite di subrequest.',
+    note: 'Binding Cloudflare senza chiave separata. Condivide i limiti operativi dell’invocazione del Worker.',
     needsKey: false,
     defaultModels: WORKERS_AI_MODELS.slice(0, 2),
   },
@@ -33,7 +34,9 @@ export const PROVIDERS = {
     label: 'OpenRouter',
     note: 'Catalogo ampio. Le varianti :free vengono ritirate spesso: verifica la disponibilità dalla Diagnostica.',
     needsKey: 'openrouterApiKey',
-    defaultModels: [],
+    // Fallback ufficiale di OpenRouter: se l'utente non ha scelto un modello
+    // specifico, il router seleziona un modello gratuito compatibile con JSON.
+    defaultModels: ['openrouter/free'],
   },
   gemini: {
     id: 'gemini',
@@ -87,7 +90,7 @@ async function callOpenRouter({ apiKey, model, messages, temperature, maxTokens,
   }
   const content = extractText(payload);
   if (!content) throw new Error('risposta senza contenuto');
-  return { content, usage: payload?.usage ?? null };
+  return { content, usage: payload?.usage ?? null, resolvedModel: payload?.model ?? model };
 }
 
 async function callWorkersAi({ ai, model, messages, temperature, maxTokens }) {
@@ -154,14 +157,36 @@ async function callGroq({ apiKey, model, messages, temperature, maxTokens, jsonM
  * Chi non ha la chiave necessaria viene saltato senza sprecare un tentativo.
  */
 export function buildAttemptPlan({ config, credentials, env }) {
-  const plan = [];
-  for (const providerId of config.llmProviders ?? ['workers-ai']) {
+  const requested = Array.isArray(config.llmProviders) && config.llmProviders.length
+    ? config.llmProviders
+    : ['workers-ai'];
+  // Le vecchie configurazioni salvavano soltanto Workers AI. Salvo opt-out
+  // esplicito, aggiungiamo in coda ogni provider oggi disponibile e proviamo un
+  // modello per provider prima di tornare al secondo modello dello stesso.
+  const providerIds = config.llmFallbackAcrossProviders === false
+    ? [...new Set(requested)]
+    : [...new Set([...requested, ...PROVIDER_FALLBACK_ORDER])];
+  const routes = [];
+  for (const providerId of providerIds) {
     const provider = PROVIDERS[providerId];
     if (!provider) continue;
     if (provider.needsKey && !credentials?.[provider.needsKey]) continue;
     if (providerId === 'workers-ai' && !env?.AI) continue;
-    const models = (config.llmModels?.[providerId] ?? provider.defaultModels ?? []).filter(Boolean);
-    for (const model of models) plan.push({ provider: providerId, model });
+    const configuredModels = Array.isArray(config.llmModels?.[providerId])
+      ? config.llmModels[providerId]
+      : [];
+    const models = providerId === 'openrouter'
+      ? [...new Set([...configuredModels, ...(provider.defaultModels ?? [])].filter(Boolean))]
+      : [...new Set([...(provider.defaultModels ?? []), ...configuredModels].filter(Boolean))];
+    if (models.length) routes.push({ provider: providerId, models });
+  }
+
+  const plan = [];
+  const depth = Math.max(0, ...routes.map((route) => route.models.length));
+  for (let index = 0; index < depth; index += 1) {
+    for (const route of routes) {
+      if (route.models[index]) plan.push({ provider: route.provider, model: route.models[index] });
+    }
   }
   return plan;
 }

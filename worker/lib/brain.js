@@ -191,7 +191,7 @@ export async function askBrain({ config, credentials, env, featuresPrompt, allow
       if (attempts.length >= 10) break;
       const label = jsonMode ? 'json' : 'text';
       try {
-        const { content, usage } = await callModel({ ...entry, messages, config, credentials, env, jsonMode });
+        const { content, usage, resolvedModel } = await callModel({ ...entry, messages, config, credentials, env, jsonMode });
         const normalized = normalizeProposal(extractJson(content), allowedSymbols);
         if (!normalized.ok) {
           attempts.push({ ...entry, format: label, ok: false, error: normalized.error });
@@ -200,7 +200,7 @@ export async function askBrain({ config, credentials, env, featuresPrompt, allow
         attempts.push({ ...entry, format: label, ok: true, usage });
         return {
           ok: true,
-          model: `${entry.provider}/${entry.model}`,
+          model: `${entry.provider}/${resolvedModel ?? entry.model}`,
           attempts,
           rawText: content,
           promptChars: userPrompt.length + systemPrompt.length,

@@ -238,7 +238,7 @@ export class EtoroClient {
    * Ricerca strumenti con più strategie di query: eToro accetta parametri
    * diversi a seconda dell'endpoint, e una sola forma non basta.
    */
-  async searchInstruments(term) {
+  async searchInstruments(term, { maxAttempts = 5 } = {}) {
     const query = String(term ?? '').trim();
     if (!query) return [];
     const attempts = [
@@ -249,7 +249,7 @@ export class EtoroClient {
       `market-data/search?name=${encodeURIComponent(query)}`,
     ];
     const seen = new Map();
-    for (const path of attempts) {
+    for (const path of attempts.slice(0, Math.max(1, maxAttempts))) {
       let rows = [];
       try {
         rows = EtoroClient.searchRows(await this.request('v1', path));
@@ -276,19 +276,18 @@ export class EtoroClient {
    * Risoluzione di un ticker in instrumentId. Prova il simbolo così com'è, poi
    * le varianti comuni (senza suffisso di borsa, con suffisso USD per le crypto).
    */
-  async searchInstrument(symbol) {
+  async searchInstrument(symbol, { tryUsd = true, maxQueriesPerVariant = 5 } = {}) {
     const original = String(symbol ?? '').trim().toUpperCase();
     if (!original) return null;
     const variants = [...new Set([
       original,
       original.split('.')[0],
       original.replace(/\.[A-Z]+$/, ''),
-      `${original}USD`,
-      original.replace(/USD$/, ''),
+      ...(tryUsd ? [`${original}USD`, original.replace(/USD$/, '')] : []),
     ])].filter(Boolean);
 
     for (const variant of variants) {
-      const candidates = await this.searchInstruments(variant);
+      const candidates = await this.searchInstruments(variant, { maxAttempts: maxQueriesPerVariant });
       const exact = candidates.find((item) => item.aliases.includes(variant));
       if (exact) return { ...exact, symbol: original, matchedAs: exact.aliases[0], exact: true };
       if (candidates.length && variant === original) {

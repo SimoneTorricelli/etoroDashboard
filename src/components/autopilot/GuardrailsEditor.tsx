@@ -109,6 +109,9 @@ export function GuardrailsEditor({ config, onSaved }: Props) {
         maxAverageDown: draft.maxAverageDown,
         stabilizationBars: draft.stabilizationBars,
         watcherMinConfidence: draft.watcherMinConfidence,
+        llmProviders: draft.llmProviders,
+        llmModels: draft.llmModels,
+        llmFallbackAcrossProviders: draft.llmFallbackAcrossProviders ?? true,
       });
       if (result.rejected.length) toast.warning(`Alcuni valori sono stati scartati: ${result.rejected.join(' · ')}`);
       else toast.success('Guardrail aggiornati');
@@ -191,7 +194,7 @@ export function GuardrailsEditor({ config, onSaved }: Props) {
                 onChange={(event) => set('rebalanceHour', Number(event.target.value))} />
             </Field>
 
-            <Field label="Budget (EUR)" help="Capitale nominale gestito. Serve a dimensionare gli ordini: tienilo allineato a quanto hai davvero sull’Agent Portfolio.">
+            <Field label="Capitale reale allocato (EUR)" help="Quanto hai realmente investito nel copy dell’Agent Portfolio (es. 200 €), non la base virtuale eToro da 10.000 USD. Serve a mostrare gli importi reali equivalenti.">
               <Input type="number" min={10} step={10} value={draft.budgetEur}
                 onChange={(event) => set('budgetEur', Number(event.target.value))} />
             </Field>
@@ -384,7 +387,8 @@ export function GuardrailsEditor({ config, onSaved }: Props) {
             </div>
           </div>
           <p className="text-xs leading-relaxed text-text-1">
-            L’AI può proporre solo questi ticker. Qualunque simbolo fuori lista fa scartare l’intera proposta.
+            Questo è il catalogo di candidati generato dalle tue preferenze, non il portafoglio finale: lo screening quantitativo crea una shortlist e soltanto dopo l’AI sceglie strumenti e pesi.
+            Qualunque simbolo fuori lista fa scartare l’intera proposta.
             Il tetto è il peso massimo che quello strumento può raggiungere in portafoglio. La somma dei tetti deve superare il 100%, altrimenti l’allocazione non è realizzabile.
           </p>
 

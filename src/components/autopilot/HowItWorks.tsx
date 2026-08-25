@@ -8,7 +8,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from '@/components/ui/accordion';
 
 const PIPELINE = [
-  { icon: Database, title: 'Fotografa', text: 'Legge da eToro il portafoglio dell’agente: equity, liquidità, posizioni aperte e prezzi.' },
+  { icon: Database, title: 'Fotografa', text: 'Legge da eToro la base virtuale dell’Agent Portfolio: equity, liquidità, posizioni aperte e prezzi. Il capitale reale la copia in proporzione.' },
   { icon: Brain, title: 'Calcola', text: 'Il Worker calcola da solo rendimenti, volatilità, drawdown, RSI, momentum e il regime di mercato (VIX, S&P 500, curva dei tassi, notizie). Nessuna AI, solo matematica.' },
   { icon: Radio, title: 'Chiede un parere', text: 'Manda quei numeri a un modello AI gratuito su OpenRouter. Il modello risponde con una sola cosa: quale allocazione percentuale terrebbe, e quanto ne è sicuro.' },
   { icon: ShieldCheck, title: 'Verifica', text: 'Il codice controlla la proposta contro i tuoi limiti. Se sfora un tetto la riduce; se è troppo incerta o l’agente è congelato, la scarta del tutto. L’AI non può aggirare nulla.' },
@@ -22,7 +22,7 @@ const MODES = [
 ];
 
 const ACTIONS = [
-  { title: 'Snapshot', text: 'Legge il portafoglio e aggiorna gli indicatori. Non coinvolge l’AI e non genera ordini. È l’operazione che alimenta la curva di equity e il controllo sul drawdown.' },
+  { title: 'Snapshot', text: 'Legge la base virtuale del portfolio e aggiorna gli indicatori. Non coinvolge l’AI e non genera ordini. Alimenta la curva percentuale e il controllo sul drawdown.' },
   { title: 'Run (ribilanciamento)', text: 'Il ciclo completo: fotografa, calcola, chiede all’AI, verifica e — secondo la modalità — esegue. È quello che parte in automatico alla cadenza configurata.' },
   { title: 'Congela', text: 'Blocco immediato. Nessuna run potrà più generare ordini finché non riattivi. Scatta anche da solo se il drawdown supera la soglia.' },
 ];

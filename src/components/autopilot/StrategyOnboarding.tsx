@@ -40,6 +40,8 @@ import {
   YAxis,
 } from 'recharts';
 import { cn } from '@/lib/utils';
+import type { StrategyCollaboration, StrategyTraceEvent } from '@/lib/agent/autopilot-api';
+import { StrategyCollaborationTrace } from './StrategyCollaborationTrace';
 import './strategy-onboarding.css';
 
 export type StrategyOnboardingStep = 'goals' | 'preferences' | 'guardrails' | 'review';
@@ -57,7 +59,7 @@ export interface StrategyOnboardingPortfolio {
   id: string;
   name: string;
   subtitle?: string;
-  balanceEur?: number;
+  virtualBalanceUsd?: number;
   status?: 'connected' | 'needs-token' | 'unavailable';
 }
 
@@ -130,6 +132,9 @@ export interface StrategyOnboardingProps {
   onGenerate?: (answers: StrategyOnboardingAnswers) => Promise<StrategyOnboardingDraft>;
   onActivate?: (draft: StrategyOnboardingDraft, answers: StrategyOnboardingAnswers) => Promise<void>;
   onStepChange?: (step: StrategyOnboardingStep) => void;
+  generationTrace?: StrategyTraceEvent[];
+  collaboration?: StrategyCollaboration | null;
+  readOnly?: boolean;
 }
 
 const DEFAULT_PORTFOLIO: StrategyOnboardingPortfolio = {
@@ -147,7 +152,7 @@ export const DEFAULT_STRATEGY_ONBOARDING_ANSWERS: StrategyOnboardingAnswers = {
   strategyName: 'Dinamico consapevole',
   objective: 'balanced-growth',
   horizonMonths: 12,
-  budgetEur: 5_000,
+  budgetEur: 250,
   macroPreferences: ['global-equities', 'technology', 'healthcare', 'crypto-large-cap'],
   cryptoPreference: 'majors',
   excludeMemeCoins: true,
@@ -355,6 +360,9 @@ export function StrategyOnboarding({
   onGenerate,
   onActivate,
   onStepChange,
+  generationTrace = [],
+  collaboration = null,
+  readOnly = false,
 }: StrategyOnboardingProps) {
   const idPrefix = useId().replace(/:/g, '');
   const availablePortfolios = portfolios?.length ? portfolios : [DEFAULT_PORTFOLIO];
@@ -497,7 +505,7 @@ export function StrategyOnboarding({
               <li key={item.id} data-active={active || undefined} data-completed={completed || undefined}>
                 <button
                   type="button"
-                  disabled={!reachable || busy !== null}
+                  disabled={readOnly || !reachable || busy !== null}
                   aria-current={active ? 'step' : undefined}
                   aria-label={`${item.label}, passo ${index + 1} di ${STEPS.length}${completed ? ', completato' : active ? ', corrente' : ''}`}
                   onClick={() => reachable && setStep(item.id)}
@@ -546,7 +554,12 @@ export function StrategyOnboarding({
                       ))}
                     </select>
                     <span>{selectedPortfolio.subtitle ?? portfolioStatusCopy(selectedPortfolio.status)}</span>
-                    <small>{selectedPortfolio.id}</small>
+                    <small>
+                      {selectedPortfolio.id}
+                      {selectedPortfolio.virtualBalanceUsd
+                        ? ` · base virtuale eToro ${NUMBER_FORMAT.format(selectedPortfolio.virtualBalanceUsd)} USD`
+                        : ''}
+                    </small>
                   </div>
                   <span className={cn('so-connection-chip', selectedPortfolio.status === 'needs-token' && 'is-warning')}>
                     <span aria-hidden /> {selectedPortfolio.status === 'needs-token' ? 'Token da verificare' : 'Connesso'}
@@ -596,7 +609,7 @@ export function StrategyOnboarding({
                   <small>Lo potrai cambiare anche dopo.</small>
                 </div>
                 <div className="so-field">
-                  <label htmlFor={`${idPrefix}-budget`}>Budget gestito</label>
+                  <label htmlFor={`${idPrefix}-budget`}>Capitale reale allocato</label>
                   <div className="so-money-input">
                     <span aria-hidden>€</span>
                     <input
@@ -608,7 +621,7 @@ export function StrategyOnboarding({
                       onChange={(event) => patchAnswers('budgetEur', Math.max(0, Number(event.target.value)))}
                     />
                   </div>
-                  <small>Serve a dimensionare posizioni e ordini.</small>
+                  <small>Inserisci quanto hai realmente investito nel copy dell’Agent Portfolio (es. 200 €), non i 10.000 USD virtuali mostrati da eToro.</small>
                 </div>
               </div>
 
@@ -634,7 +647,7 @@ export function StrategyOnboarding({
               <div className="so-side-note-icon"><Activity size={22} aria-hidden /></div>
               <p className="so-side-kicker">Profilo in costruzione</p>
               <h2>{OBJECTIVES.find((item) => item.id === answers.objective)?.title}</h2>
-              <p>Con {NUMBER_FORMAT.format(answers.budgetEur)} € su un orizzonte di {answers.horizonMonths} mesi, ogni limite verrà tradotto anche in importi reali.</p>
+              <p>Con {NUMBER_FORMAT.format(answers.budgetEur)} € reali su un orizzonte di {answers.horizonMonths} mesi, le percentuali della base virtuale eToro verranno replicate in proporzione.</p>
               <dl>
                 <div><dt>Portfolio</dt><dd>{selectedPortfolio.name}</dd></div>
                 <div><dt>Modalità iniziale</dt><dd>Shadow</dd></div>
@@ -861,7 +874,7 @@ export function StrategyOnboarding({
               <div className="so-selected-portfolio">
                 <span className="so-portfolio-icon" aria-hidden><BriefcaseBusiness size={22} /></span>
                 <div><small>Portfolio selezionato</small><strong>{selectedPortfolio.name}</strong><span>{selectedPortfolio.subtitle ?? portfolioStatusCopy(selectedPortfolio.status)}</span></div>
-                <button type="button" onClick={() => setStep('goals')}>Cambia portfolio</button>
+                {!readOnly ? <button type="button" onClick={() => setStep('goals')}>Cambia portfolio</button> : null}
               </div>
 
               <div className="so-review-section">
@@ -899,7 +912,7 @@ export function StrategyOnboarding({
                   <p>La strategia è vincolata ai limiti che hai definito.</p>
                   <small>Rischio massimo · Drawdown massimo · Esposizione per asset · Limiti per settore · Liquidità minima · Orizzonte temporale</small>
                 </div>
-                <button type="button" onClick={() => setStep('guardrails')}>Visualizza dettagli</button>
+                {!readOnly ? <button type="button" onClick={() => setStep('guardrails')}>Visualizza dettagli</button> : null}
               </div>
             </main>
 
@@ -982,6 +995,7 @@ export function StrategyOnboarding({
                   max={30}
                   step={1}
                   value={reviewRiskPct}
+                  disabled={readOnly}
                   onChange={(event) => setReviewRiskPct(Number(event.target.value))}
                   aria-describedby={`${idPrefix}-review-risk-help`}
                 />
@@ -993,13 +1007,21 @@ export function StrategyOnboarding({
                 <p id={`${idPrefix}-review-risk-help`}>Puoi stringere il limite prima di attivare; il nuovo valore sarà applicato alla bozza.</p>
               </section>
 
-              <button className="so-activate-button" type="button" disabled={busy !== null || activated} onClick={() => void activate()}>
-                {busy === 'activating' ? <LoaderCircle className="so-spin" size={22} aria-hidden /> : activated ? <CheckCircle2 size={22} aria-hidden /> : <Play size={22} aria-hidden />}
-                {busy === 'activating' ? 'Attivazione in corso…' : activated ? 'Strategia attivata in shadow' : 'Avvia in modalità shadow'}
-              </button>
-              <p className={cn('so-shadow-note', activated && 'is-success')}>
+              {readOnly ? (
+                <div className="so-activate-button" aria-label="Strategia già attiva in modalità shadow">
+                  <CheckCircle2 size={22} aria-hidden /> Strategia attiva in shadow
+                </div>
+              ) : (
+                <button className="so-activate-button" type="button" disabled={busy !== null || activated} onClick={() => void activate()}>
+                  {busy === 'activating' ? <LoaderCircle className="so-spin" size={22} aria-hidden /> : activated ? <CheckCircle2 size={22} aria-hidden /> : <Play size={22} aria-hidden />}
+                  {busy === 'activating' ? 'Attivazione in corso…' : activated ? 'Strategia attivata in shadow' : 'Avvia in modalità shadow'}
+                </button>
+              )}
+              <p className={cn('so-shadow-note', (activated || readOnly) && 'is-success')}>
                 <ShieldCheck size={16} aria-hidden />
-                {activated
+                {readOnly
+                  ? 'Questa è la scheda salvata nel Worker per la strategia attiva.'
+                  : activated
                   ? `Attiva in shadow: monitoraggio avviato per ${draft.shadowDays} giorni.`
                   : `La strategia opererà in shadow per ${draft.shadowDays} giorni. Nessun ordine reale verrà eseguito.`}
               </p>
@@ -1016,6 +1038,17 @@ export function StrategyOnboarding({
           </div>
         ) : null}
       </div>
+
+      {generationTrace.length || collaboration ? (
+        <div className="so-collaboration-wrap">
+          <StrategyCollaborationTrace
+            events={generationTrace}
+            collaboration={collaboration}
+            live={busy === 'generating'}
+            compact={step !== 'review'}
+          />
+        </div>
+      ) : null}
 
       {error ? (
         <div className="so-error" role="alert">

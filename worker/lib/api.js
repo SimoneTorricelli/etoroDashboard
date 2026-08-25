@@ -4,7 +4,7 @@
  * esplicita aggiuntiva.
  */
 import { runPipeline } from './pipeline.js';
-import { listFreeModels } from './brain.js';
+import { extractJson, listFreeModels } from './brain.js';
 import { notify, notifyTest } from './notify.js';
 import {
   clearCredentials, describeCredentials, hasVerifiedAgentBinding, resolveCredentials,
@@ -116,7 +116,7 @@ export function sanitizeConfigPatch(patch) {
       rejected.push('strategyProfile: usa POST /agent/profile');
       continue;
     }
-    if (key === 'watcherEnabled') {
+    if (key === 'watcherEnabled' || key === 'llmFallbackAcrossProviders') {
       out[key] = Boolean(value);
       continue;
     }
@@ -360,37 +360,339 @@ function strategyPreview(spec, guided, scenario) {
   };
 }
 
-async function generateGuidedStrategy({ rawAnswers, config, credentials, env }) {
+/** Ricostruisce la scheda leggibile per strategie create prima del salvataggio della review. */
+function hydrateGuidedReview(config) {
+  if (!config?.onboardingComplete || config.strategyDraft || !config.strategySpec || !config.strategyScenario) return config;
+  const spec = config.strategySpec;
+  const assetClasses = Array.isArray(spec.universePolicy?.assetClasses) ? spec.universePolicy.assetClasses : [];
+  const sectors = [
+    ...(Array.isArray(spec.universePolicy?.sectors?.include) ? spec.universePolicy.sectors.include : []),
+    ...(Array.isArray(spec.universePolicy?.sectors?.prefer) ? spec.universePolicy.sectors.prefer : []),
+  ];
+  const themes = [
+    ...(Array.isArray(spec.universePolicy?.themes?.include) ? spec.universePolicy.themes.include : []),
+    ...(Array.isArray(spec.universePolicy?.themes?.prefer) ? spec.universePolicy.themes.prefer : []),
+  ];
+  const macroPreferences = [];
+  if (assetClasses.some((item) => ['stock', 'etf'].includes(item))) macroPreferences.push('global-equities');
+  if (sectors.includes('technology') || themes.some((item) => ['artificial-intelligence', 'semiconductors'].includes(item))) macroPreferences.push('technology');
+  if (sectors.includes('healthcare') || themes.includes('healthcare-innovation')) macroPreferences.push('healthcare');
+  if (assetClasses.includes('crypto') && spec.universePolicy?.crypto?.enabled) macroPreferences.push('crypto-large-cap');
+  if (assetClasses.includes('bond')) macroPreferences.push('bonds');
+  if (assetClasses.includes('commodity')) macroPreferences.push('commodities');
+  if (!macroPreferences.length) macroPreferences.push('global-equities');
+  const objective = {
+    income: 'dividends',
+    'capital-preservation': 'capital-preservation',
+    tactical: 'tactical',
+  }[spec.objective?.primary] ?? 'balanced-growth';
+  const cryptoTiers = spec.universePolicy?.crypto?.tiers ?? [];
+  const guided = {
+    portfolioId: config.activeAgentPortfolioId,
+    strategyName: spec.name,
+    objective,
+    horizonMonths: spec.objective?.horizonMonths ?? config.strategyScenario.horizonMonths ?? 12,
+    budgetEur: spec.capital?.budgetEur ?? config.budgetEur,
+    macroPreferences,
+    cryptoPreference: !spec.universePolicy?.crypto?.enabled
+      ? 'none'
+      : spec.universePolicy.crypto.allowMeme
+        ? 'meme-opt-in'
+        : cryptoTiers.some((item) => item !== 'large-cap') ? 'broad' : 'majors',
+    excludeMemeCoins: !spec.universePolicy?.crypto?.allowMeme,
+    maxHoldings: spec.diversification?.maxPositions ?? config.maxHoldings,
+    cashTargetPct: Math.max(0, 100 - Number(spec.capital?.targetDeploymentPct ?? 97)),
+    maxDrawdownPct: spec.risk?.maxDrawdownPct ?? config.drawdownStopPct * 100,
+    maxAssetPct: spec.diversification?.maxInstrumentWeightPct ?? 20,
+    maxSectorPct: spec.diversification?.maxSectorWeightPct ?? 35,
+    maxTurnoverPct: spec.execution?.maxTurnoverPct ?? config.maxTurnoverPct * 100,
+    minHoldingDays: config.minHoldingDays,
+    shadowDays: config.shadowDays,
+  };
+  return {
+    ...config,
+    strategyDraft: strategyPreview(spec, guided, config.strategyScenario),
+    guidedOnboardingAnswers: guided,
+  };
+}
+
+function safeTraceText(value, fallback = '') {
+  const text = String(value ?? fallback).replace(/\s+/g, ' ').trim();
+  return text.slice(0, 360);
+}
+
+function normalizeReview(raw, reviewer) {
+  const parsed = typeof raw === 'string' ? extractJson(raw) : raw;
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const verdict = parsed.verdict === 'revise' ? 'revise' : parsed.verdict === 'approve' ? 'approve' : null;
+  if (!verdict) return null;
+  const list = (value) => (Array.isArray(value) ? value : [])
+    .map((item) => safeTraceText(item))
+    .filter(Boolean)
+    .slice(0, 3);
+  return {
+    reviewer,
+    verdict,
+    summary: safeTraceText(parsed.summary, verdict === 'approve' ? 'Policy coerente con i vincoli dichiarati.' : 'Sono richieste correzioni prima della validazione.'),
+    strengths: list(parsed.strengths),
+    concerns: list(parsed.concerns),
+    requiredChanges: list(parsed.requiredChanges),
+    confidence: Math.max(0, Math.min(1, Number(parsed.confidence) || 0)),
+  };
+}
+
+function buildReviewMessages(answers, spec) {
+  return [
+    {
+      role: 'system',
+      content: [
+        'Sei un revisore indipendente di policy di portafoglio.',
+        'Valuta la StrategySpec rispetto al consenso dell’onboarding, diversificazione, rischio, liquidità ed eseguibilità con il budget.',
+        'Non mostrare ragionamenti interni o chain-of-thought: restituisci soltanto un verdetto sintetico e verificabile.',
+        'Non proporre ticker, ordini, leva, short o promesse di rendimento.',
+        'Rispondi con JSON puro: {"verdict":"approve|revise","summary":"...","strengths":["..."],"concerns":["..."],"requiredChanges":["..."],"confidence":0.0}.',
+      ].join('\n'),
+    },
+    {
+      role: 'user',
+      content: `ONBOARDING_JSON_BEGIN\n${JSON.stringify(answers)}\nONBOARDING_JSON_END\n\nSTRATEGY_SPEC_JSON_BEGIN\n${JSON.stringify(spec)}\nSTRATEGY_SPEC_JSON_END`,
+    },
+  ];
+}
+
+function buildSynthesisMessages(prompt, spec, reviews) {
+  return [
+    { role: 'system', content: prompt.system },
+    {
+      role: 'user',
+      content: [
+        prompt.user,
+        '',
+        'STRATEGY_SPEC_DA_REVISIONARE_BEGIN',
+        JSON.stringify(spec),
+        'STRATEGY_SPEC_DA_REVISIONARE_END',
+        '',
+        'REVISIONI_INDIPENDENTI_BEGIN',
+        JSON.stringify(reviews.map(({ reviewer, verdict, summary, concerns, requiredChanges }) => ({ reviewer, verdict, summary, concerns, requiredChanges }))),
+        'REVISIONI_INDIPENDENTI_END',
+        '',
+        'Integra solo le correzioni compatibili con onboarding e schema. Restituisci la StrategySpec completa in JSON puro.',
+      ].join('\n'),
+    },
+  ];
+}
+
+function sanitizeStrategyCollaboration(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const trace = (Array.isArray(raw.trace) ? raw.trace : []).slice(0, 30).map((event, index) => ({
+    id: safeTraceText(event?.id, `trace-${index + 1}`).slice(0, 80),
+    at: Number(event?.at) || Date.now(),
+    stage: ['intake', 'lead', 'review', 'synthesis', 'deterministic', 'complete'].includes(event?.stage) ? event.stage : 'review',
+    status: ['running', 'passed', 'warning', 'failed'].includes(event?.status) ? event.status : 'warning',
+    title: safeTraceText(event?.title, 'Passaggio di revisione'),
+    model: event?.model ? safeTraceText(event.model).slice(0, 160) : null,
+    summary: safeTraceText(event?.summary),
+    handoff: (Array.isArray(event?.handoff) ? event.handoff : []).map((item) => safeTraceText(item)).filter(Boolean).slice(0, 5),
+    details: (Array.isArray(event?.details) ? event.details : []).map((item) => safeTraceText(item)).filter(Boolean).slice(0, 5),
+  }));
+  const reviews = (Array.isArray(raw.reviews) ? raw.reviews : []).slice(0, 3)
+    .map((review) => normalizeReview(review, safeTraceText(review?.reviewer, 'Revisore AI')))
+    .filter(Boolean);
+  return {
+    version: 1,
+    mode: 'multi-model-review',
+    status: ['validated', 'validated-with-warnings', 'deterministic-fallback'].includes(raw.status)
+      ? raw.status
+      : 'validated-with-warnings',
+    leadModel: raw.leadModel ? safeTraceText(raw.leadModel).slice(0, 160) : null,
+    reviewerModels: (Array.isArray(raw.reviewerModels) ? raw.reviewerModels : []).map((item) => safeTraceText(item)).filter(Boolean).slice(0, 3),
+    finalModel: raw.finalModel ? safeTraceText(raw.finalModel).slice(0, 160) : null,
+    reviews,
+    trace,
+  };
+}
+
+async function generateGuidedStrategy({ rawAnswers, config, credentials, env, onTrace = () => {} }) {
   const { answers, guided } = guidedAnswersToContract(rawAnswers);
   const prompt = buildStrategyPrompt(answers);
   let spec = buildSafeStrategySpec(answers);
   let source = 'deterministic';
   let model = null;
   const attempts = [];
+  const trace = [];
+  const reviews = [];
+  let traceIndex = 0;
+  const emit = (stage, status, title, summary, extra = {}) => {
+    const event = {
+      id: `strategy-${++traceIndex}`,
+      at: Date.now(),
+      stage,
+      status,
+      title: safeTraceText(title),
+      summary: safeTraceText(summary),
+      ...(extra.model ? { model: safeTraceText(extra.model).slice(0, 160) } : {}),
+      ...(extra.handoff ? { handoff: extra.handoff.map((item) => safeTraceText(item)).filter(Boolean).slice(0, 5) } : {}),
+      ...(extra.details ? { details: extra.details.map((item) => safeTraceText(item)).filter(Boolean).slice(0, 5) } : {}),
+    };
+    trace.push(event);
+    try { onTrace(event); } catch { /* la telemetria UI non deve fermare la strategia */ }
+    return event;
+  };
+
+  emit('intake', 'passed', 'Preferenze tradotte in vincoli', 'Obiettivo, budget, rischio e macro-preferenze sono diventati un contratto strutturato.', {
+    handoff: ['Onboarding normalizzato', 'Vincoli di consenso', 'Baseline prudenziale'],
+  });
+
   const llmConfig = { ...config, llmTemperature: Math.min(0.2, config.llmTemperature), llmMaxTokens: Math.max(3200, config.llmMaxTokens) };
-  for (const attempt of buildAttemptPlan({ config: llmConfig, credentials, env }).slice(0, 3)) {
+  const plan = buildAttemptPlan({ config: llmConfig, credentials, env });
+  let leadAttempt = null;
+  for (const attempt of plan.slice(0, 6)) {
+    const attemptModel = `${attempt.provider}/${attempt.model}`;
+    emit('lead', 'running', 'Modello guida al lavoro', 'Il modello migliore disponibile sta costruendo la StrategySpec entro i vincoli scelti.', {
+      model: attemptModel,
+      handoff: ['Onboarding normalizzato', 'Schema StrategySpec', 'Baseline prudenziale'],
+    });
     try {
       const response = await callModel({ ...attempt, messages: prompt.messages, config: llmConfig, credentials, env, jsonMode: true, timeoutMs: 55_000 });
+      const resolvedAttemptModel = `${attempt.provider}/${response.resolvedModel ?? attempt.model}`;
       const normalized = normalizeAiStrategySpec(response.content, answers);
       if (!normalized.ok) {
         attempts.push({ ...attempt, ok: false, error: normalized.error });
+        emit('lead', 'failed', 'Proposta non conforme', 'La risposta non rispettava schema o consenso ed è stata scartata senza applicarla.', { model: attemptModel });
         continue;
       }
       spec = normalized.value;
       source = 'ai';
-      model = `${attempt.provider}/${attempt.model}`;
+      model = resolvedAttemptModel;
+      leadAttempt = attempt;
       attempts.push({ ...attempt, ok: true });
+      emit('lead', 'passed', 'Prima proposta pronta', 'La policy è completa e può passare ai revisori indipendenti.', {
+        model: resolvedAttemptModel,
+        handoff: ['StrategySpec strutturata', 'Limiti di rischio', 'Regole di universo dinamico'],
+      });
       break;
     } catch (error) {
       attempts.push({ ...attempt, ok: false, error: error instanceof Error ? error.message : String(error) });
+      emit('lead', 'failed', 'Modello non disponibile', 'Il router passa al provider successivo senza interrompere la creazione.', {
+        model: attemptModel,
+        details: [error instanceof Error ? error.message : String(error)],
+      });
     }
   }
+
+  if (!leadAttempt) {
+    emit('lead', 'warning', 'Baseline prudenziale utilizzata', 'Nessun modello ha restituito una policy valida: la strategia continua dalla baseline deterministica.', {
+      handoff: ['Baseline prudenziale', 'Vincoli di consenso', 'Controlli di fattibilità'],
+    });
+  }
+
+  const remaining = plan.filter((attempt) => !leadAttempt || attempt.provider !== leadAttempt.provider || attempt.model !== leadAttempt.model);
+  const diverse = [
+    ...remaining.filter((attempt, index, all) => all.findIndex((item) => item.provider === attempt.provider) === index),
+    ...remaining.filter((attempt, index, all) => all.findIndex((item) => item.provider === attempt.provider) !== index),
+  ];
+  const reviewerModels = [];
+  const reviewedRoutes = new Set();
+  for (const attempt of diverse.slice(0, 6)) {
+    if (reviews.length >= 2) break;
+    const reviewer = `${attempt.provider}/${attempt.model}`;
+    emit('review', 'running', `Revisione ${reviews.length + 1}`, 'Un modello indipendente controlla consenso, rischio, diversificazione e fattibilità.', {
+      model: reviewer,
+      handoff: ['StrategySpec candidata', 'Onboarding normalizzato', 'Checklist di validazione'],
+    });
+    try {
+      const response = await callModel({ ...attempt, messages: buildReviewMessages(answers, spec), config: { ...llmConfig, llmMaxTokens: 1200 }, credentials, env, jsonMode: true, timeoutMs: 45_000 });
+      const resolvedReviewer = `${attempt.provider}/${response.resolvedModel ?? attempt.model}`;
+      const review = normalizeReview(response.content, resolvedReviewer);
+      if (!review) {
+        emit('review', 'failed', 'Revisione non leggibile', 'Il responso non aveva il formato richiesto; viene provato un altro modello.', { model: reviewer });
+        continue;
+      }
+      reviews.push(review);
+      reviewerModels.push(resolvedReviewer);
+      reviewedRoutes.add(reviewer);
+      emit('review', review.verdict === 'approve' ? 'passed' : 'warning', review.verdict === 'approve' ? 'Policy approvata' : 'Correzioni richieste', review.summary, {
+        model: resolvedReviewer,
+        details: [...review.strengths, ...review.concerns, ...review.requiredChanges].slice(0, 5),
+        handoff: ['Verdetto sintetico', 'Punti di forza', 'Correzioni richieste'],
+      });
+    } catch (error) {
+      emit('review', 'failed', 'Revisore non disponibile', 'La validazione prosegue con il modello successivo.', {
+        model: reviewer,
+        details: [error instanceof Error ? error.message : String(error)],
+      });
+    }
+  }
+
+  let finalModel = model;
+  if (reviews.some((review) => review.verdict === 'revise')) {
+    const synthesisAttempt = diverse.find((attempt) => !reviewedRoutes.has(`${attempt.provider}/${attempt.model}`));
+    if (synthesisAttempt) {
+      const synthesisModel = `${synthesisAttempt.provider}/${synthesisAttempt.model}`;
+      emit('synthesis', 'running', 'Sintesi delle revisioni', 'Le correzioni compatibili vengono integrate senza ampliare il consenso iniziale.', {
+        model: synthesisModel,
+        handoff: ['StrategySpec candidata', 'Verdetti dei revisori', 'Vincoli originali'],
+      });
+      try {
+        const response = await callModel({ ...synthesisAttempt, messages: buildSynthesisMessages(prompt, spec, reviews), config: llmConfig, credentials, env, jsonMode: true, timeoutMs: 55_000 });
+        const resolvedSynthesisModel = `${synthesisAttempt.provider}/${response.resolvedModel ?? synthesisAttempt.model}`;
+        const normalized = normalizeAiStrategySpec(response.content, answers);
+        if (normalized.ok) {
+          spec = normalized.value;
+          source = 'ai';
+          finalModel = resolvedSynthesisModel;
+          emit('synthesis', 'passed', 'Revisioni integrate', 'La versione consolidata rispetta ancora schema e consenso dell’onboarding.', { model: resolvedSynthesisModel });
+        } else {
+          emit('synthesis', 'warning', 'Sintesi scartata', 'La versione consolidata ampliava o rompeva un vincolo: resta valida la proposta precedente.', { model: synthesisModel });
+        }
+      } catch (error) {
+        emit('synthesis', 'warning', 'Sintesi non disponibile', 'Resta attiva la proposta precedente, già protetta dai controlli deterministici.', {
+          model: synthesisModel,
+          details: [error instanceof Error ? error.message : String(error)],
+        });
+      }
+    }
+  }
+
   spec = applyGuidedGuardrails(spec, guided);
+  const feasibility = checkStrategyFeasibility(spec);
+  emit('deterministic', feasibility.ok ? 'passed' : 'failed', 'Controllo finale dei guardrail', feasibility.ok
+    ? 'Budget, tetti, liquidità, consenso e fattibilità sono coerenti: nessun modello può oltrepassare questi limiti.'
+    : 'La strategia non supera i controlli deterministici.', {
+    details: feasibility.ok ? feasibility.warnings : feasibility.errors,
+    handoff: ['StrategySpec validata', 'Scenario deterministico', 'Modalità shadow'],
+  });
   const scenario = buildDeterministicScenarioSummary(spec, scenarioAssumptions(spec), {
     horizonMonths: Math.max(3, Math.min(120, Number(guided.horizonMonths) || 12)),
     startingCapitalEur: spec.capital.budgetEur,
   });
-  return { answers, guided, spec, scenario, draft: strategyPreview(spec, guided, scenario), generation: { source, model, attempts } };
+  const collaborationStatus = source === 'deterministic'
+    ? 'deterministic-fallback'
+    : reviews.some((review) => review.verdict === 'revise') || reviews.length < 2
+      ? 'validated-with-warnings'
+      : 'validated';
+  emit('complete', collaborationStatus === 'validated' ? 'passed' : 'warning', 'Strategia pronta', collaborationStatus === 'validated'
+    ? 'Più modelli hanno validato la policy; ora parte in shadow e resta sotto guardrail deterministici.'
+    : 'La policy è pronta con protezioni deterministiche; alcune revisioni AI non erano disponibili o hanno segnalato attenzioni.');
+  const collaboration = sanitizeStrategyCollaboration({
+    version: 1,
+    mode: 'multi-model-review',
+    status: collaborationStatus,
+    leadModel: model,
+    reviewerModels,
+    finalModel,
+    reviews,
+    trace,
+  });
+  return {
+    answers,
+    guided,
+    spec,
+    scenario,
+    draft: strategyPreview(spec, guided, scenario),
+    generation: { source, model: finalModel, attempts },
+    collaboration,
+  };
 }
 
 export async function handleAgentApi(request, env, ctx, pathname) {
@@ -406,7 +708,8 @@ export async function handleAgentApi(request, env, ctx, pathname) {
 
   // GET /agent/state
   if (route === 'state' && method === 'GET') {
-    const [config, runs, curve, resolved] = await Promise.all([loadConfig(db), listRuns(db, 12), equityHistory(db, 200), resolveCredentials(db, env)]);
+    const [storedConfig, runs, curve, resolved] = await Promise.all([loadConfig(db), listRuns(db, 12), equityHistory(db, 200), resolveCredentials(db, env)]);
+    const config = hydrateGuidedReview(storedConfig);
     const last = runs[0] ?? null;
     const hwm = curve.length ? Math.max(...curve.map((row) => Number(row.hwm_usd) || 0)) : 0;
     const equity = curve.length ? Number(curve[curve.length - 1].equity_usd) : 0;
@@ -449,6 +752,61 @@ export async function handleAgentApi(request, env, ctx, pathname) {
     }
   }
 
+  // POST /agent/strategy/draft/stream — stessa generazione, con una traccia
+  // NDJSON progressiva pensata per l'interfaccia (mai chain-of-thought).
+  if (route === 'strategy/draft/stream' && method === 'POST') {
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      async start(controller) {
+        let open = true;
+        const send = (value) => {
+          if (!open) return;
+          try { controller.enqueue(encoder.encode(`${JSON.stringify(value)}\n`)); } catch { open = false; }
+        };
+        try {
+          const [config, { values: credentials }] = await Promise.all([loadConfig(db), resolveCredentials(db, env)]);
+          const bundle = await generateGuidedStrategy({
+            rawAnswers: body.answers ?? body,
+            config,
+            credentials,
+            env,
+            onTrace: (event) => send({ type: 'trace', event }),
+          });
+          await audit(db, null, 'info', 'strategy', `Bozza strategia multi-AI generata (${bundle.generation.source})`, {
+            model: bundle.generation.model,
+            reviewers: bundle.collaboration?.reviewerModels ?? [],
+            collaborationStatus: bundle.collaboration?.status,
+            attempts: bundle.generation.attempts.map(({ provider, model, ok, error }) => ({ provider, model, ok, error })),
+            objective: bundle.spec.objective.primary,
+            maxPositions: bundle.spec.diversification.maxPositions,
+          });
+          send({
+            type: 'complete',
+            bundle: {
+              draft: bundle.draft,
+              strategySpec: bundle.spec,
+              onboardingAnswers: bundle.answers,
+              scenario: bundle.scenario,
+              generation: bundle.generation,
+              collaboration: bundle.collaboration,
+            },
+          });
+        } catch (error) {
+          send({ type: 'error', error: error instanceof Error ? error.message : String(error) });
+        } finally {
+          if (open) controller.close();
+        }
+      },
+    });
+    return new Response(stream, {
+      headers: {
+        'content-type': 'application/x-ndjson; charset=utf-8',
+        'cache-control': 'no-store, no-transform',
+        'x-accel-buffering': 'no',
+      },
+    });
+  }
+
   // POST /agent/strategy/draft — genera una policy, mai ordini o ticker.
   if (route === 'strategy/draft' && method === 'POST') {
     try {
@@ -466,6 +824,7 @@ export async function handleAgentApi(request, env, ctx, pathname) {
         onboardingAnswers: bundle.answers,
         scenario: bundle.scenario,
         generation: bundle.generation,
+        collaboration: bundle.collaboration,
       });
     } catch (error) {
       return json({ error: error instanceof Error ? error.message : String(error) }, 400);
@@ -512,6 +871,7 @@ export async function handleAgentApi(request, env, ctx, pathname) {
       const maxHoldings = spec.diversification.maxPositions;
       const minHoldingDays = Math.max(0, Math.min(365, Math.round(Number(activationGuided.minHoldingDays) || 0)));
       const policyPool = buildPolicyUniverse(spec, { limit: Math.min(60, Math.max(40, maxHoldings * 3)) });
+      const persistedDraft = strategyPreview(spec, activationGuided, scenario);
       const next = await saveConfig(db, {
         strategySpecVersion: spec.schemaVersion,
         strategySpec: spec,
@@ -520,6 +880,9 @@ export async function handleAgentApi(request, env, ctx, pathname) {
         strategyName: spec.name,
         strategyGeneratedBy: String(body.generatedBy ?? 'guided-onboarding').slice(0, 160),
         strategyScenario: scenario,
+        strategyDraft: persistedDraft,
+        strategyCollaboration: sanitizeStrategyCollaboration(body.collaboration),
+        guidedOnboardingAnswers: activationGuided,
         policyUniverse: spec.universePolicy,
         universeMode: 'dynamic',
         pool: policyPool,
@@ -557,7 +920,7 @@ export async function handleAgentApi(request, env, ctx, pathname) {
         cashFloorPct: spec.capital.cashFloorPct,
         policyCandidates: policyPool.length,
       });
-      return json({ ok: true, config: next, strategySpec: spec, scenario, draft: strategyPreview(spec, activationGuided, scenario) });
+      return json({ ok: true, config: next, strategySpec: spec, scenario, draft: persistedDraft });
     } catch (error) {
       return json({ error: error instanceof Error ? error.message : String(error) }, 400);
     }

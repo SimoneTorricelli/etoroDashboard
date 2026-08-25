@@ -29,6 +29,7 @@ import { GuardrailsEditor } from '@/components/autopilot/GuardrailsEditor';
 import { ProfileSelector } from '@/components/autopilot/ProfileSelector';
 import { WatcherPanel } from '@/components/autopilot/WatcherPanel';
 import { CredentialsSection } from '@/components/autopilot/CredentialsSection';
+import { ActiveStrategyDashboard } from '@/components/autopilot/ActiveStrategyDashboard';
 import {
   StrategyOnboarding, createStrategyOnboardingPreview,
   DEFAULT_STRATEGY_ONBOARDING_ANSWERS,
@@ -38,8 +39,9 @@ import {
 import { cn } from '@/lib/utils';
 import {
   autopilot, getBaseUrl, getControlToken, isTokenRemembered, setBaseUrl, setControlToken,
+  AutopilotError,
   type AutopilotState, type ExecutionMode, type RunBundle, type RunSummary,
-  type GuidedStrategyBundle,
+  type GuidedStrategyBundle, type StrategyCollaboration, type StrategyTraceEvent,
 } from '@/lib/agent/autopilot-api';
 
 const stagger = (i: number) => ({
@@ -71,10 +73,33 @@ const KIND_LABEL: Record<string, string> = {
 
 const fmtUsd = (value: number | null | undefined) =>
   value == null ? '—' : new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(value);
+const fmtEur = (value: number | null | undefined) =>
+  value == null ? '—' : new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR', maximumFractionDigits: 2 }).format(value);
 const fmtPct = (value: number | null | undefined, digits = 1) =>
   value == null ? '—' : `${(value * 100).toFixed(digits)}%`;
 const fmtDate = (value: number | null | undefined) =>
   value ? new Date(value).toLocaleString('it-IT', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : '—';
+
+const PREVIEW_COLLABORATION: StrategyCollaboration = {
+  version: 1,
+  mode: 'multi-model-review',
+  status: 'validated',
+  leadModel: 'workers-ai/@cf/openai/gpt-oss-120b',
+  reviewerModels: ['gemini/gemini-3.7-flash', 'openrouter/openrouter/free'],
+  finalModel: 'workers-ai/@cf/openai/gpt-oss-120b',
+  reviews: [
+    { reviewer: 'gemini/gemini-3.7-flash', verdict: 'approve', summary: 'Budget, rischio e diversificazione sono coerenti con il profilo scelto.', strengths: ['Universo dinamico ben delimitato'], concerns: [], requiredChanges: [], confidence: 0.88 },
+    { reviewer: 'openrouter/openrouter/free', verdict: 'approve', summary: 'I limiti per asset, settore e liquidità rendono la policy applicabile in shadow.', strengths: ['Guardrail chiari'], concerns: [], requiredChanges: [], confidence: 0.83 },
+  ],
+  trace: [
+    { id: 'preview-1', at: 1, stage: 'intake', status: 'passed', title: 'Preferenze tradotte in vincoli', summary: 'Obiettivo, budget e rischio sono diventati un contratto strutturato.', handoff: ['Onboarding normalizzato', 'Vincoli di consenso'] },
+    { id: 'preview-2', at: 2, stage: 'lead', status: 'passed', title: 'Prima proposta pronta', model: 'workers-ai/@cf/openai/gpt-oss-120b', summary: 'La policy completa passa ai revisori indipendenti.', handoff: ['StrategySpec', 'Regole di universo dinamico'] },
+    { id: 'preview-3', at: 3, stage: 'review', status: 'passed', title: 'Policy approvata', model: 'gemini/gemini-3.7-flash', summary: 'Consenso, rischio e fattibilità risultano coerenti.', handoff: ['Verdetto sintetico', 'Punti di forza'] },
+    { id: 'preview-4', at: 4, stage: 'review', status: 'passed', title: 'Seconda validazione completata', model: 'openrouter/openrouter/free', summary: 'La strategia è applicabile con il budget dichiarato.', handoff: ['Esito revisione', 'Checklist budget'] },
+    { id: 'preview-5', at: 5, stage: 'deterministic', status: 'passed', title: 'Controllo finale dei guardrail', summary: 'Nessun modello può oltrepassare i limiti verificati.' },
+    { id: 'preview-6', at: 6, stage: 'complete', status: 'passed', title: 'Strategia pronta', summary: 'La policy validata può partire in shadow.' },
+  ],
+};
 
 export default function Autopilot() {
   const [token, setToken] = useState(getControlToken());
@@ -91,9 +116,37 @@ export default function Autopilot() {
   const onboardingQuery = typeof window !== 'undefined'
     ? new URLSearchParams(window.location.search).get('onboarding')
     : null;
+  const activeStrategyPreview = typeof window !== 'undefined'
+    && new URLSearchParams(window.location.search).get('preview') === 'active-strategy';
   const [onboardingOpen, setOnboardingOpen] = useState(Boolean(onboardingQuery));
   const [onboardingPortfolios, setOnboardingPortfolios] = useState<StrategyOnboardingPortfolio[] | undefined>();
   const [strategyBundle, setStrategyBundle] = useState<GuidedStrategyBundle<StrategyOnboardingDraft> | null>(null);
+  const [strategyTrace, setStrategyTrace] = useState<StrategyTraceEvent[]>([]);
+  const [activeTab, setActiveTab] = useState('panoramica');
+  const [activatedStrategyName, setActivatedStrategyName] = useState('');
+  const [reviewingSavedStrategy, setReviewingSavedStrategy] = useState(false);
+
+  const closeOnboarding = useCallback(() => {
+    setOnboardingOpen(false);
+    setReviewingSavedStrategy(false);
+    if (typeof window === 'undefined') return;
+    const url = new URL(window.location.href);
+    url.searchParams.delete('onboarding');
+    window.history.replaceState(window.history.state, '', `${url.pathname}${url.search}${url.hash}`);
+  }, []);
+
+  const openOnboarding = useCallback(() => {
+    setStrategyBundle(null);
+    setStrategyTrace([]);
+    setActivatedStrategyName('');
+    setReviewingSavedStrategy(false);
+    setOnboardingOpen(true);
+  }, []);
+
+  const openSavedStrategy = useCallback(() => {
+    setReviewingSavedStrategy(true);
+    setOnboardingOpen(true);
+  }, []);
 
   const refresh = useCallback(async () => {
     if (!getControlToken()) {
@@ -140,7 +193,7 @@ export default function Autopilot() {
           id: portfolio.id,
           name: portfolio.name,
           subtitle: portfolio.id === activeId && verified ? 'Agent Portfolio verificato' : 'Agent Portfolio esistente',
-          balanceEur: portfolio.virtualBalanceUsd,
+          virtualBalanceUsd: portfolio.virtualBalanceUsd,
           status: portfolio.id === activeId && verified ? 'connected' : 'needs-token',
         })));
       })
@@ -171,12 +224,23 @@ export default function Autopilot() {
   };
 
   const generateGuidedStrategy = async (answers: StrategyOnboardingAnswers): Promise<StrategyOnboardingDraft> => {
+    setStrategyTrace([]);
     if (!getControlToken()) {
       toast.info('Anteprima locale pronta. Collega il Worker prima di attivarla.');
       return createStrategyOnboardingPreview(answers);
     }
-    const bundle = await autopilot.strategyDraft<StrategyOnboardingDraft>(answers as unknown as Record<string, unknown>);
+    let bundle: GuidedStrategyBundle<StrategyOnboardingDraft>;
+    try {
+      bundle = await autopilot.strategyDraftStream<StrategyOnboardingDraft>(
+        answers as unknown as Record<string, unknown>,
+        (event) => setStrategyTrace((current) => [...current.filter((item) => item.id !== event.id), event]),
+      );
+    } catch (caught) {
+      if (!(caught instanceof AutopilotError) || ![404, 405].includes(caught.status)) throw caught;
+      bundle = await autopilot.strategyDraft<StrategyOnboardingDraft>(answers as unknown as Record<string, unknown>);
+    }
     setStrategyBundle(bundle);
+    setStrategyTrace(bundle.collaboration?.trace ?? []);
     if (bundle.generation.source === 'ai') toast.success(`Strategia generata da ${bundle.generation.model}`);
     else toast.info('Strategia sicura generata deterministicamente: i provider AI non erano disponibili.');
     return bundle.draft;
@@ -203,8 +267,12 @@ export default function Autopilot() {
       portfolioId: answers.portfolioId,
       generatedBy: bundle.generation.model ?? bundle.generation.source,
       reviewMaxDrawdownPct: draft.riskRangePct,
+      collaboration: bundle.collaboration,
     });
     await refresh();
+    setActivatedStrategyName(draft.strategyName);
+    setActiveTab('strategia');
+    closeOnboarding();
     toast.success(`“${draft.strategyName}” è attiva in shadow. Nessun ordine reale verrà inviato.`);
   };
 
@@ -215,6 +283,34 @@ export default function Autopilot() {
   const credentialsOk = state?.credentials.filter((item) => item.required).every((item) => item.configured) ?? false;
   const hasRun = runs.length > 0;
 
+  if (activeStrategyPreview) {
+    const previewDraft = createStrategyOnboardingPreview(DEFAULT_STRATEGY_ONBOARDING_ANSWERS);
+    const previewConfig = {
+      ...(state?.config ?? {}),
+      executionMode: 'shadow',
+      budgetEur: DEFAULT_STRATEGY_ONBOARDING_ANSWERS.budgetEur,
+    } as AutopilotState['config'];
+    const previewNow = Date.now();
+    const previewCurve = Array.from({ length: 18 }, (_, index) => {
+      const wave = Math.sin(index / 2.4) * 54;
+      const equity = 10000 + index * 17 + wave;
+      return { at: previewNow - (17 - index) * 86_400_000, equity_usd: equity, invested_usd: equity * .97, cash_usd: equity * .03, hwm_usd: Math.max(10000, equity) };
+    });
+    return (
+      <div className="min-h-screen bg-[#f8f7f1] p-3 sm:p-6">
+        <ActiveStrategyDashboard
+          config={previewConfig}
+          draft={previewDraft}
+          answers={DEFAULT_STRATEGY_ONBOARDING_ANSWERS}
+          collaboration={PREVIEW_COLLABORATION}
+          equityCurve={previewCurve}
+          onReview={() => undefined}
+          onDryRun={() => undefined}
+        />
+      </div>
+    );
+  }
+
   const steps = [
     { done: Boolean(state), label: 'Connetti la dashboard al Worker' },
     { done: credentialsOk, label: 'Inserisci le credenziali obbligatorie' },
@@ -223,14 +319,29 @@ export default function Autopilot() {
   ];
 
   if (onboardingOpen) {
-    const showReview = onboardingQuery === 'review';
+    const showReview = reviewingSavedStrategy || onboardingQuery === 'review';
     const previewAnswers = DEFAULT_STRATEGY_ONBOARDING_ANSWERS;
+    const savedAnswers = state?.config.guidedOnboardingAnswers as Partial<StrategyOnboardingAnswers> | null | undefined;
+    const initialAnswers = {
+      ...previewAnswers,
+      ...(reviewingSavedStrategy ? savedAnswers : null),
+      budgetEur: reviewingSavedStrategy
+        ? savedAnswers?.budgetEur ?? state?.config.budgetEur ?? previewAnswers.budgetEur
+        : state?.config.budgetEur ?? previewAnswers.budgetEur,
+      strategyName: reviewingSavedStrategy
+        ? savedAnswers?.strategyName ?? state?.config.strategyName ?? previewAnswers.strategyName
+        : state?.config.strategyName || previewAnswers.strategyName,
+      portfolioId: reviewingSavedStrategy
+        ? savedAnswers?.portfolioId ?? state?.config.activeAgentPortfolioId ?? previewAnswers.portfolioId
+        : state?.config.activeAgentPortfolioId || previewAnswers.portfolioId,
+    };
+    const savedDraft = state?.config.strategyDraft as StrategyOnboardingDraft | null | undefined;
     return (
-      <div className="fixed inset-y-0 right-0 z-50 overflow-y-auto bg-[#faf9f5] md:left-16 xl:left-[232px]">
+      <div className="fixed inset-y-0 left-0 right-0 z-50 overflow-y-auto bg-[#faf9f5] md:left-16 xl:left-[232px]">
         <Toaster position="top-right" richColors />
         <button
           type="button"
-          onClick={() => setOnboardingOpen(false)}
+          onClick={closeOnboarding}
           className="fixed right-4 top-3 z-[60] grid size-9 place-items-center rounded-full border border-[#233a2c1f] bg-white/90 text-[#56645c] shadow-sm backdrop-blur transition-colors hover:text-[#0d5434] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0d5434]"
           aria-label="Chiudi onboarding e torna ad Autopilot"
           title="Torna ad Autopilot"
@@ -239,11 +350,14 @@ export default function Autopilot() {
         </button>
         <StrategyOnboarding
           portfolios={onboardingPortfolios}
-          initialAnswers={previewAnswers}
+          initialAnswers={initialAnswers}
           initialStep={showReview ? 'review' : 'goals'}
-          initialDraft={showReview ? createStrategyOnboardingPreview(previewAnswers) : null}
+          initialDraft={showReview ? savedDraft ?? createStrategyOnboardingPreview(initialAnswers) : null}
           onGenerate={generateGuidedStrategy}
           onActivate={activateGuidedStrategy}
+          generationTrace={strategyTrace}
+          collaboration={strategyBundle?.collaboration ?? state?.config.strategyCollaboration ?? null}
+          readOnly={reviewingSavedStrategy && Boolean(savedDraft)}
         />
       </div>
     );
@@ -267,7 +381,7 @@ export default function Autopilot() {
         <Button variant="outline" size="sm" onClick={() => void refresh()} disabled={loading}>
           <RefreshCw className={cn('size-4', loading && 'animate-spin')} /> Aggiorna
         </Button>
-        <Button size="sm" onClick={() => setOnboardingOpen(true)}>
+        <Button size="sm" onClick={openOnboarding}>
           <Bot className="size-4" /> Nuova strategia guidata
         </Button>
       </motion.div>
@@ -364,10 +478,10 @@ export default function Autopilot() {
           {/* KPI */}
           <motion.div {...stagger(3)} className="col-span-12 grid gap-4 md:grid-cols-4">
             <Card>
-              <CardHeader className="pb-1"><CardDescription className="text-text-1">Equity Agent Portfolio</CardDescription></CardHeader>
+              <CardHeader className="pb-1"><CardDescription className="text-text-1">Base virtuale eToro</CardDescription></CardHeader>
               <CardContent>
                 <div className="text-2xl font-semibold tabular-nums text-text-0">{fmtUsd(state.equityUsd)}</div>
-                <p className="text-xs text-text-1">Massimo storico {fmtUsd(state.highWaterMarkUsd)}</p>
+                <p className="text-xs text-text-1">Non è il capitale reale · allocato {fmtEur(config.budgetEur)}</p>
               </CardContent>
             </Card>
             <Card>
@@ -403,7 +517,7 @@ export default function Autopilot() {
           </motion.div>
 
           <motion.div {...stagger(4)} className="col-span-12">
-            <Tabs defaultValue="panoramica">
+            <Tabs value={activeTab} onValueChange={setActiveTab}>
               <TabsList className="w-full justify-start overflow-x-auto">
                 <TabsTrigger value="panoramica">Panoramica</TabsTrigger>
                 <TabsTrigger value="guida">Come funziona</TabsTrigger>
@@ -519,6 +633,47 @@ export default function Autopilot() {
               <TabsContent value="guida" className="pt-4"><HowItWorks /></TabsContent>
 
               <TabsContent value="strategia" className="space-y-4 pt-4">
+                {config.onboardingComplete && config.strategyDraft ? (
+                  <ActiveStrategyDashboard
+                    config={config}
+                    draft={config.strategyDraft as unknown as StrategyOnboardingDraft}
+                    answers={config.guidedOnboardingAnswers as Partial<StrategyOnboardingAnswers> | null | undefined}
+                    collaboration={config.strategyCollaboration ?? null}
+                    equityCurve={state.equityCurve}
+                    loading={loading}
+                    onReview={openSavedStrategy}
+                    onDryRun={() => void guarded('Run dry-run completata', () => autopilot.trigger('rebalance', 'dry-run'))}
+                  />
+                ) : config.onboardingComplete ? (
+                  <Alert>
+                    <CircleCheck className="size-4" />
+                    <AlertTitle>
+                      {activatedStrategyName ? `“${activatedStrategyName}” salvata e attiva` : `Strategia “${config.strategyName || 'guidata'}” attiva`}
+                    </AlertTitle>
+                    <AlertDescription className="space-y-3">
+                      <p>
+                        È salvata nella configurazione persistente del Worker e resta attiva anche a browser chiuso. Qui trovi il profilo, i guardrail e il pool generato dalle tue scelte. Il pool è il catalogo ammesso:
+                        a ogni ciclo lo screening crea la shortlist e l’AI propone i pesi finali, che devono sommare al 100%.
+                      </p>
+                      <div className="flex flex-wrap gap-2">
+                        {config.strategyDraft && (
+                          <Button type="button" size="sm" variant="outline" onClick={openSavedStrategy}>
+                            <Eye className="size-4" /> Rivedi scheda completa
+                          </Button>
+                        )}
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={loading}
+                          onClick={() => void guarded('Run dry-run completata', () => autopilot.trigger('rebalance', 'dry-run'))}
+                        >
+                          <FlaskConical className="size-4" /> Prova un ciclo completo in dry-run
+                        </Button>
+                      </div>
+                    </AlertDescription>
+                  </Alert>
+                ) : null}
                 <ProfileSelector current={config.strategyProfile} onApplied={refresh} />
                 <GuardrailsEditor config={config} onSaved={refresh} />
               </TabsContent>
@@ -552,7 +707,7 @@ export default function Autopilot() {
                           <TableHead>Tipo</TableHead>
                           <TableHead>Modalità</TableHead>
                           <TableHead>Esito</TableHead>
-                          <TableHead className="text-right">Equity</TableHead>
+                          <TableHead className="text-right">Equity virtuale</TableHead>
                           <TableHead />
                         </TableRow>
                       </TableHeader>
@@ -626,9 +781,9 @@ export default function Autopilot() {
                               {Array.isArray(detail.proposal?.attempts) && detail.proposal.attempts.length > 0 && (
                                 <div className="space-y-1 rounded-lg bg-bg-0 p-3">
                                   <p className="text-xs text-text-1">Tentativi per modello, in ordine:</p>
-                                  {(detail.proposal.attempts as Array<{ model: string; format: string; ok: boolean; error?: string }>).map((attempt, index) => (
+                                  {(detail.proposal.attempts as Array<{ provider?: string; model: string; format: string; ok: boolean; error?: string }>).map((attempt, index) => (
                                     <p key={index} className={cn('font-mono text-[11px]', attempt.ok ? 'text-gain' : 'text-text-1')}>
-                                      {attempt.ok ? '✓' : '✗'} {attempt.model} [{attempt.format}]{attempt.error ? ` — ${attempt.error}` : ''}
+                                      {attempt.ok ? '✓' : '✗'} {attempt.provider ? `${attempt.provider}/` : ''}{attempt.model} [{attempt.format}]{attempt.error ? ` — ${attempt.error}` : ''}
                                     </p>
                                   ))}
                                 </div>
@@ -669,7 +824,13 @@ export default function Autopilot() {
                                   <TableRow key={`${order.symbol}-${index}`}>
                                     <TableCell className="font-medium text-text-0">{order.symbol}</TableCell>
                                     <TableCell className={order.side === 'buy' ? 'text-gain' : 'text-loss'}>{order.side === 'buy' ? 'ACQUISTA' : 'VENDI'}</TableCell>
-                                    <TableCell className="text-right tabular-nums text-text-0">{fmtUsd(order.amount_usd)}</TableCell>
+                                    <TableCell className="text-right tabular-nums text-text-0">
+                                      {fmtUsd(order.amount_usd)} <span className="block text-[10px] text-text-2">virtuali · ≈ {fmtEur(
+                                        detail.snapshot?.equity_usd
+                                          ? order.amount_usd / detail.snapshot.equity_usd * config.budgetEur
+                                          : null,
+                                      )} reali</span>
+                                    </TableCell>
                                     <TableCell><Badge variant="outline">{order.state}</Badge></TableCell>
                                     <TableCell className="max-w-[280px] truncate text-xs text-text-1">{order.message}</TableCell>
                                   </TableRow>

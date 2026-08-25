@@ -24,7 +24,10 @@ import {
   saveWatcherEvent, startRun, syncLedger, upsertOrder,
 } from './db.js';
 
-const KV_CANDLES = 'candles:v1:';
+const KV_CANDLES_BUNDLE = 'candles:v2:bundle';
+const CANDLE_CACHE_MAX_AGE_MS = 12 * 60 * 60 * 1000;
+const CANDLE_REFRESH_BATCH = 8;
+const UNRESOLVED_RETRY_MS = 24 * 60 * 60 * 1000;
 
 export function romeParts(date = new Date()) {
   const formatter = new Intl.DateTimeFormat('en-GB', {
@@ -85,7 +88,9 @@ async function resolveUniverse(client, db, config) {
   const cache = await loadUniverseCache(db);
   const universe = new Map();
   const fresh = [];
+  const negative = [];
   const unresolved = [];
+  const now = Date.now();
 
   for (const entry of universeSource(config)) {
     const cached = cache.get(entry.symbol);
@@ -93,21 +98,32 @@ async function resolveUniverse(client, db, config) {
       universe.set(entry.symbol, { ...entry, instrumentId: cached.instrument_id, name: cached.name || entry.name });
       continue;
     }
+    if (cached && now - Number(cached.updated_at ?? 0) < UNRESOLVED_RETRY_MS) {
+      unresolved.push(entry.symbol);
+      continue;
+    }
     try {
-      const found = await client.searchInstrument(entry.symbol);
+      const found = await client.searchInstrument(entry.symbol, {
+        tryUsd: entry.class === 'crypto',
+        // In pipeline la continuità viene prima della ricerca esaustiva: la
+        // ricerca completa resta disponibile nella UI e nella diagnostica.
+        maxQueriesPerVariant: 1,
+      });
       if (found?.instrumentId) {
         const resolvedEntry = { ...entry, instrumentId: found.instrumentId, name: found.name || entry.name, matchedAs: found.matchedAs };
         universe.set(entry.symbol, resolvedEntry);
         fresh.push(resolvedEntry);
       } else {
         unresolved.push(entry.symbol);
+        negative.push({ ...entry, instrumentId: 0, matchedAs: 'non disponibile su eToro' });
       }
     } catch {
       unresolved.push(entry.symbol);
+      negative.push({ ...entry, instrumentId: 0, matchedAs: 'ricerca eToro fallita' });
     }
   }
 
-  if (fresh.length) await cacheUniverse(db, fresh);
+  if (fresh.length || negative.length) await cacheUniverse(db, [...fresh, ...negative]);
   return { universe, unresolved };
 }
 
@@ -153,28 +169,90 @@ async function mergeHeldPositions(client, db, universe, snapshot) {
   return added;
 }
 
-/** Serie giornaliere con cache 12h: riduce di molto le chiamate a eToro. */
-async function loadCandles(client, env, universe) {
+/**
+ * Ordina gli storici da aggiornare: prima le posizioni aperte, poi gli strumenti
+ * mai visti, infine quelli con cache più vecchia. Il tetto protegge il budget di
+ * subrequest del Worker e permette alla cache di scaldarsi tra un ciclo e l'altro.
+ */
+export function buildCandleRefreshQueue(universe, instruments, {
+  heldInstrumentIds = [], now = Date.now(), maxAgeMs = CANDLE_CACHE_MAX_AGE_MS,
+  limit = CANDLE_REFRESH_BATCH,
+} = {}) {
+  const held = new Set(heldInstrumentIds.map(Number));
+  return [...universe.entries()]
+    .map(([symbol, meta]) => {
+      const cached = instruments?.[String(meta.instrumentId)];
+      const hasRows = Boolean(cached?.rows?.length);
+      const updatedAt = Number(cached?.updatedAt ?? 0);
+      return { symbol, meta, hasRows, updatedAt, stale: !hasRows || now - updatedAt >= maxAgeMs };
+    })
+    .filter((item) => item.stale)
+    .sort((a, b) => {
+      const heldDelta = Number(held.has(b.meta.instrumentId)) - Number(held.has(a.meta.instrumentId));
+      if (heldDelta) return heldDelta;
+      const missingDelta = Number(!b.hasRows) - Number(!a.hasRows);
+      if (missingDelta) return missingDelta;
+      if (a.updatedAt !== b.updatedAt) return a.updatedAt - b.updatedAt;
+      return a.symbol.localeCompare(b.symbol);
+    })
+    .slice(0, Math.max(1, limit));
+}
+
+/** Serie giornaliere in un solo oggetto KV, con aggiornamento progressivo. */
+export async function loadCandles(client, env, universe, options = {}) {
   const candles = new Map();
-  for (const [symbol, meta] of universe.entries()) {
-    const key = `${KV_CANDLES}${meta.instrumentId}`;
-    if (env.STATE) {
-      try {
-        const cached = await env.STATE.get(key, 'json');
-        if (cached?.rows?.length) { candles.set(symbol, cached.rows); continue; }
-      } catch { /* cache non disponibile */ }
-    }
+  let bundle = { version: 2, instruments: {} };
+  if (env.STATE) {
     try {
-      const rows = await client.candles(meta.instrumentId, 'OneDay', 260);
-      if (rows.length) {
-        candles.set(symbol, rows);
-        if (env.STATE) {
-          try { await env.STATE.put(key, JSON.stringify({ rows }), { expirationTtl: 60 * 60 * 12 }); } catch { /* ignora */ }
-        }
-      }
-    } catch { /* strumento senza storico: le feature saranno parziali */ }
+      const cached = await env.STATE.get(KV_CANDLES_BUNDLE, 'json');
+      if (cached?.version === 2 && cached?.instruments) bundle = cached;
+    } catch { /* cache non disponibile */ }
   }
-  return candles;
+
+  for (const [symbol, meta] of universe.entries()) {
+    const cached = bundle.instruments[String(meta.instrumentId)];
+    if (cached?.rows?.length) candles.set(symbol, cached.rows);
+  }
+
+  const queue = buildCandleRefreshQueue(universe, bundle.instruments, options);
+  let refreshed = 0;
+  let changed = false;
+  // Quattro richieste contemporanee restano sotto il limite di connessioni
+  // aperte del runtime, mentre il tetto totale resta deterministico.
+  for (let offset = 0; offset < queue.length; offset += 4) {
+    const chunk = queue.slice(offset, offset + 4);
+    const results = await Promise.all(chunk.map(async ({ symbol, meta }) => {
+      try {
+        const rows = await client.candles(meta.instrumentId, 'OneDay', 260);
+        return { symbol, meta, rows };
+      } catch {
+        return { symbol, meta, rows: [] };
+      }
+    }));
+    for (const { symbol, meta, rows } of results) {
+      if (!rows.length) continue;
+      candles.set(symbol, rows);
+      bundle.instruments[String(meta.instrumentId)] = { rows, updatedAt: Date.now() };
+      refreshed += 1;
+      changed = true;
+    }
+  }
+
+  if (env.STATE && changed) {
+    try {
+      bundle = { ...bundle, version: 2, updatedAt: Date.now() };
+      await env.STATE.put(KV_CANDLES_BUNDLE, JSON.stringify(bundle), { expirationTtl: 30 * 24 * 60 * 60 });
+    } catch { /* cache non disponibile */ }
+  }
+  return {
+    candles,
+    stats: {
+      available: candles.size,
+      total: universe.size,
+      refreshed,
+      pending: Math.max(0, universe.size - candles.size),
+    },
+  };
 }
 
 // ---------------------------------------------------------------- watcher
@@ -296,9 +374,10 @@ export async function runPipeline({ env, kind, modeOverride }) {
   }
 
   let equityUsd = null;
+  let credentials = {};
   try {
     const resolved = await resolveCredentials(db, env);
-    const credentials = resolved.values;
+    credentials = resolved.values;
     const client = buildClient(resolved, config);
     const hasVerifiedAgent = hasVerifiedAgentBinding(resolved, config);
     if (mode === 'live' && !hasVerifiedAgent) {
@@ -329,14 +408,16 @@ export async function runPipeline({ env, kind, modeOverride }) {
     equityUsd = snapshot.equityUsd;
     await saveSnapshot(db, runId, snapshot);
     const { hwm, drawdown } = await recordEquity(db, snapshot.equityUsd, snapshot.investedUsd, snapshot.cashUsd);
-    await audit(db, runId, 'info', 'snapshot', `Equity ${snapshot.equityUsd} USD, cash ${snapshot.cashUsd} USD, ${snapshot.positions.length} posizioni`, { hwm, drawdown });
+    await audit(db, runId, 'info', 'snapshot', `Base virtuale eToro: equity ${snapshot.equityUsd} USD, cash ${snapshot.cashUsd} USD, ${snapshot.positions.length} posizioni`, {
+      hwm, drawdown, configuredRealCapitalEur: config.budgetEur,
+    });
 
     // --- 2. Circuit breaker ------------------------------------------------
     if (drawdown > config.drawdownStopPct && !config.frozen) {
       const reason = `drawdown ${(drawdown * 100).toFixed(1)}% oltre la soglia ${(config.drawdownStopPct * 100).toFixed(0)}%`;
       await saveConfig(db, { frozen: true, frozenReason: reason });
       await audit(db, runId, 'error', 'circuit-breaker', `Agente congelato: ${reason}`);
-      await notify(credentials, 'critical', 'Autopilot congelato', [reason, `Equity ${snapshot.equityUsd} USD · massimo storico ${hwm} USD`]);
+      await notify(credentials, 'critical', 'Autopilot congelato', [reason, `Equity virtuale ${snapshot.equityUsd} USD · massimo storico virtuale ${hwm} USD`]);
       await finishRun(db, runId, 'frozen', equityUsd, reason);
       return { runId, status: 'frozen', reason };
     }
@@ -345,21 +426,24 @@ export async function runPipeline({ env, kind, modeOverride }) {
     const { universe, unresolved } = await resolveUniverse(client, db, config);
     const heldOutsidePolicy = await mergeHeldPositions(client, db, universe, snapshot);
     if (!universe.size) throw new Error(`nessuno strumento risolto su eToro${unresolved.length ? ` (falliti: ${unresolved.join(', ')})` : ''}`);
-    if (unresolved.length) await audit(db, runId, 'warn', 'universe', `Simboli non risolti: ${unresolved.join(', ')}`);
+    if (unresolved.length) await audit(db, runId, 'warn', 'universe', `Esclusi dalla run perché non disponibili nel catalogo eToro: ${unresolved.join(', ')} · nuovo controllo entro 24h`);
     if (heldOutsidePolicy.length) {
       await audit(db, runId, 'warn', 'universe', `${heldOutsidePolicy.length} posizioni esistenti aggiunte fuori policy`, heldOutsidePolicy.map((item) => item.symbol));
     }
 
-    const [candles, external] = await Promise.all([
-      loadCandles(client, env, universe),
+    const [{ candles, stats: candleStats }, external] = await Promise.all([
+      loadCandles(client, env, universe, {
+        heldInstrumentIds: snapshot.positions.map((item) => item.instrumentId),
+      }),
       collectExternalContext({
         finnhubKey: credentials.finnhubKey,
         marketauxKey: credentials.marketauxKey,
         fmpKey: credentials.fmpKey,
         symbols: [...universe.keys()],
         kv: env.STATE,
-        // Sul ribilanciamento serve il dato fresco, sugli heartbeat no.
-        ttlSeconds: kind === 'rebalance' ? 60 : 3 * 60 * 60,
+        // Anche nel ribilanciamento pochi minuti di cache evitano che due test
+        // manuali consecutivi replichino tutte le fonti esterne.
+        ttlSeconds: kind === 'rebalance' ? 15 * 60 : 3 * 60 * 60,
       }),
     ]);
     const history = await equityHistory(db, 400);
@@ -370,7 +454,8 @@ export async function runPipeline({ env, kind, modeOverride }) {
     const heldSymbols = new Set(features.instruments.filter((item) => item.weight > 0.001).map((item) => item.symbol));
     const ledger = await syncLedger(db, [...heldSymbols]);
 
-    await audit(db, runId, 'info', 'features', `Feature su ${features.instruments.length} strumenti · regime ${features.regime.label}`, {
+    await audit(db, runId, candleStats.pending ? 'warn' : 'info', 'features', `Universo ${features.instruments.length} strumenti · storici disponibili ${candleStats.available}/${candleStats.total} · regime ${features.regime.label}${candleStats.pending ? ' · cache in riscaldamento' : ''}`, {
+      candleCoverage: candleStats,
       failedSources: features.sourceDiagnostics.filter((item) => !item.ok).map((item) => item.name),
     });
 
@@ -391,7 +476,7 @@ export async function runPipeline({ env, kind, modeOverride }) {
     const scores = new Map(screening.ranked.map((item) => [item.symbol, item.score]));
     const shortlistSymbols = screening.shortlist.map((item) => item.symbol);
     if (dynamic) {
-      await audit(db, runId, 'info', 'screening', `Shortlist di ${shortlistSymbols.length} su ${screening.ranked.length} candidati`, {
+      await audit(db, runId, 'info', 'screening', `Shortlist di ${shortlistSymbols.length} su ${screening.ranked.length} strumenti con storico sufficiente (pool risolto: ${universe.size})`, {
         top: screening.shortlist.slice(0, 10).map((item) => ({ symbol: item.symbol, score: item.score, held: item.held })),
       });
     }

@@ -55,6 +55,9 @@ export interface AutopilotConfig {
   strategyName?: string;
   strategyGeneratedBy?: string;
   strategyScenario?: Record<string, unknown> | null;
+  strategyDraft?: Record<string, unknown> | null;
+  strategyCollaboration?: StrategyCollaboration | null;
+  guidedOnboardingAnswers?: Record<string, unknown> | null;
   policyUniverse?: Record<string, unknown> | null;
   shadowStartedAt?: number;
   shadowDays?: number;
@@ -108,6 +111,7 @@ export interface AutopilotConfig {
   minConfidence: number;
   models: string[];
   llmProviders: string[];
+  llmFallbackAcrossProviders?: boolean;
   llmModels: Record<string, string[]>;
   llmTemperature: number;
   llmMaxTokens: number;
@@ -241,6 +245,43 @@ export interface GuidedStrategyBundle<TDraft = Record<string, unknown>> {
     model: string | null;
     attempts: Array<{ provider: string; model: string; ok: boolean; error?: string }>;
   };
+  collaboration: StrategyCollaboration;
+}
+
+export type StrategyTraceStage = 'intake' | 'lead' | 'review' | 'synthesis' | 'deterministic' | 'complete';
+export type StrategyTraceStatus = 'running' | 'passed' | 'warning' | 'failed';
+
+export interface StrategyTraceEvent {
+  id: string;
+  at: number;
+  stage: StrategyTraceStage;
+  status: StrategyTraceStatus;
+  title: string;
+  model?: string | null;
+  summary: string;
+  handoff?: string[];
+  details?: string[];
+}
+
+export interface StrategyModelReview {
+  reviewer: string;
+  verdict: 'approve' | 'revise';
+  summary: string;
+  strengths: string[];
+  concerns: string[];
+  requiredChanges: string[];
+  confidence: number;
+}
+
+export interface StrategyCollaboration {
+  version: 1;
+  mode: 'multi-model-review';
+  status: 'validated' | 'validated-with-warnings' | 'deterministic-fallback';
+  leadModel: string | null;
+  reviewerModels: string[];
+  finalModel: string | null;
+  reviews: StrategyModelReview[];
+  trace: StrategyTraceEvent[];
 }
 
 /**
@@ -335,6 +376,57 @@ async function call<T>(path: string, init: RequestInit = {}): Promise<T> {
   return body as T;
 }
 
+async function streamStrategyDraft<TDraft>(
+  answers: Record<string, unknown>,
+  onTrace: (event: StrategyTraceEvent) => void,
+): Promise<GuidedStrategyBundle<TDraft>> {
+  const token = getControlToken();
+  if (!token) throw new AutopilotError('Token di controllo non impostato.', 401);
+  const response = await fetch(`${getBaseUrl()}/agent/strategy/draft/stream`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ answers }),
+    cache: 'no-store',
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({})) as { error?: string };
+    throw new AutopilotError(payload.error ?? `HTTP ${response.status}`, response.status);
+  }
+  if (!response.body) throw new AutopilotError('Il browser non supporta la generazione progressiva.', 500);
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffered = '';
+  let complete: GuidedStrategyBundle<TDraft> | null = null;
+  const consumeLine = (line: string) => {
+    if (!line.trim()) return;
+    const message = JSON.parse(line) as {
+      type: 'trace' | 'complete' | 'error';
+      event?: StrategyTraceEvent;
+      bundle?: GuidedStrategyBundle<TDraft>;
+      error?: string;
+    };
+    if (message.type === 'trace' && message.event) onTrace(message.event);
+    if (message.type === 'complete' && message.bundle) complete = message.bundle;
+    if (message.type === 'error') throw new AutopilotError(message.error ?? 'Generazione strategia non riuscita.', 500);
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    buffered += decoder.decode(value, { stream: !done });
+    const lines = buffered.split('\n');
+    buffered = lines.pop() ?? '';
+    lines.forEach(consumeLine);
+    if (done) break;
+  }
+  consumeLine(buffered);
+  if (!complete) throw new AutopilotError('La generazione si è interrotta prima del risultato finale.', 500);
+  return complete;
+}
+
 export const autopilot = {
   state: () => call<AutopilotState>('/agent/state'),
   runs: (limit = 30) => call<{ runs: RunSummary[] }>(`/agent/runs?limit=${limit}`),
@@ -373,12 +465,17 @@ export const autopilot = {
       method: 'POST',
       body: JSON.stringify({ answers }),
     }),
+  strategyDraftStream: <TDraft = Record<string, unknown>>(
+    answers: Record<string, unknown>,
+    onTrace: (event: StrategyTraceEvent) => void,
+  ) => streamStrategyDraft<TDraft>(answers, onTrace),
   activateStrategy: <TDraft = Record<string, unknown>>(payload: {
     answers: Record<string, unknown>;
     strategySpec: Record<string, unknown>;
     portfolioId: string;
     generatedBy?: string;
     reviewMaxDrawdownPct?: number;
+    collaboration?: StrategyCollaboration | null;
   }) => call<{ ok: true; config: AutopilotConfig; strategySpec: Record<string, unknown>; scenario: Record<string, unknown>; draft: TDraft }>('/agent/strategy/activate', {
     method: 'POST',
       body: JSON.stringify(payload),

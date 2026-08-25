@@ -73,8 +73,8 @@ export async function runDiagnostics(resolved, config, env = {}) {
       });
       const portfolio = await agentClient.portfolio(credentials.etoroAgentToken);
       checks.push(ok('etoro.agent', 'eToro — token Agent Portfolio',
-        `valido · equity ${portfolio.equityUsd} USD · ${portfolio.positions.length} posizioni`,
-        { data: { equityUsd: portfolio.equityUsd, positions: portfolio.positions.length } }));
+        `valido · base virtuale eToro ${portfolio.equityUsd} USD · ${portfolio.positions.length} posizioni · capitale reale configurato ${config.budgetEur} EUR`,
+        { data: { virtualEquityUsd: portfolio.equityUsd, configuredRealCapitalEur: config.budgetEur, positions: portfolio.positions.length } }));
     } catch (error) {
       checks.push(ko('etoro.agent', 'eToro — token Agent Portfolio', error.message,
         error.status === 401
@@ -111,7 +111,10 @@ export async function runDiagnostics(resolved, config, env = {}) {
     const missing = [];
     for (const entry of config.whitelist) {
       try {
-        const found = await readClient.searchInstrument(entry.symbol);
+        const found = await readClient.searchInstrument(entry.symbol, {
+          tryUsd: entry.class === 'crypto',
+          maxQueriesPerVariant: 1,
+        });
         if (!found?.instrumentId) missing.push(entry.symbol);
         else if (found.exact) resolvedSymbols.push(`${entry.symbol}→#${found.instrumentId}`);
         else approximate.push(`${entry.symbol} risolto come ${found.matchedAs} (#${found.instrumentId})`);
@@ -141,7 +144,7 @@ export async function runDiagnostics(resolved, config, env = {}) {
         { data: probes })
     : ko('models', 'Provider AI',
         broken.map((item) => `${item.provider}/${item.model}: ${item.error}`).join(' · '),
-        'Workers AI è incluso nel piano gratuito di Cloudflare e non richiede chiavi: verifica che il binding "AI" sia in wrangler.jsonc. In alternativa aggiungi una chiave Gemini o Groq nelle Credenziali.'));
+        'Verifica il binding Workers AI e le chiavi dei provider esterni. La cascata prova automaticamente Gemini, Groq e OpenRouter quando sono configurati.'));
 
   // --- Notifiche ----------------------------------------------------------
   if (!credentials.telegramBotToken && !credentials.telegramChatId && !credentials.notifyWebhookUrl) {
