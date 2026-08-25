@@ -556,9 +556,6 @@ export function StrategyOnboarding({
                     <span>{selectedPortfolio.subtitle ?? portfolioStatusCopy(selectedPortfolio.status)}</span>
                     <small>
                       {selectedPortfolio.id}
-                      {selectedPortfolio.virtualBalanceUsd
-                        ? ` · base virtuale eToro ${NUMBER_FORMAT.format(selectedPortfolio.virtualBalanceUsd)} USD`
-                        : ''}
                     </small>
                   </div>
                   <span className={cn('so-connection-chip', selectedPortfolio.status === 'needs-token' && 'is-warning')}>
@@ -647,7 +644,7 @@ export function StrategyOnboarding({
               <div className="so-side-note-icon"><Activity size={22} aria-hidden /></div>
               <p className="so-side-kicker">Profilo in costruzione</p>
               <h2>{OBJECTIVES.find((item) => item.id === answers.objective)?.title}</h2>
-              <p>Con {NUMBER_FORMAT.format(answers.budgetEur)} € reali su un orizzonte di {answers.horizonMonths} mesi, le percentuali della base virtuale eToro verranno replicate in proporzione.</p>
+              <p>Con {NUMBER_FORMAT.format(answers.budgetEur)} € reali su un orizzonte di {answers.horizonMonths} mesi, eToro replicherà in proporzione l’allocazione scelta.</p>
               <dl>
                 <div><dt>Portfolio</dt><dd>{selectedPortfolio.name}</dd></div>
                 <div><dt>Modalità iniziale</dt><dd>Shadow</dd></div>

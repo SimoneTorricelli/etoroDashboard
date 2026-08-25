@@ -14,6 +14,48 @@ function violation(code, message, severity = 'blocking', data) {
   return { code, message, severity, data };
 }
 
+/**
+ * Su un portafoglio ancora vuoto completa una proposta troppo concentrata con
+ * candidati già ammessi e ordinati dallo screening. L'AI mantiene la scelta dei
+ * pesi principali; il livello deterministico rende però il piano materialmente
+ * compatibile con il numero preferito di posizioni e con i cap.
+ */
+export function expandInitialDiversification(targetWeights, features, config, scores, violations, completionSymbols) {
+  const weights = { ...targetWeights };
+  if (Number(features.portfolio.openPositions) > 0) return weights;
+  const allowed = completionSymbols?.length ? new Set(completionSymbols) : null;
+  const eligible = features.instruments
+    .filter((item) => (item.maxWeight ?? 0) > 0.001 && (!allowed || allowed.has(item.symbol)))
+    .sort((a, b) => (scores.get(b.symbol) ?? -Infinity) - (scores.get(a.symbol) ?? -Infinity) || a.symbol.localeCompare(b.symbol));
+  const preferred = Math.max(
+    Number(config.minHoldings) || 1,
+    Number(config.preferredHoldings) || Number(config.minHoldings) || 1,
+  );
+  const desired = Math.min(Number(config.maxHoldings) || preferred, preferred, eligible.length);
+  const eligibleSymbols = new Set(eligible.map((item) => item.symbol));
+  const proposed = new Set(Object.entries(weights)
+    .filter(([symbol, weight]) => symbol !== 'CASH' && Number(weight) > 0.001 && eligibleSymbols.has(symbol))
+    .map(([symbol]) => symbol));
+  if (proposed.size >= desired) return weights;
+
+  const added = [];
+  for (const item of eligible) {
+    if (proposed.has(item.symbol)) continue;
+    weights[item.symbol] = Number(weights[item.symbol]) || 0;
+    proposed.add(item.symbol);
+    added.push(item.symbol);
+    if (proposed.size >= desired) break;
+  }
+  if (added.length) {
+    violations.push(violation(
+      'diversification_completed',
+      `portafoglio iniziale completato a ${proposed.size} strumenti con i candidati meglio classificati: ${added.join(', ')}`,
+      'clamped',
+    ));
+  }
+  return weights;
+}
+
 /** Riduce i pesi entro i limiti per strumento e per classe, poi rinormalizza. */
 export function clampWeights(targetWeights, features, config, violations) {
   const bySymbol = new Map(features.instruments.map((item) => [item.symbol, item]));
@@ -108,7 +150,7 @@ export function clampWeights(targetWeights, features, config, violations) {
 /**
  * @returns {{ok: boolean, violations: Array, plan: object}}
  */
-export function validateProposal({ proposal, features, config, ordersToday = 0, ledger = new Map(), scores = new Map() }) {
+export function validateProposal({ proposal, features, config, ordersToday = 0, ledger = new Map(), scores = new Map(), completionSymbols = null }) {
   const violations = [];
   const equityUsd = features.portfolio.equityUsd;
   const bySymbol = new Map(features.instruments.map((item) => [item.symbol, item]));
@@ -122,7 +164,15 @@ export function validateProposal({ proposal, features, config, ordersToday = 0, 
     violations.push(violation('daily_order_cap', `raggiunto il limite di ${config.maxOrdersPerDay} ordini nelle ultime 24h`));
   }
 
-  let targets = clampWeights(proposal.targetWeights, features, config, violations);
+  const expandedTargets = expandInitialDiversification(
+    proposal.targetWeights,
+    features,
+    config,
+    scores,
+    violations,
+    completionSymbols,
+  );
+  let targets = clampWeights(expandedTargets, features, config, violations);
 
   // Numero massimo di posizioni: si tengono i pesi più alti, il resto va a cassa.
   const invested = Object.entries(targets).filter(([symbol, weight]) => symbol !== 'CASH' && weight > 0.001);
@@ -219,10 +269,18 @@ export function validateProposal({ proposal, features, config, ordersToday = 0, 
 
   // Cap di turnover: scala proporzionalmente l'intero piano.
   const turnoverUsd = candidates.reduce((sum, item) => sum + Math.abs(item.deltaUsd), 0);
-  const turnoverCapUsd = config.maxTurnoverPct * equityUsd;
+  const initialConstruction = Number(features.portfolio.openPositions) === 0
+    && Number(features.portfolio.cashWeight) >= 0.95;
+  // Il turnover scelto dall'utente limita i ribilanciamenti successivi. La
+  // costruzione iniziale può invece raggiungere il deployment esplicitamente
+  // richiesto, altrimenti servirebbero cicli artificiali lasciando cassa ferma.
+  const turnoverCapPct = initialConstruction
+    ? Math.max(config.maxTurnoverPct, Number(config.targetDeploymentPct) || (1 - config.maxCashPct))
+    : config.maxTurnoverPct;
+  const turnoverCapUsd = turnoverCapPct * equityUsd;
   if (turnoverUsd > turnoverCapUsd && turnoverUsd > 0) {
     const factor = turnoverCapUsd / turnoverUsd;
-    violations.push(violation('turnover_cap', `turnover ${round(turnoverUsd, 0)} USD ridotto a ${round(turnoverCapUsd, 0)} USD (${(config.maxTurnoverPct * 100).toFixed(0)}%)`, 'clamped'));
+    violations.push(violation('turnover_cap', `turnover ${round(turnoverUsd, 0)} USD ridotto a ${round(turnoverCapUsd, 0)} USD (${(turnoverCapPct * 100).toFixed(0)}%)`, 'clamped'));
     for (const item of candidates) item.deltaUsd = round(item.deltaUsd * factor, 2);
     candidates = candidates.filter((item) => Math.abs(item.deltaUsd) >= config.minOrderUsd);
   }
@@ -243,7 +301,8 @@ export function validateProposal({ proposal, features, config, ordersToday = 0, 
 
   // Numero massimo di ordini per run: si tengono gli scostamenti più grandi.
   candidates.sort((a, b) => Math.abs(b.deltaUsd) - Math.abs(a.deltaUsd));
-  const remainingSlots = Math.max(0, Math.min(config.maxOrdersPerRun, config.maxOrdersPerDay - ordersToday));
+  // Margine prudenziale sotto il limite ufficiale eToro di 20 scritture/minuto.
+  const remainingSlots = Math.max(0, Math.min(16, config.maxOrdersPerRun, config.maxOrdersPerDay - ordersToday));
   if (candidates.length > remainingSlots) {
     violations.push(violation('run_order_cap', `${candidates.length} ordini richiesti, ne vengono eseguiti ${remainingSlots}`, 'clamped'));
     for (const dropped of candidates.slice(remainingSlots)) dropped.skipped = 'oltre il numero massimo di ordini';
@@ -310,6 +369,7 @@ export function validateProposal({ proposal, features, config, ordersToday = 0, 
     rationale: proposal.rationale,
     risks: proposal.risks,
     watch: proposal.watch,
+    executionScale: Number(features.portfolio.executionScale) > 0 ? Number(features.portfolio.executionScale) : 1,
   };
 
   return { ok: blocking.length === 0, violations, plan };

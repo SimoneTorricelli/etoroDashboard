@@ -113,7 +113,8 @@ export async function saveCredentials(db, env, patch) {
  * resta sempre internamente coerente e riconoscibile dalla fingerprint.
  */
 export async function saveVerifiedAgentToken(db, env, {
-  token, portfolioId, portfolioName = '', verifiedAt = Date.now(), currentConfig,
+  token, portfolioId, portfolioName = '', mirrorId = '', virtualBalanceUsd = 0,
+  verifiedAt = Date.now(), currentConfig,
 }) {
   const cleanToken = String(token ?? '').trim();
   const cleanPortfolioId = String(portfolioId ?? '').trim();
@@ -136,6 +137,8 @@ export async function saveVerifiedAgentToken(db, env, {
     ...(currentConfig ?? {}),
     activeAgentPortfolioId: binding.portfolioId,
     activeAgentPortfolioName: binding.portfolioName,
+    activeAgentPortfolioMirrorId: String(mirrorId ?? ''),
+    activeAgentPortfolioVirtualBalanceUsd: Number(virtualBalanceUsd) || 0,
     agentTokenVerifiedAt: binding.verifiedAt,
     agentTokenHint: `••••${cleanToken.slice(-4)}`,
     agentTokenFingerprint: fingerprint,

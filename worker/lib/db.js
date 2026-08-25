@@ -66,12 +66,21 @@ export const DEFAULT_CONFIG = {
    */
   activeAgentPortfolioId: '',
   activeAgentPortfolioName: '',
+  activeAgentPortfolioMirrorId: '',
+  activeAgentPortfolioVirtualBalanceUsd: 0,
   agentTokenVerifiedAt: 0,
   agentTokenHint: '',
   agentTokenFingerprint: '',
   agentTokenOrigin: '',
   /** Cambio EUR→USD di fallback se le fonti FX non rispondono. */
   fallbackEurUsd: 1.08,
+  /** Ultimo capitale reale del mirror eToro, mai il saldo virtuale dell'Agent. */
+  lastManagedCapitalUsd: 0,
+  lastManagedCapitalEur: 0,
+  lastManagedCapitalAt: 0,
+  lastManagedEurUsd: 0,
+  /** Inizio della serie v2 basata esclusivamente sul mirror reale. */
+  realCapitalTrackingStartedAt: 0,
 
   /**
    * fixed: l'AI riceve la whitelist e decide solo i pesi.
@@ -83,6 +92,7 @@ export const DEFAULT_CONFIG = {
   /** Quanti strumenti al massimo/minimo tenere contemporaneamente. */
   maxHoldings: 8,
   minHoldings: 4,
+  preferredHoldings: 6,
   /** Pool di candidati per la modalità dinamica. */
   pool: [],
 
@@ -129,7 +139,7 @@ export const DEFAULT_CONFIG = {
   maxOrdersPerDay: 8,
   minOrderUsd: 10,
   maxOrderUsd: 120,
-  /** Tetto dinamico per ordine rispetto all'equity virtuale gestita. */
+  /** Tetto dinamico per ordine rispetto al capitale reale gestito. */
   maxOrderPctOfCapital: 0.20,
   maxTurnoverPct: 0.20,         // quota max di portafoglio movimentata per run
   minRebalanceBandAbs: 0.03,    // scostamento assoluto minimo per agire
@@ -263,8 +273,10 @@ export async function saveValidation(db, runId, validation) {
     .run();
 }
 
-export async function recordEquity(db, equityUsd, investedUsd, cashUsd) {
-  const previous = await db.prepare('SELECT hwm_usd FROM equity_curve ORDER BY at DESC LIMIT 1').first();
+export async function recordEquity(db, equityUsd, investedUsd, cashUsd, since = 0) {
+  const previous = since > 0
+    ? await db.prepare('SELECT hwm_usd FROM equity_curve WHERE at >= ? ORDER BY at DESC LIMIT 1').bind(since).first()
+    : await db.prepare('SELECT hwm_usd FROM equity_curve ORDER BY at DESC LIMIT 1').first();
   const hwm = Math.max(Number(previous?.hwm_usd ?? 0), equityUsd);
   await db.prepare('INSERT OR REPLACE INTO equity_curve (at, equity_usd, invested_usd, cash_usd, hwm_usd) VALUES (?, ?, ?, ?, ?)')
     .bind(Date.now(), equityUsd, investedUsd ?? null, cashUsd ?? null, hwm)
@@ -435,7 +447,10 @@ export async function loadUniverseCache(db) {
   return new Map((results ?? []).map((row) => [row.symbol, row]));
 }
 
-export async function equityHistory(db, limit = 400) {
-  const { results } = await db.prepare('SELECT * FROM equity_curve ORDER BY at DESC LIMIT ?').bind(limit).all();
+export async function equityHistory(db, limit = 400, since = 0) {
+  const query = since > 0
+    ? db.prepare('SELECT * FROM equity_curve WHERE at >= ? ORDER BY at DESC LIMIT ?').bind(since, limit)
+    : db.prepare('SELECT * FROM equity_curve ORDER BY at DESC LIMIT ?').bind(limit);
+  const { results } = await query.all();
   return (results ?? []).reverse();
 }

@@ -9,7 +9,6 @@ import { useState } from 'react';
 import { toast } from 'sonner';
 import { KeyRound, Loader2, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { Badge } from '@/components/ui/badge';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { autopilot, type AgentPortfolioSummary } from '@/lib/agent/autopilot-api';
 
@@ -82,9 +81,6 @@ export function AgentTokenGenerator({ onGenerated }: Props) {
                 <p className="font-mono text-[11px] text-text-2">{portfolio.id}</p>
               </div>
               <div className="flex items-center gap-2">
-                {portfolio.virtualBalanceUsd > 0 && (
-                  <Badge variant="outline" className="tabular-nums">{portfolio.virtualBalanceUsd} USD virtuali</Badge>
-                )}
                 <Button size="sm" disabled={busy !== null} onClick={() => void generate(portfolio)}>
                   {busy === portfolio.id ? <Loader2 className="size-4 animate-spin" /> : <KeyRound className="size-4" />}
                   Genera token

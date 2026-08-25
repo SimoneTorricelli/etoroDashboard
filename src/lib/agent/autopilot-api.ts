@@ -63,12 +63,19 @@ export interface AutopilotConfig {
   shadowDays?: number;
   activeAgentPortfolioId?: string;
   activeAgentPortfolioName?: string;
+  activeAgentPortfolioMirrorId?: string;
   agentTokenVerifiedAt?: number;
   agentTokenHint?: string;
+  lastManagedCapitalUsd?: number;
+  lastManagedCapitalEur?: number;
+  lastManagedCapitalAt?: number;
+  lastManagedEurUsd?: number;
+  realCapitalTrackingStartedAt?: number;
   universeMode: 'fixed' | 'dynamic';
   shortlistSize: number;
   maxHoldings: number;
   minHoldings: number;
+  preferredHoldings?: number;
   pool: WhitelistEntry[];
   minHoldingDays: number;
   reentryCooldownDays: number;
@@ -213,6 +220,7 @@ export interface AgentPortfolioSummary {
   id: string;
   name: string;
   virtualBalanceUsd: number;
+  mirrorId?: string;
   createdAt: string;
 }
 

@@ -136,7 +136,7 @@ export function describeProfile(config) {
     return [
       `Strategia guidata “${spec.name}”: ${spec.objective?.description ?? config.riskProfile}`,
       `Orizzonte ${spec.objective?.horizonMonths ?? 'n/d'} mesi. Volatilità annua desiderata ${spec.risk?.targetVolatilityPct?.min ?? 'n/d'}–${spec.risk?.targetVolatilityPct?.max ?? 'n/d'}%.`,
-      `Tieni fra ${spec.diversification?.minPositions ?? config.minHoldings} e ${spec.diversification?.maxPositions ?? config.maxHoldings} strumenti; universo policy-dynamic, cap e preferenze non ampliabili dall'AI.`,
+      `Tieni fra ${spec.diversification?.minPositions ?? config.minHoldings} e ${spec.diversification?.maxPositions ?? config.maxHoldings} strumenti, mirando a ${config.preferredHoldings ?? spec.diversification?.preferredPositions ?? config.minHoldings}; il minimo non è il target. Universo policy-dynamic, cap e preferenze non ampliabili dall'AI.`,
       config.riskProfile,
     ].join(' ');
   }
@@ -144,7 +144,7 @@ export function describeProfile(config) {
   return [
     `Profilo ${profile.label}: ${profile.summary}`,
     `Orizzonte ${profile.horizon}. Volatilità annua desiderata ${profile.targetVolPct[0]}–${profile.targetVolPct[1]}%.`,
-    `Tieni fra ${config.minHoldings} e ${config.maxHoldings} strumenti in portafoglio.`,
+    `Tieni fra ${config.minHoldings} e ${config.maxHoldings} strumenti in portafoglio, mirando a ${config.preferredHoldings ?? config.minHoldings}.`,
     config.riskProfile,
   ].join(' ');
 }

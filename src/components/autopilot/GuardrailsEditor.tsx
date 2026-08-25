@@ -194,7 +194,7 @@ export function GuardrailsEditor({ config, onSaved }: Props) {
                 onChange={(event) => set('rebalanceHour', Number(event.target.value))} />
             </Field>
 
-            <Field label="Capitale reale allocato (EUR)" help="Quanto hai realmente investito nel copy dell’Agent Portfolio (es. 200 €), non la base virtuale eToro da 10.000 USD. Serve a mostrare gli importi reali equivalenti.">
+            <Field label="Budget strategico (EUR)" help="È il budget scelto durante l’onboarding per progettare la strategia. Durante le run, importi, grafici e ordini usano invece il capitale reale letto direttamente dal mirror eToro.">
               <Input type="number" min={10} step={10} value={draft.budgetEur}
                 onChange={(event) => set('budgetEur', Number(event.target.value))} />
             </Field>

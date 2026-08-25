@@ -16,8 +16,9 @@ import { buildShortlist, scoreInstrument } from './lib/screening.js';
 import { decideWatcherAction, detectAnomalies, isStabilized, relevantHeadlines } from './lib/watcher.js';
 import { executePlan, reconcile } from './lib/executor.js';
 import { buildAttemptPlan } from './lib/llm.js';
-import { buildCandleRefreshQueue } from './lib/pipeline.js';
+import { buildCandleRefreshQueue, scaleAgentSnapshotToReal, shortlistDeploymentCapacity } from './lib/pipeline.js';
 import { buildStrategyActivationNotification } from './lib/notify.js';
+import { EtoroClient } from './lib/etoro.js';
 
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -165,6 +166,69 @@ test('cache storici: priorità alle posizioni e tetto di refresh', () => {
   assert.equal(queue[0].meta.instrumentId, 3009);
 });
 
+test('capitale Agent: i 10.000 tecnici vengono scalati sul mirror reale', () => {
+  const managed = scaleAgentSnapshotToReal(
+    {
+      takenAt: 1, equityUsd: 10_000, cashUsd: 6_000, investedUsd: 4_000,
+      positions: [{ positionId: 91, instrumentId: 1001, invested: 4_000, valueUsd: 4_000, grossValueUsd: 4_000, pnlUsd: 0 }],
+    },
+    {
+      takenAt: 2, mirrorId: '77', equityUsd: 428.45, cashUsd: 257.07,
+      positions: [{ positionId: 501, instrumentId: 1001, invested: 171.38, valueUsd: 171.38, pnlUsd: 0 }],
+    },
+  );
+  assert.equal(managed.equityUsd, 428.45);
+  assert.equal(managed.cashUsd, 257.07);
+  assert.equal(managed.positions[0].positionId, 91, 'serve l’ID operativo dell’Agent');
+  assert.equal(managed.positions[0].valueUsd, 171.38);
+  assert.ok(Math.abs(managed.executionScale - (10_000 / 428.45)) < 1e-6);
+});
+
+test('eToro: il mirrorId collega l’Agent Portfolio al capitale reale del proprietario', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).endsWith('/agent-portfolios')) {
+      return new Response(JSON.stringify({
+        agentPortfolios: [{
+          agentPortfolioId: '0405bc2a-2bd1-443b-9000-8e6846fe6d10',
+          agentPortfolioName: '0405bc2a',
+          agentPortfolioVirtualBalance: 10_000,
+          mirrorId: 771,
+        }],
+      }), { status: 200 });
+    }
+    return new Response(JSON.stringify({
+      clientPortfolio: {
+        Mirrors: [{ MirrorID: 771, AvailableAmount: 428.45, Positions: [] }],
+      },
+    }), { status: 200 });
+  };
+  try {
+    const client = new EtoroClient({ apiKey: 'api', userKey: 'owner' });
+    const remote = (await client.agentPortfolios())[0];
+    const real = await client.mirrorPortfolio(remote.mirrorId);
+    assert.equal(remote.name, '0405bc2a');
+    assert.equal(remote.virtualBalanceUsd, 10_000);
+    assert.equal(remote.mirrorId, '771');
+    assert.equal(real.equityUsd, 428.45);
+    assert.equal(real.source, 'owner-mirror');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('readiness: misura la capacità della shortlist entro i cap di classe', () => {
+  const shortlist = [
+    ...Array.from({ length: 8 }, (_, index) => ({ symbol: `S${index}`, class: 'stock', maxWeight: 0.1 })),
+    ...Array.from({ length: 3 }, (_, index) => ({ symbol: `E${index}`, class: 'etf', maxWeight: 0.1 })),
+  ];
+  const capacity = shortlistDeploymentCapacity(shortlist, {
+    maxHoldings: 20,
+    maxWeightPerClass: { stock: 0.6, etf: 0.4 },
+  });
+  assert.ok(Math.abs(capacity - 0.9) < 1e-9);
+});
+
 test('estrazione JSON tollera testo attorno e code fence', () => {
   const parsed = extractJson('Ecco il piano:\n```json\n{"targetWeights":{"SPY":0.5,"CASH":0.5},"confidence":0.7,"rationale":"ok"}\n```\nFine.');
   assert.equal(parsed.confidence, 0.7);
@@ -195,6 +259,67 @@ test('guardrail: confidence bassa blocca la run', () => {
   const result = validateProposal({ proposal, features, config });
   assert.equal(result.ok, false);
   assert.ok(result.violations.some((item) => item.code === 'low_confidence'));
+});
+
+test('guardrail: il portafoglio iniziale mira alle posizioni preferite e rispetta i cap', () => {
+  const instruments = Array.from({ length: 15 }, (_, index) => ({
+    symbol: `A${index + 1}`,
+    instrumentId: 2_000 + index,
+    class: index < 10 ? 'stock' : 'etf',
+    maxWeight: index === 0 ? 0.10 : index === 1 ? 0.11 : index === 2 ? 0.08 : 0.10,
+    weight: 0,
+    valueUsd: 0,
+    investedUsd: 0,
+    pnlUsd: 0,
+    pnlPct: null,
+    positionIds: [],
+  }));
+  const initialFeatures = {
+    portfolio: { equityUsd: 500, cashUsd: 500, openPositions: 0, cashWeight: 1, executionScale: 20 },
+    instruments,
+  };
+  const initialConfig = {
+    ...DEFAULT_CONFIG,
+    frozen: false,
+    minConfidence: 0.5,
+    minHoldings: 3,
+    preferredHoldings: 15,
+    maxHoldings: 20,
+    minCashPct: 0.03,
+    maxCashPct: 0.03,
+    targetDeploymentPct: 0.97,
+    maxTurnoverPct: 0.28,
+    maxOrdersPerRun: 16,
+    maxOrdersPerDay: 20,
+    minOrderUsd: 1,
+    maxOrderUsd: 100_000,
+    maxOrderPctOfCapital: 0.2,
+    minRebalanceBandAbs: 0.001,
+    minRebalanceBandRel: 0.01,
+    transactionCostBps: 1,
+    maxWeightPerClass: { stock: 0.75, etf: 0.4, cash: 1 },
+  };
+  const proposal = {
+    targetWeights: { A1: 0.4, A2: 0.3, A3: 0.25, CASH: 0.05 },
+    confidence: 0.8,
+    rationale: '', risks: [], watch: [],
+  };
+  const scores = new Map(instruments.map((item, index) => [item.symbol, 80 - index]));
+  const result = validateProposal({
+    proposal,
+    features: initialFeatures,
+    config: initialConfig,
+    scores,
+    completionSymbols: instruments.map((item) => item.symbol),
+  });
+  const invested = Object.entries(result.plan.targets).filter(([symbol, weight]) => symbol !== 'CASH' && weight > 0.001);
+  assert.equal(result.ok, true);
+  assert.equal(invested.length, 15);
+  assert.ok(result.plan.targets.CASH <= 0.0301);
+  assert.ok(result.plan.targets.A1 <= 0.1001);
+  assert.ok(result.violations.some((item) => item.code === 'diversification_completed'));
+  assert.ok(result.plan.turnoverPct > 0.28, 'la costruzione iniziale non usa il cap dei ribilanciamenti');
+  assert.equal(result.plan.executionScale, 20);
 });
 
 test('guardrail: freeze blocca sempre', () => {

@@ -53,7 +53,6 @@ const PREFERENCE_LABEL: Record<string, string> = {
 };
 
 const EUR = new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR', maximumFractionDigits: 2 });
-const USD = new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 });
 
 function buildScenarioData(favorablePct: number, adversePct: number, horizonMonths: number) {
   const steps = Math.max(4, Math.min(12, horizonMonths));
@@ -84,6 +83,8 @@ export function ActiveStrategyDashboard({
   onDryRun,
 }: ActiveStrategyDashboardProps) {
   const budgetEur = Number(answers?.budgetEur ?? config.budgetEur) || 0;
+  const eurUsd = Number(config.lastManagedEurUsd ?? config.fallbackEurUsd) || 1;
+  const latestManagedEur = Number(config.lastManagedCapitalEur) || budgetEur;
   const preferences = (answers?.macroPreferences ?? []).map((item) => PREFERENCE_LABEL[item] ?? item);
   const scenario = useMemo(
     () => buildScenarioData(draft.scenario.favorablePct, draft.scenario.adversePct, draft.scenario.horizonMonths),
@@ -98,14 +99,13 @@ export function ActiveStrategyDashboard({
       return {
         at: point.at,
         label: formatTime(point.at),
-        virtualUsd: Number(point.equity_usd),
-        realEur: budgetEur * (1 + pct / 100),
+        realEur: Number(point.equity_usd) / eurUsd,
+        cashEur: Number(point.cash_usd ?? 0) / eurUsd,
         pct,
       };
     });
-  }, [budgetEur, equityCurve]);
+  }, [equityCurve, eurUsd]);
   const latest = performance.at(-1);
-  const latestPoint = equityCurve.at(-1);
   const currentPct = latest?.pct ?? 0;
   const statusLabel = config.executionMode === 'live' ? 'Live' : config.executionMode === 'dry-run' ? 'Dry-run' : 'Shadow';
 
@@ -129,7 +129,7 @@ export function ActiveStrategyDashboard({
         <div>
           {preferences.length ? preferences.map((preference) => <span key={preference}><Check size={12} aria-hidden /> {preference}</span>) : <span>Universo dinamico guidato dalla policy</span>}
           {answers?.cryptoPreference ? <span>Crypto: {answers.cryptoPreference === 'none' ? 'escluse' : answers.cryptoPreference === 'majors' ? 'solo large cap' : answers.cryptoPreference === 'broad' ? 'large cap e altcoin' : 'meme coin abilitate'}</span> : null}
-          <span>Fino a {draft.guardrails.maxHoldings} posizioni</span>
+          <span>Obiettivo {config.preferredHoldings ?? Math.round(draft.guardrails.maxHoldings * 0.75)} · massimo {draft.guardrails.maxHoldings} posizioni</span>
         </div>
       </div>
 
@@ -197,9 +197,9 @@ export function ActiveStrategyDashboard({
         </div>
         <div className="asd-performance-layout">
           <div className="asd-performance-kpis">
-            <div><span>Capitale reale stimato</span><strong>{EUR.format(latest?.realEur ?? budgetEur)}</strong><small>Replica proporzionale della performance virtuale</small></div>
+            <div><span>Capitale reale eToro</span><strong>{EUR.format(latest?.realEur ?? latestManagedEur)}</strong><small>Letto dal mirror del portfolio selezionato</small></div>
             <div><span>Performance osservata</span><strong className={currentPct < 0 ? 'is-negative' : 'is-positive'}>{currentPct >= 0 ? '+' : ''}{currentPct.toFixed(2)}%</strong><small>Dalla prima rilevazione disponibile</small></div>
-            <div><span>Base virtuale eToro</span><strong>{latest ? USD.format(latest.virtualUsd) : 'In attesa'}</strong><small>È un conto virtuale, non il tuo capitale reale</small></div>
+            <div><span>Liquidità reale</span><strong>{latest ? EUR.format(latest.cashEur) : 'In attesa'}</strong><small>Disponibile nel mirror per i prossimi ordini</small></div>
           </div>
           <div className="asd-performance-chart">
             {performance.length > 1 ? (
@@ -221,7 +221,7 @@ export function ActiveStrategyDashboard({
         </div>
         <footer>
           <ShieldCheck size={15} aria-hidden />
-          L’importo in euro è una stima proporzionale: eToro espone circa {latestPoint ? USD.format(latestPoint.equity_usd) : '10.000 USD'} virtuali, mentre il capitale reale gestito resta {EUR.format(budgetEur)}.
+          Grafico e percentuali usano soltanto il capitale reale del mirror eToro. La base tecnica dell’Agent resta interna al motore e non entra nei valori mostrati.
         </footer>
       </article>
 

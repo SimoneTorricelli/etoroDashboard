@@ -26,8 +26,91 @@ import {
 
 const KV_CANDLES_BUNDLE = 'candles:v2:bundle';
 const CANDLE_CACHE_MAX_AGE_MS = 12 * 60 * 60 * 1000;
-const CANDLE_REFRESH_BATCH = 8;
+const CANDLE_REFRESH_BATCH = 12;
+const UNIVERSE_RESOLVE_BATCH = 12;
 const UNRESOLVED_RETRY_MS = 24 * 60 * 60 * 1000;
+
+const roundMoney = (value) => Math.round(Number(value) * 100) / 100;
+
+/**
+ * Mantiene ID e posizioni del conto operativo Agent, ma converte tutti gli
+ * importi nel capitale reale del mirror del proprietario. `executionScale`
+ * resta interno e serve solo a tradurre gli ordini reali nei 10.000 virtuali
+ * richiesti dall'API eToro.
+ */
+export function scaleAgentSnapshotToReal(virtualSnapshot, realMirrorSnapshot) {
+  const virtualEquity = Number(virtualSnapshot?.equityUsd) || 0;
+  const realEquity = Number(realMirrorSnapshot?.equityUsd) || 0;
+  if (virtualEquity <= 0 || realEquity <= 0) throw new Error('Capitale Agent o mirror reale non disponibile');
+  const globalScale = realEquity / virtualEquity;
+  const realByInstrument = new Map();
+  for (const position of realMirrorSnapshot.positions ?? []) {
+    const current = realByInstrument.get(position.instrumentId) ?? { valueUsd: 0, invested: 0, pnlUsd: 0 };
+    current.valueUsd += Number(position.valueUsd) || 0;
+    current.invested += Number(position.invested) || 0;
+    current.pnlUsd += Number(position.pnlUsd) || 0;
+    realByInstrument.set(position.instrumentId, current);
+  }
+  const virtualByInstrument = new Map();
+  for (const position of virtualSnapshot.positions ?? []) {
+    virtualByInstrument.set(
+      position.instrumentId,
+      (virtualByInstrument.get(position.instrumentId) ?? 0) + (Number(position.valueUsd) || 0),
+    );
+  }
+  const positions = (virtualSnapshot.positions ?? []).map((position) => {
+    const realGroup = realByInstrument.get(position.instrumentId);
+    const virtualGroupValue = virtualByInstrument.get(position.instrumentId) || 0;
+    const share = realGroup && virtualGroupValue > 0 ? (Number(position.valueUsd) || 0) / virtualGroupValue : 0;
+    const valueUsd = realGroup ? realGroup.valueUsd * share : (Number(position.valueUsd) || 0) * globalScale;
+    const invested = realGroup ? realGroup.invested * share : (Number(position.invested) || 0) * globalScale;
+    const pnlUsd = realGroup ? realGroup.pnlUsd * share : (Number(position.pnlUsd) || 0) * globalScale;
+    return {
+      ...position,
+      invested: roundMoney(invested),
+      valueUsd: roundMoney(valueUsd),
+      grossValueUsd: roundMoney((Number(position.grossValueUsd) || 0) * globalScale),
+      pnlUsd: roundMoney(pnlUsd),
+    };
+  });
+  return {
+    takenAt: Math.max(Number(virtualSnapshot.takenAt) || 0, Number(realMirrorSnapshot.takenAt) || 0, Date.now()),
+    cashUsd: roundMoney(realMirrorSnapshot.cashUsd),
+    investedUsd: roundMoney(positions.reduce((sum, item) => sum + item.invested, 0)),
+    positionsValueUsd: roundMoney(positions.reduce((sum, item) => sum + item.valueUsd, 0)),
+    equityUsd: roundMoney(realEquity),
+    positions,
+    source: 'owner-mirror',
+    mirrorId: realMirrorSnapshot.mirrorId,
+    executionScale: virtualEquity / realEquity,
+    virtualEquityUsd: roundMoney(virtualEquity),
+  };
+}
+
+/** Capacità massima investibile della shortlist entro cap per asset e classe. */
+export function shortlistDeploymentCapacity(shortlist, config) {
+  const classUsed = {};
+  let total = 0;
+  const maxPositions = Math.max(1, Number(config.maxHoldings) || shortlist.length);
+  const remaining = [...shortlist].filter((item) => (Number(item.maxWeight) || 0) > 0);
+  for (let slot = 0; slot < maxPositions && remaining.length; slot += 1) {
+    remaining.sort((a, b) => {
+      const roomFor = (item) => Math.min(
+        Number(item.maxWeight) || 0,
+        Math.max(0, Number(config.maxWeightPerClass?.[item.class ?? 'other'] ?? 1) - (classUsed[item.class ?? 'other'] ?? 0)),
+      );
+      return roomFor(b) - roomFor(a);
+    });
+    const item = remaining.shift();
+    const klass = item.class ?? 'other';
+    const classCap = Number(config.maxWeightPerClass?.[klass] ?? 1);
+    const room = Math.max(0, classCap - (classUsed[klass] ?? 0));
+    const allocation = Math.min(Number(item.maxWeight) || 0, room);
+    classUsed[klass] = (classUsed[klass] ?? 0) + allocation;
+    total += allocation;
+  }
+  return Math.min(1, total);
+}
 
 export function romeParts(date = new Date()) {
   const formatter = new Intl.DateTimeFormat('en-GB', {
@@ -91,6 +174,7 @@ async function resolveUniverse(client, db, config) {
   const negative = [];
   const unresolved = [];
   const now = Date.now();
+  let lookupAttempts = 0;
 
   for (const entry of universeSource(config)) {
     const cached = cache.get(entry.symbol);
@@ -102,6 +186,11 @@ async function resolveUniverse(client, db, config) {
       unresolved.push(entry.symbol);
       continue;
     }
+    if (lookupAttempts >= UNIVERSE_RESOLVE_BATCH) {
+      unresolved.push(entry.symbol);
+      continue;
+    }
+    lookupAttempts += 1;
     try {
       const found = await client.searchInstrument(entry.symbol, {
         tryUsd: entry.class === 'crypto',
@@ -294,16 +383,18 @@ async function runWatcher({ env, db, config, credentials, client, snapshot, feat
     if (decision.action === 'buy' && mode === 'live' && !config.frozen) {
       const id = await deterministicId(runId, `watch-${anomaly.symbol}`, anomaly.symbol, 'buy');
       try {
+        const executionScale = Number(snapshot.executionScale) > 0 ? Number(snapshot.executionScale) : 1;
+        const executionAmountUsd = roundMoney(decision.amountUsd * executionScale);
         const eligibility = await client.eligibility([anomaly.instrumentId]);
         const eligible = eligibility.get(anomaly.instrumentId);
         if (!eligible?.allowOpenPosition) {
           decision = { action: 'noop', reason: `${anomaly.symbol}: mercato chiuso o strumento non negoziabile` };
           await audit(db, runId, 'warn', 'watcher', decision.reason);
-        } else if (decision.amountUsd + 0.005 < eligible.minPositionUsd) {
-          decision = { action: 'noop', reason: `${anomaly.symbol}: importo sotto il minimo eToro di ${eligible.minPositionUsd} USD` };
+        } else if (executionAmountUsd + 0.005 < eligible.minPositionUsd) {
+          decision = { action: 'noop', reason: `${anomaly.symbol}: importo sotto il minimo reale equivalente di ${roundMoney(eligible.minPositionUsd / executionScale)} USD` };
           await audit(db, runId, 'warn', 'watcher', decision.reason);
         } else {
-          const response = await client.openOrder({ instrumentId: anomaly.instrumentId, amountUsd: decision.amountUsd, requestId: id });
+          const response = await client.openOrder({ instrumentId: anomaly.instrumentId, amountUsd: executionAmountUsd, requestId: id });
           await upsertOrder(db, {
             id, runId, seq: 900, symbol: anomaly.symbol, instrumentId: anomaly.instrumentId,
             side: 'buy', amountUsd: decision.amountUsd, mode, state: 'sent',
@@ -351,6 +442,14 @@ async function runWatcher({ env, db, config, credentials, client, snapshot, feat
 export async function runPipeline({ env, kind, modeOverride }) {
   const db = env.DB;
   const config = await loadConfig(db);
+  if (config.strategySpec?.diversification) {
+    const preferredByPolicy = Number(config.strategySpec.diversification.preferredPositions) || 0;
+    const preferredByRange = Math.round((Number(config.strategySpec.diversification.maxPositions) || config.maxHoldings) * 0.75);
+    config.preferredHoldings = Math.min(
+      Number(config.maxHoldings) || 1,
+      Math.max(Number(config.minHoldings) || 1, Number(config.preferredHoldings) || 0, preferredByPolicy, preferredByRange),
+    );
+  }
   const mode = modeOverride ?? config.executionMode;
   const baseProfile = PROFILES[config.strategyProfile] ?? PROFILES.balanced;
   const profile = config.strategySpec ? {
@@ -387,15 +486,44 @@ export async function runPipeline({ env, kind, modeOverride }) {
 
     // --- 1. Snapshot -------------------------------------------------------
     let snapshot;
+    let virtualSnapshot = null;
     try {
-      snapshot = await client.portfolio(portfolioUserKey);
+      virtualSnapshot = await client.portfolio(portfolioUserKey);
+      if (hasVerifiedAgent) {
+        let mirrorId = String(config.activeAgentPortfolioMirrorId ?? '');
+        let remote = null;
+        if (!mirrorId) {
+          remote = (await client.agentPortfolios()).find((item) => item.id === config.activeAgentPortfolioId) ?? null;
+          mirrorId = String(remote?.mirrorId ?? '');
+        }
+        if (!mirrorId) throw new Error('eToro non ha restituito il mirrorId del portfolio: impossibile leggere il capitale reale');
+        const realMirrorSnapshot = await client.mirrorPortfolio(mirrorId);
+        snapshot = scaleAgentSnapshotToReal(virtualSnapshot, realMirrorSnapshot);
+        if (mirrorId !== config.activeAgentPortfolioMirrorId || remote?.virtualBalanceUsd) {
+          config.activeAgentPortfolioMirrorId = mirrorId;
+          config.activeAgentPortfolioVirtualBalanceUsd = remote?.virtualBalanceUsd || virtualSnapshot.equityUsd;
+          await saveConfig(db, {
+            activeAgentPortfolioMirrorId: mirrorId,
+            activeAgentPortfolioVirtualBalanceUsd: config.activeAgentPortfolioVirtualBalanceUsd,
+          });
+        }
+      } else {
+        snapshot = virtualSnapshot;
+      }
     } catch (error) {
-      if (hasVerifiedAgent && Number(error?.status) === 401) {
+      if (hasVerifiedAgent && !virtualSnapshot && Number(error?.status) === 401) {
         await saveCredentials(db, env, { etoroAgentToken: '' });
         await saveConfig(db, {
           executionMode: 'shadow',
           activeAgentPortfolioId: '',
           activeAgentPortfolioName: '',
+          activeAgentPortfolioMirrorId: '',
+          activeAgentPortfolioVirtualBalanceUsd: 0,
+          lastManagedCapitalUsd: 0,
+          lastManagedCapitalEur: 0,
+          lastManagedCapitalAt: 0,
+          lastManagedEurUsd: 0,
+          realCapitalTrackingStartedAt: 0,
           agentTokenVerifiedAt: 0,
           agentTokenHint: '',
           agentTokenFingerprint: '',
@@ -405,11 +533,21 @@ export async function runPipeline({ env, kind, modeOverride }) {
       }
       throw error;
     }
+    if (!Number(config.realCapitalTrackingStartedAt)) {
+      config.realCapitalTrackingStartedAt = Date.now();
+      await saveConfig(db, { realCapitalTrackingStartedAt: config.realCapitalTrackingStartedAt });
+    }
     equityUsd = snapshot.equityUsd;
     await saveSnapshot(db, runId, snapshot);
-    const { hwm, drawdown } = await recordEquity(db, snapshot.equityUsd, snapshot.investedUsd, snapshot.cashUsd);
-    await audit(db, runId, 'info', 'snapshot', `Base virtuale eToro: equity ${snapshot.equityUsd} USD, cash ${snapshot.cashUsd} USD, ${snapshot.positions.length} posizioni`, {
-      hwm, drawdown, configuredRealCapitalEur: config.budgetEur,
+    const { hwm, drawdown } = await recordEquity(
+      db,
+      snapshot.equityUsd,
+      snapshot.investedUsd,
+      snapshot.cashUsd,
+      config.realCapitalTrackingStartedAt,
+    );
+    await audit(db, runId, 'info', 'snapshot', `Capitale reale eToro: equity ${snapshot.equityUsd} USD, cash ${snapshot.cashUsd} USD, ${snapshot.positions.length} posizioni`, {
+      hwm, drawdown, source: snapshot.source, mirrorId: snapshot.mirrorId,
     });
 
     // --- 2. Circuit breaker ------------------------------------------------
@@ -417,7 +555,7 @@ export async function runPipeline({ env, kind, modeOverride }) {
       const reason = `drawdown ${(drawdown * 100).toFixed(1)}% oltre la soglia ${(config.drawdownStopPct * 100).toFixed(0)}%`;
       await saveConfig(db, { frozen: true, frozenReason: reason });
       await audit(db, runId, 'error', 'circuit-breaker', `Agente congelato: ${reason}`);
-      await notify(credentials, 'critical', 'Autopilot congelato', [reason, `Equity virtuale ${snapshot.equityUsd} USD · massimo storico virtuale ${hwm} USD`]);
+      await notify(credentials, 'critical', 'Autopilot congelato', [reason, `Capitale reale ${snapshot.equityUsd} USD · massimo storico reale ${hwm} USD`]);
       await finishRun(db, runId, 'frozen', equityUsd, reason);
       return { runId, status: 'frozen', reason };
     }
@@ -426,7 +564,7 @@ export async function runPipeline({ env, kind, modeOverride }) {
     const { universe, unresolved } = await resolveUniverse(client, db, config);
     const heldOutsidePolicy = await mergeHeldPositions(client, db, universe, snapshot);
     if (!universe.size) throw new Error(`nessuno strumento risolto su eToro${unresolved.length ? ` (falliti: ${unresolved.join(', ')})` : ''}`);
-    if (unresolved.length) await audit(db, runId, 'warn', 'universe', `Esclusi dalla run perché non disponibili nel catalogo eToro: ${unresolved.join(', ')} · nuovo controllo entro 24h`);
+    if (unresolved.length) await audit(db, runId, 'warn', 'universe', `Risoluzione progressiva: ${unresolved.length} simboli non ancora disponibili in questa run (${unresolved.join(', ')})`);
     if (heldOutsidePolicy.length) {
       await audit(db, runId, 'warn', 'universe', `${heldOutsidePolicy.length} posizioni esistenti aggiunte fuori policy`, heldOutsidePolicy.map((item) => item.symbol));
     }
@@ -446,8 +584,19 @@ export async function runPipeline({ env, kind, modeOverride }) {
         ttlSeconds: kind === 'rebalance' ? 15 * 60 : 3 * 60 * 60,
       }),
     ]);
-    const history = await equityHistory(db, 400);
+    const history = await equityHistory(db, 400, config.realCapitalTrackingStartedAt);
     const features = buildFeatures({ snapshot, universe, candles, external, config, equityHistory: history });
+    const eurUsd = Number(features.eurUsd) || config.fallbackEurUsd;
+    config.lastManagedCapitalUsd = snapshot.equityUsd;
+    config.lastManagedCapitalEur = roundMoney(snapshot.equityUsd / eurUsd);
+    config.lastManagedCapitalAt = snapshot.takenAt;
+    config.lastManagedEurUsd = eurUsd;
+    await saveConfig(db, {
+      lastManagedCapitalUsd: config.lastManagedCapitalUsd,
+      lastManagedCapitalEur: config.lastManagedCapitalEur,
+      lastManagedCapitalAt: config.lastManagedCapitalAt,
+      lastManagedEurUsd: config.lastManagedEurUsd,
+    });
     await saveFeatures(db, runId, features);
 
     // Il registro va allineato prima di qualunque decisione.
@@ -479,6 +628,18 @@ export async function runPipeline({ env, kind, modeOverride }) {
       await audit(db, runId, 'info', 'screening', `Shortlist di ${shortlistSymbols.length} su ${screening.ranked.length} strumenti con storico sufficiente (pool risolto: ${universe.size})`, {
         top: screening.shortlist.slice(0, 10).map((item) => ({ symbol: item.symbol, score: item.score, held: item.held })),
       });
+    }
+
+    if (dynamic && Number(features.portfolio.openPositions) === 0) {
+      const preferred = Math.min(config.maxHoldings, Math.max(config.minHoldings, config.preferredHoldings));
+      const capacity = shortlistDeploymentCapacity(screening.shortlist, config);
+      const requiredDeployment = 1 - config.maxCashPct;
+      if (shortlistSymbols.length < preferred || capacity + 0.0001 < requiredDeployment) {
+        const reason = `Analisi rimandata: ${shortlistSymbols.length} candidati con storico, ne servono almeno ${preferred}; capacità entro i cap ${(capacity * 100).toFixed(0)}% su ${(requiredDeployment * 100).toFixed(0)}% richiesto. Cache aggiornata ${candleStats.refreshed} strumenti in questo ciclo.`;
+        await audit(db, runId, 'warn', 'readiness', reason, { candleStats, preferred, capacity, requiredDeployment });
+        await finishRun(db, runId, 'blocked', equityUsd, reason);
+        return { runId, status: 'blocked', reason, warming: true, candleStats };
+      }
     }
 
     // --- 6. Cervello -------------------------------------------------------
@@ -513,7 +674,15 @@ export async function runPipeline({ env, kind, modeOverride }) {
 
     // --- 7. Validazione ----------------------------------------------------
     const ordersToday = await countOrdersToday(db);
-    const validation = validateProposal({ proposal: brain.parsed, features, config, ordersToday, ledger, scores });
+    const validation = validateProposal({
+      proposal: brain.parsed,
+      features,
+      config,
+      ordersToday,
+      ledger,
+      scores,
+      completionSymbols: dynamic ? shortlistSymbols : [...universe.keys()],
+    });
     await saveValidation(db, runId, validation);
     await audit(db, runId, validation.ok ? 'info' : 'warn', 'validator',
       validation.ok ? `Piano valido: ${validation.plan.orders.length} ordini, turnover ${(validation.plan.turnoverPct * 100).toFixed(1)}%` : 'Piano bloccato dai guardrail',

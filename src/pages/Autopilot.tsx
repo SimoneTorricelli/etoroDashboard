@@ -206,8 +206,9 @@ export default function Autopilot() {
   const guarded = async (label: string, task: () => Promise<unknown>) => {
     setLoading(true);
     try {
-      const result = await task() as { status?: string; error?: string; runId?: string };
+      const result = await task() as { status?: string; error?: string; reason?: string; runId?: string; warming?: boolean };
       if (result?.status === 'error') toast.error(`Run fallita: ${result.error ?? 'errore sconosciuto'}`);
+      else if (result?.status === 'blocked' && result.warming) toast.info(result.reason ?? 'Storici in preparazione: ripeti il ciclo fra poco.');
       else if (result?.status === 'blocked') toast.warning('Piano bloccato dai guardrail: apri il dettaglio della run.');
       else toast.success(label);
       await refresh();
@@ -279,9 +280,12 @@ export default function Autopilot() {
   const config = state?.config;
   const mode = config?.executionMode ?? 'shadow';
   const frozen = Boolean(config?.frozen);
+  const realRuns = config?.realCapitalTrackingStartedAt
+    ? runs.filter((run) => run.started_at >= Number(config.realCapitalTrackingStartedAt))
+    : [];
 
   const credentialsOk = state?.credentials.filter((item) => item.required).every((item) => item.configured) ?? false;
-  const hasRun = runs.length > 0;
+  const hasRun = realRuns.length > 0;
 
   if (activeStrategyPreview) {
     const previewDraft = createStrategyOnboardingPreview(DEFAULT_STRATEGY_ONBOARDING_ANSWERS);
@@ -478,10 +482,10 @@ export default function Autopilot() {
           {/* KPI */}
           <motion.div {...stagger(3)} className="col-span-12 grid gap-4 md:grid-cols-4">
             <Card>
-              <CardHeader className="pb-1"><CardDescription className="text-text-1">Base virtuale eToro</CardDescription></CardHeader>
+              <CardHeader className="pb-1"><CardDescription className="text-text-1">Capitale reale Agent</CardDescription></CardHeader>
               <CardContent>
-                <div className="text-2xl font-semibold tabular-nums text-text-0">{fmtUsd(state.equityUsd)}</div>
-                <p className="text-xs text-text-1">Non è il capitale reale · allocato {fmtEur(config.budgetEur)}</p>
+                <div className="text-2xl font-semibold tabular-nums text-text-0">{fmtEur(config.lastManagedCapitalEur || null)}</div>
+                <p className="text-xs text-text-1">Ultima lettura del mirror eToro · {fmtUsd(state.equityUsd)}</p>
               </CardContent>
             </Card>
             <Card>
@@ -707,15 +711,15 @@ export default function Autopilot() {
                           <TableHead>Tipo</TableHead>
                           <TableHead>Modalità</TableHead>
                           <TableHead>Esito</TableHead>
-                          <TableHead className="text-right">Equity virtuale</TableHead>
+                          <TableHead className="text-right">Capitale reale</TableHead>
                           <TableHead />
                         </TableRow>
                       </TableHeader>
                       <TableBody>
-                        {runs.length === 0 && (
+                        {realRuns.length === 0 && (
                           <TableRow><TableCell colSpan={6} className="py-8 text-center text-sm text-text-1">Nessuna run registrata.</TableCell></TableRow>
                         )}
-                        {runs.map((run) => (
+                        {realRuns.map((run) => (
                           <TableRow key={run.id} className="cursor-pointer" onClick={() => void openRun(run.id)}>
                             <TableCell className="whitespace-nowrap tabular-nums text-text-0">{fmtDate(run.started_at)}</TableCell>
                             <TableCell className="text-text-1">{KIND_LABEL[run.kind] ?? run.kind}</TableCell>
@@ -757,9 +761,12 @@ export default function Autopilot() {
                               <div className="flex flex-wrap items-center gap-2">
                                 <Badge variant="secondary">{detail.proposal.model}</Badge>
                                 <Badge variant={detail.proposal.parsed.confidence >= config.minConfidence ? 'default' : 'outline'}>
-                                  confidence {detail.proposal.parsed.confidence.toFixed(2)} (soglia {config.minConfidence})
+                                  affidabilità {detail.proposal.parsed.confidence.toFixed(2)} (minimo {config.minConfidence})
                                 </Badge>
                               </div>
+                              <p className="text-xs leading-relaxed text-text-1">
+                                L’affidabilità è la stima prudenziale del modello sulla qualità della decisione rispetto a non cambiare nulla. Non dipende dalla grandezza del capitale; sotto il minimo il piano resta visibile, ma non può produrre ordini.
+                              </p>
                               <p className="text-sm leading-relaxed text-text-0">{detail.proposal.parsed.rationale}</p>
                               <div>
                                 <p className="mb-1 text-xs text-text-1">Allocazione proposta</p>
@@ -825,11 +832,7 @@ export default function Autopilot() {
                                     <TableCell className="font-medium text-text-0">{order.symbol}</TableCell>
                                     <TableCell className={order.side === 'buy' ? 'text-gain' : 'text-loss'}>{order.side === 'buy' ? 'ACQUISTA' : 'VENDI'}</TableCell>
                                     <TableCell className="text-right tabular-nums text-text-0">
-                                      {fmtUsd(order.amount_usd)} <span className="block text-[10px] text-text-2">virtuali · ≈ {fmtEur(
-                                        detail.snapshot?.equity_usd
-                                          ? order.amount_usd / detail.snapshot.equity_usd * config.budgetEur
-                                          : null,
-                                      )} reali</span>
+                                      {fmtUsd(order.amount_usd)} <span className="block text-[10px] text-text-2">capitale reale</span>
                                     </TableCell>
                                     <TableCell><Badge variant="outline">{order.state}</Badge></TableCell>
                                     <TableCell className="max-w-[280px] truncate text-xs text-text-1">{order.message}</TableCell>

@@ -72,9 +72,20 @@ export async function runDiagnostics(resolved, config, env = {}) {
         agentToken: credentials.etoroAgentToken,
       });
       const portfolio = await agentClient.portfolio(credentials.etoroAgentToken);
+      let realPortfolio = null;
+      if (readClient && config.activeAgentPortfolioId) {
+        let mirrorId = String(config.activeAgentPortfolioMirrorId ?? '');
+        if (!mirrorId) {
+          const remote = (await readClient.agentPortfolios()).find((item) => item.id === config.activeAgentPortfolioId);
+          mirrorId = String(remote?.mirrorId ?? '');
+        }
+        if (mirrorId) realPortfolio = await readClient.mirrorPortfolio(mirrorId);
+      }
+      if (!realPortfolio) throw new Error('Token valido, ma capitale reale del mirror non leggibile');
+      const eurUsd = Number(config.lastManagedEurUsd) || Number(config.fallbackEurUsd) || 1;
       checks.push(ok('etoro.agent', 'eToro — token Agent Portfolio',
-        `valido · base virtuale eToro ${portfolio.equityUsd} USD · ${portfolio.positions.length} posizioni · capitale reale configurato ${config.budgetEur} EUR`,
-        { data: { virtualEquityUsd: portfolio.equityUsd, configuredRealCapitalEur: config.budgetEur, positions: portfolio.positions.length } }));
+        `valido · capitale reale ${(realPortfolio.equityUsd / eurUsd).toFixed(2)} EUR · ${portfolio.positions.length} posizioni`,
+        { data: { realEquityUsd: realPortfolio.equityUsd, realEquityEur: realPortfolio.equityUsd / eurUsd, positions: portfolio.positions.length } }));
     } catch (error) {
       checks.push(ko('etoro.agent', 'eToro — token Agent Portfolio', error.message,
         error.status === 401

@@ -72,6 +72,7 @@ const NUMERIC_BOUNDS = {
   shortlistSize: [5, 40],
   maxHoldings: [1, 30],
   minHoldings: [1, 20],
+  preferredHoldings: [1, 30],
   minHoldingDays: [0, 365],
   reentryCooldownDays: [0, 365],
   substitutionEdge: [0, 100],
@@ -95,7 +96,12 @@ export function sanitizeConfigPatch(patch) {
     if (!(key in DEFAULT_CONFIG)) { rejected.push(`${key}: chiave sconosciuta`); continue; }
     if (key === 'executionMode') { rejected.push('executionMode: usa POST /agent/mode'); continue; }
     if (key === 'frozen' || key === 'frozenReason') { rejected.push(`${key}: usa /agent/freeze o /agent/unfreeze`); continue; }
-    if (['activeAgentPortfolioId', 'activeAgentPortfolioName', 'agentTokenVerifiedAt', 'agentTokenHint', 'agentTokenFingerprint', 'agentTokenOrigin'].includes(key)) {
+    if ([
+      'activeAgentPortfolioId', 'activeAgentPortfolioName', 'activeAgentPortfolioMirrorId',
+      'activeAgentPortfolioVirtualBalanceUsd', 'agentTokenVerifiedAt', 'agentTokenHint',
+      'agentTokenFingerprint', 'agentTokenOrigin', 'lastManagedCapitalUsd', 'lastManagedCapitalEur',
+      'lastManagedCapitalAt', 'lastManagedEurUsd', 'realCapitalTrackingStartedAt',
+    ].includes(key)) {
       rejected.push(`${key}: gestito esclusivamente dal flusso token Agent`);
       continue;
     }
@@ -245,7 +251,7 @@ function guidedAnswersToContract(raw) {
       targetDeploymentPct: 100 - cashTarget,
     },
     diversification: {
-      preferredPositions: Math.min(maxHoldings, Math.max(3, Math.round(maxHoldings * 0.65))),
+      preferredPositions: Math.min(maxHoldings, Math.max(3, Math.round(maxHoldings * 0.75))),
       maxPositions: maxHoldings,
     },
     sectors: { include: [], prefer: preferredSectors, exclude: [] },
@@ -708,7 +714,13 @@ export async function handleAgentApi(request, env, ctx, pathname) {
 
   // GET /agent/state
   if (route === 'state' && method === 'GET') {
-    const [storedConfig, runs, curve, resolved] = await Promise.all([loadConfig(db), listRuns(db, 12), equityHistory(db, 200), resolveCredentials(db, env)]);
+    const storedConfig = await loadConfig(db);
+    const trackingSince = Number(storedConfig.realCapitalTrackingStartedAt) || Number.MAX_SAFE_INTEGER;
+    const [runs, curve, resolved] = await Promise.all([
+      listRuns(db, 12),
+      equityHistory(db, 200, trackingSince),
+      resolveCredentials(db, env),
+    ]);
     const config = hydrateGuidedReview(storedConfig);
     const last = runs[0] ?? null;
     const hwm = curve.length ? Math.max(...curve.map((row) => Number(row.hwm_usd) || 0)) : 0;
@@ -890,12 +902,16 @@ export async function handleAgentApi(request, env, ctx, pathname) {
         targetDeploymentPct: spec.capital.targetDeploymentPct / 100,
         maxHoldings,
         minHoldings: spec.diversification.minPositions,
+        preferredHoldings: Math.max(
+          spec.diversification.preferredPositions,
+          Math.min(maxHoldings, Math.round(maxHoldings * 0.75)),
+        ),
         shortlistSize: Math.min(40, Math.max(24, maxHoldings * 2)),
         minHoldingDays,
         cadence: spec.execution.cadence,
         minOrderUsd: Math.max(1, spec.execution.minOrderEur * current.fallbackEurUsd),
         // L'assoluto diventa solo un fusibile molto alto; il validator usa il
-        // tetto percentuale sull'equity virtuale del portfolio.
+        // tetto percentuale sul capitale reale del portfolio.
         maxOrderUsd: 100000,
         maxOrderPctOfCapital: spec.execution.maxOrderPctOfCapital / 100,
         maxTurnoverPct: spec.execution.maxTurnoverPct / 100,
@@ -903,11 +919,12 @@ export async function handleAgentApi(request, env, ctx, pathname) {
         minCashPct: spec.capital.cashFloorPct / 100,
         maxCashPct: spec.capital.cashCeilingPct / 100,
         drawdownStopPct: spec.risk.maxDrawdownPct / 100,
-        maxOrdersPerRun: Math.min(20, maxHoldings),
+        maxOrdersPerRun: Math.min(16, maxHoldings),
         maxOrdersPerDay: Math.min(40, Math.max(maxHoldings, maxHoldings * 2)),
         watcherEnabled: true,
         riskProfile: `${spec.objective.description} Nessuna leva, nessuno short. Universo dinamico entro le preferenze e i cap della StrategySpec v${spec.schemaVersion}.`,
         shadowStartedAt: Date.now(),
+        realCapitalTrackingStartedAt: 0,
         shadowDays,
         executionMode: 'shadow',
         frozen: false,
@@ -1005,6 +1022,13 @@ export async function handleAgentApi(request, env, ctx, pathname) {
         await saveConfig(db, {
           activeAgentPortfolioId: '',
           activeAgentPortfolioName: '',
+          activeAgentPortfolioMirrorId: '',
+          activeAgentPortfolioVirtualBalanceUsd: 0,
+          lastManagedCapitalUsd: 0,
+          lastManagedCapitalEur: 0,
+          lastManagedCapitalAt: 0,
+          lastManagedEurUsd: 0,
+          realCapitalTrackingStartedAt: 0,
           agentTokenVerifiedAt: 0,
           agentTokenHint: '',
           agentTokenFingerprint: '',
@@ -1019,6 +1043,13 @@ export async function handleAgentApi(request, env, ctx, pathname) {
       await saveConfig(db, {
         activeAgentPortfolioId: '',
         activeAgentPortfolioName: '',
+        activeAgentPortfolioMirrorId: '',
+        activeAgentPortfolioVirtualBalanceUsd: 0,
+        lastManagedCapitalUsd: 0,
+        lastManagedCapitalEur: 0,
+        lastManagedCapitalAt: 0,
+        lastManagedEurUsd: 0,
+        realCapitalTrackingStartedAt: 0,
         agentTokenVerifiedAt: 0,
         agentTokenHint: '',
         agentTokenFingerprint: '',
@@ -1093,6 +1124,10 @@ export async function handleAgentApi(request, env, ctx, pathname) {
     if (!credentials.etoroApiKey || !credentials.etoroUserKey) return json({ error: 'credenziali eToro non configurate' }, 400);
     try {
       const client = new EtoroClient({ apiKey: credentials.etoroApiKey, userKey: credentials.etoroUserKey });
+      const remote = (await client.agentPortfolios()).find((item) => item.id === agentPortfolioId);
+      if (!remote) throw new Error(`Agent Portfolio ${agentPortfolioId} non trovato sul conto eToro`);
+      if (!remote.mirrorId) throw new Error('eToro non ha restituito il mirrorId necessario a leggere il capitale reale');
+      const realPortfolio = await client.mirrorPortfolio(remote.mirrorId);
       const { token, name } = await client.createAgentUserToken(agentPortfolioId);
       // eToro restituisce il segreto una sola volta. Lo collaudiamo prima di
       // sostituire l'eventuale token valido già nel vault.
@@ -1106,14 +1141,24 @@ export async function handleAgentApi(request, env, ctx, pathname) {
       const { config } = await saveVerifiedAgentToken(db, env, {
         token,
         portfolioId: agentPortfolioId,
-        portfolioName: body.agentPortfolioName,
+        portfolioName: body.agentPortfolioName || remote.name,
+        mirrorId: remote.mirrorId,
+        virtualBalanceUsd: remote.virtualBalanceUsd,
         verifiedAt: Date.now(),
-        currentConfig,
+        currentConfig: {
+          ...currentConfig,
+          lastManagedCapitalUsd: realPortfolio.equityUsd,
+          lastManagedCapitalEur: realPortfolio.equityUsd / currentConfig.fallbackEurUsd,
+          lastManagedCapitalAt: realPortfolio.takenAt,
+          lastManagedEurUsd: currentConfig.fallbackEurUsd,
+          realCapitalTrackingStartedAt: 0,
+        },
       });
       const hint = config.agentTokenHint;
       await audit(db, null, 'warn', 'credentials', `Nuovo token Agent Portfolio verificato e salvato (${name})`, {
         agentPortfolioId,
-        equityUsd: portfolio.equityUsd,
+        realEquityUsd: realPortfolio.equityUsd,
+        virtualEquityUsd: portfolio.equityUsd,
         positions: portfolio.positions.length,
       });
       return json({
@@ -1124,7 +1169,8 @@ export async function handleAgentApi(request, env, ctx, pathname) {
         portfolio: {
           id: agentPortfolioId,
           name: config.activeAgentPortfolioName,
-          equityUsd: portfolio.equityUsd,
+          equityUsd: realPortfolio.equityUsd,
+          virtualEquityUsd: portfolio.equityUsd,
           positions: portfolio.positions.length,
         },
         credentials: describeCredentials(await resolveCredentials(db, env)),

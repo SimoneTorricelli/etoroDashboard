@@ -20,22 +20,30 @@ export async function deterministicId(...parts) {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Pre-check di ammissibilità sugli acquisti: mercato aperto e taglio minimo. */
-async function checkEligibility(client, orders, config) {
+async function checkEligibility(client, orders, executionScale) {
   const buys = orders.filter((order) => order.side === 'buy');
   if (!buys.length) return { ok: true, issues: [], checks: [] };
   const map = await client.eligibility([...new Set(buys.map((order) => order.instrumentId))]);
   const issues = [];
   const checks = buys.map((order) => {
     const info = map.get(order.instrumentId);
+    const executionAmountUsd = round(order.amountUsd * executionScale, 2);
+    const realMinimumUsd = info?.minPositionUsd ? round(info.minPositionUsd / executionScale, 2) : null;
     let detail = 'ammesso';
     if (!info) detail = 'eToro non ha restituito l’ammissibilità';
     else if (!info.allowOpenPosition) detail = 'mercato chiuso o strumento non negoziabile';
-    else if (order.amountUsd + 0.005 < info.minPositionUsd) detail = `sotto il minimo eToro di ${info.minPositionUsd} USD`;
+    else if (executionAmountUsd + 0.005 < info.minPositionUsd) detail = `sotto il minimo reale equivalente di ${realMinimumUsd} USD`;
     const eligible = detail === 'ammesso';
     if (!eligible) issues.push(`${order.symbol}: ${detail}`);
-    return { symbol: order.symbol, instrumentId: order.instrumentId, eligible, detail, minPositionUsd: info?.minPositionUsd ?? null };
+    return {
+      symbol: order.symbol,
+      instrumentId: order.instrumentId,
+      eligible,
+      detail,
+      minPositionUsd: realMinimumUsd,
+      agentMinimumUsd: info?.minPositionUsd ?? null,
+    };
   });
-  void config;
   return { ok: issues.length === 0, issues, checks };
 }
 
@@ -44,6 +52,7 @@ async function checkEligibility(client, orders, config) {
  */
 export async function executePlan({ db, client, runId, plan, mode, config }) {
   const results = [];
+  const executionScale = Number(plan.executionScale) > 0 ? Number(plan.executionScale) : 1;
 
   // Fail closed: solo il valore esatto "live" può raggiungere gli endpoint
   // di trading. Configurazioni corrotte, spazi o maiuscole non vengono
@@ -64,7 +73,7 @@ export async function executePlan({ db, client, runId, plan, mode, config }) {
     return { mode, executed: false, results, eligibility: null };
   }
 
-  const eligibility = await checkEligibility(client, plan.orders, config).catch((error) => ({
+  const eligibility = await checkEligibility(client, plan.orders, executionScale).catch((error) => ({
     ok: false,
     issues: [`pre-check ammissibilità fallito: ${error.message}`],
     checks: [],
@@ -89,10 +98,14 @@ export async function executePlan({ db, client, runId, plan, mode, config }) {
       continue;
     }
 
-    const base = { id, runId, seq: order.seq, symbol: order.symbol, instrumentId: order.instrumentId, side: order.side, amountUsd: order.amountUsd, positionId: order.positionId, mode };
+    const executionAmountUsd = round(order.amountUsd * executionScale, 2);
+    const base = {
+      id, runId, seq: order.seq, symbol: order.symbol, instrumentId: order.instrumentId,
+      side: order.side, amountUsd: order.amountUsd, executionAmountUsd, positionId: order.positionId, mode,
+    };
 
     if (mode === 'dry-run') {
-      const record = { ...base, state: 'simulated', message: `dry-run: ${order.side} ${order.amountUsd} USD non inviato` };
+      const record = { ...base, state: 'simulated', message: `dry-run: ${order.side} ${order.amountUsd} USD reali non inviato` };
       await upsertOrder(db, record);
       results.push(record);
       continue;
@@ -102,8 +115,8 @@ export async function executePlan({ db, client, runId, plan, mode, config }) {
 
     try {
       const response = order.side === 'buy'
-        ? await client.openOrder({ instrumentId: order.instrumentId, amountUsd: order.amountUsd, requestId: id })
-        : await client.closeOrder({ positionId: order.positionId, amountUsd: order.fullExit ? null : order.amountUsd, requestId: id });
+        ? await client.openOrder({ instrumentId: order.instrumentId, amountUsd: executionAmountUsd, requestId: id })
+        : await client.closeOrder({ positionId: order.positionId, amountUsd: order.fullExit ? null : executionAmountUsd, requestId: id });
 
       const etoroOrderId = String(response?.orderId ?? response?.OrderId ?? response?.OrderID ?? '') || null;
       const record = { ...base, state: 'sent', etoroOrderId, message: 'accettato, in verifica' };
@@ -126,12 +139,12 @@ export async function executePlan({ db, client, runId, plan, mode, config }) {
     }
   }
 
-  if (mode === 'live') await verifyOrders({ db, client, results });
+  if (mode === 'live') await verifyOrders({ db, client, results, executionScale });
   return { mode, executed: mode === 'live', results, eligibility };
 }
 
 /** Due letture ravvicinate dello stato ordine: sufficienti senza rischiare 429. */
-async function verifyOrders({ db, client, results }) {
+async function verifyOrders({ db, client, results, executionScale = 1 }) {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const pending = results.filter((item) => item.state === 'sent');
     if (!pending.length) return;
@@ -140,7 +153,8 @@ async function verifyOrders({ db, client, results }) {
       try {
         const lookup = await client.lookupOrder({ orderId: record.etoroOrderId, referenceId: record.id });
         record.state = lookup.state === 'pending' ? 'sent' : lookup.state;
-        record.filledUsd = lookup.filledUsd || (lookup.state === 'filled' ? record.amountUsd : 0);
+        const virtualFilled = lookup.filledUsd || (lookup.state === 'filled' ? record.executionAmountUsd : 0);
+        record.filledUsd = round(virtualFilled / executionScale, 2);
         record.positionIds = lookup.positionIds;
         record.message = lookup.error ? `${lookup.label} — ${lookup.error}` : lookup.label;
         await upsertOrder(db, record);

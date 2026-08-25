@@ -219,6 +219,8 @@ export function buildFeatures({ snapshot, universe, candles, external, config, e
     equityRet1w: pctChange(equitySeries, 7),
     equityRet1m: pctChange(equitySeries, 30),
     equityMaxDd: equitySeries.length > 10 ? maxDrawdown(equitySeries) : null,
+    executionScale: Number(snapshot.executionScale) > 0 ? round(snapshot.executionScale, 6) : 1,
+    capitalSource: snapshot.source ?? 'account',
   };
 
   return {
@@ -248,7 +250,7 @@ export function buildFeatures({ snapshot, universe, candles, external, config, e
 export function renderFeaturesPrompt(features, config, { includeInstruments = true } = {}) {
   const lines = [];
   const p = features.portfolio;
-  lines.push(`PORTAFOGLIO (USD) equity=${p.equityUsd} cash=${p.cashUsd} (${(features.allocationByClass.cash * 100).toFixed(1)}%) investito=${p.investedUsd} pnl_aperto=${p.unrealizedPnlUsd} posizioni=${p.openPositions}`);
+  lines.push(`PORTAFOGLIO REALE GESTITO (USD) equity=${p.equityUsd} cash=${p.cashUsd} (${(features.allocationByClass.cash * 100).toFixed(1)}%) investito=${p.investedUsd} pnl_aperto=${p.unrealizedPnlUsd} posizioni=${p.openPositions}`);
   lines.push(`STORICO equity 1w=${p.equityRet1w ?? 'n/d'}% 1m=${p.equityRet1m ?? 'n/d'}% maxDD=${p.equityMaxDd ?? 'n/d'}% concentrazione_HHI=${p.concentrationHhi} pos_efficaci=${p.effectivePositions ?? 'n/d'}`);
   lines.push(`CLASSI ${Object.entries(features.allocationByClass).map(([key, value]) => `${key}=${(value * 100).toFixed(1)}%`).join(' ')}`);
 
@@ -292,7 +294,7 @@ export function renderFeaturesPrompt(features, config, { includeInstruments = tr
   }
 
   lines.push('');
-  lines.push(`VINCOLI budget=${config.budgetEur} EUR (EURUSD ${features.eurUsd}) cash_min=${(config.minCashPct * 100).toFixed(0)}% cash_max=${(config.maxCashPct * 100).toFixed(0)}% turnover_max=${(config.maxTurnoverPct * 100).toFixed(0)}% ordini_max=${config.maxOrdersPerRun} banda_minima=${(config.minRebalanceBandAbs * 100).toFixed(0)}%`);
+  lines.push(`VINCOLI capitale_reale=${(p.equityUsd / features.eurUsd).toFixed(2)} EUR (EURUSD ${features.eurUsd}) posizioni_min=${config.minHoldings} posizioni_preferite=${config.preferredHoldings ?? config.minHoldings} posizioni_max=${config.maxHoldings} cash_min=${(config.minCashPct * 100).toFixed(0)}% cash_max=${(config.maxCashPct * 100).toFixed(0)}% turnover_ribilanciamenti=${(config.maxTurnoverPct * 100).toFixed(0)}% ordini_max=${config.maxOrdersPerRun} banda_minima=${(config.minRebalanceBandAbs * 100).toFixed(0)}%`);
   lines.push(`PROFILO ${config.riskProfile}`);
   return lines.join('\n');
 }

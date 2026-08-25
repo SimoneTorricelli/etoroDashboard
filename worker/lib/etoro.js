@@ -34,6 +34,62 @@ const asRecord = (value) => (value && typeof value === 'object' && !Array.isArra
 
 const recordList = (value) => (Array.isArray(value) ? value.filter((item) => item && typeof item === 'object') : []);
 
+function normalizePositions(rawPositions) {
+  return recordList(rawPositions).map((raw) => {
+    const invested = num(pick(raw, 'Amount', 'amount'));
+    const units = num(pick(raw, 'Units', 'units'));
+    const openRate = num(pick(raw, 'OpenRate', 'openRate'));
+    const leverage = num(pick(raw, 'Leverage', 'leverage'), 1) || 1;
+    const currentRate = num(pick(raw, 'CurrentRate', 'currentRate', 'Rate', 'rate'), openRate);
+    const isBuy = pick(raw, 'IsBuy', 'isBuy') !== false;
+    const grossValue = units > 0 && currentRate > 0 ? units * currentRate : invested;
+    const unrealized = asRecord(pick(raw, 'UnrealizedPnL', 'unrealizedPnL', 'unrealizedPnl'));
+    const reportedPnl = pick(unrealized, 'PnL', 'pnl', 'Profit', 'profit');
+    const pnl = reportedPnl !== undefined
+      ? num(reportedPnl)
+      : openRate > 0 && units > 0
+        ? (isBuy ? (currentRate - openRate) : (openRate - currentRate)) * units
+        : num(pick(raw, 'NetProfit', 'netProfit', 'Profit', 'profit', 'PnL', 'pnl'));
+    return {
+      positionId: num(pick(raw, 'PositionID', 'positionId', 'PositionId')),
+      instrumentId: num(pick(raw, 'InstrumentID', 'instrumentId', 'InstrumentId')),
+      invested,
+      units,
+      openRate,
+      currentRate,
+      leverage,
+      isBuy,
+      valueUsd: Math.round((invested + pnl) * 100) / 100,
+      grossValueUsd: Math.round(grossValue * 100) / 100,
+      pnlUsd: Math.round(pnl * 100) / 100,
+      openedAt: String(pick(raw, 'OpenDateTime', 'openDateTime', 'OpenTime') ?? ''),
+    };
+  });
+}
+
+function snapshotFromRoot(root, {
+  cashKeys = ['Credit', 'credit'],
+  source = 'account',
+  mirrorId = null,
+} = {}) {
+  const positions = normalizePositions(pick(root, 'Positions', 'positions'));
+  const cashUsd = num(pick(root, ...cashKeys));
+  const investedUsd = positions.reduce((sum, item) => sum + item.invested, 0);
+  const positionsValue = positions.reduce((sum, item) => sum + item.valueUsd, 0);
+  const reportedEquity = num(pick(root, 'Equity', 'equity'), 0);
+  const equityUsd = reportedEquity > 0 ? reportedEquity : cashUsd + positionsValue;
+  return {
+    takenAt: Date.now(),
+    cashUsd: Math.round(cashUsd * 100) / 100,
+    investedUsd: Math.round(investedUsd * 100) / 100,
+    positionsValueUsd: Math.round(positionsValue * 100) / 100,
+    equityUsd: Math.round(equityUsd * 100) / 100,
+    positions,
+    source,
+    mirrorId: mirrorId == null ? null : String(mirrorId),
+  };
+}
+
 const UUID_PATTERN = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
 const TOKEN_SECRET_KEYS = ['userToken', 'UserToken', 'userTokenValue', 'UserTokenValue'];
 
@@ -96,6 +152,8 @@ export class EtoroClient {
     this.agentToken = credentials.agentToken || '';
     this.timeoutMs = timeoutMs;
     this.calls = 0;
+    this.readCalls = 0;
+    this.writeCalls = 0;
   }
 
   headers(userKey = this.userKey, requestId = crypto.randomUUID()) {
@@ -110,40 +168,59 @@ export class EtoroClient {
 
   async request(version, path, { method = 'GET', body, userKey, requestId } = {}) {
     const url = `${BASE[version]}/${path.replace(/^\/+/, '')}`;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-    this.calls += 1;
-    try {
-      const response = await fetch(url, {
-        method,
-        headers: this.headers(userKey, requestId),
-        body: body === undefined ? undefined : JSON.stringify(body),
-        signal: controller.signal,
-      });
-      const text = await response.text();
-      let parsed = {};
-      try { parsed = text ? JSON.parse(text) : {}; } catch { parsed = { message: text }; }
-      if (!response.ok) {
-        const record = asRecord(parsed);
-        const nested = asRecord(pick(record, 'error', 'Error', 'data', 'Data'));
-        const message = pick(record, 'errorMessage', 'ErrorMessage', 'message', 'Message', 'detail', 'Detail', 'title', 'Title')
-          ?? pick(nested, 'errorMessage', 'ErrorMessage', 'message', 'Message', 'detail', 'Detail')
-          ?? pick(record, 'error', 'Error');
-        const code = pick(record, 'errorCode', 'ErrorCode', 'code', 'Code')
-          ?? pick(nested, 'errorCode', 'ErrorCode', 'code', 'Code');
-        const details = pick(record, 'errors', 'Errors', 'validationErrors', 'ValidationErrors');
-        const messageText = typeof message === 'string' ? message.trim() : '';
-        const codeText = typeof code === 'string' || typeof code === 'number' ? String(code).trim() : '';
-        const label = codeText && messageText && codeText.toLowerCase() !== messageText.toLowerCase()
-          ? `${codeText}: ${messageText}`
-          : messageText || codeText || `HTTP ${response.status}`;
-        const extra = details ? ` — ${JSON.stringify(details).slice(0, 300)}` : (typeof message === 'object' ? ` — ${JSON.stringify(message).slice(0, 300)}` : '');
-        throw new EtoroError(`${label}${extra}`, response.status, parsed);
+    const normalizedMethod = String(method).toUpperCase();
+    const isRead = normalizedMethod === 'GET';
+    const requestKey = requestId ?? crypto.randomUUID();
+    const attempts = isRead ? 3 : 1;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      if (isRead && this.readCalls >= 45) throw new EtoroError('Limite interno di sicurezza: troppe letture eToro nella stessa esecuzione', 429, {});
+      if (!isRead && this.writeCalls >= 16) throw new EtoroError('Limite interno di sicurezza: troppe operazioni eToro nella stessa esecuzione', 429, {});
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+      this.calls += 1;
+      if (isRead) this.readCalls += 1;
+      else this.writeCalls += 1;
+      try {
+        const response = await fetch(url, {
+          method: normalizedMethod,
+          headers: this.headers(userKey, requestKey),
+          body: body === undefined ? undefined : JSON.stringify(body),
+          signal: controller.signal,
+        });
+        const text = await response.text();
+        let parsed = {};
+        try { parsed = text ? JSON.parse(text) : {}; } catch { parsed = { message: text }; }
+        if (response.status === 429 && isRead && attempt + 1 < attempts) {
+          const retryAfter = Number(response.headers.get('retry-after'));
+          const waitMs = Number.isFinite(retryAfter) && retryAfter > 0
+            ? Math.min(5_000, retryAfter * 1000)
+            : 350 * (2 ** attempt) + Math.floor(Math.random() * 150);
+          await new Promise((resolve) => setTimeout(resolve, waitMs));
+          continue;
+        }
+        if (!response.ok) {
+          const record = asRecord(parsed);
+          const nested = asRecord(pick(record, 'error', 'Error', 'data', 'Data'));
+          const message = pick(record, 'errorMessage', 'ErrorMessage', 'message', 'Message', 'detail', 'Detail', 'title', 'Title')
+            ?? pick(nested, 'errorMessage', 'ErrorMessage', 'message', 'Message', 'detail', 'Detail')
+            ?? pick(record, 'error', 'Error');
+          const code = pick(record, 'errorCode', 'ErrorCode', 'code', 'Code')
+            ?? pick(nested, 'errorCode', 'ErrorCode', 'code', 'Code');
+          const details = pick(record, 'errors', 'Errors', 'validationErrors', 'ValidationErrors');
+          const messageText = typeof message === 'string' ? message.trim() : '';
+          const codeText = typeof code === 'string' || typeof code === 'number' ? String(code).trim() : '';
+          const label = codeText && messageText && codeText.toLowerCase() !== messageText.toLowerCase()
+            ? `${codeText}: ${messageText}`
+            : messageText || codeText || `HTTP ${response.status}`;
+          const extra = details ? ` — ${JSON.stringify(details).slice(0, 300)}` : (typeof message === 'object' ? ` — ${JSON.stringify(message).slice(0, 300)}` : '');
+          throw new EtoroError(`${label}${extra}`, response.status, parsed);
+        }
+        return parsed;
+      } finally {
+        clearTimeout(timer);
       }
-      return parsed;
-    } finally {
-      clearTimeout(timer);
     }
+    throw new EtoroError('Richiesta eToro non completata', 429, {});
   }
 
   /** Portafoglio + posizioni aperte dell'account indicato dallo user key attivo. */
@@ -151,46 +228,31 @@ export class EtoroClient {
     const data = await this.request('v1', 'trading/info/real/pnl', { userKey });
     const account = asRecord(pick(data, 'clientPortfolio', 'ClientPortfolio', 'portfolio', 'Portfolio')) ;
     const root = Object.keys(account).length ? account : asRecord(data);
-    const rawPositions = recordList(pick(root, 'Positions', 'positions'));
-    const positions = rawPositions.map((raw) => {
-      const invested = num(pick(raw, 'Amount', 'amount'));
-      const units = num(pick(raw, 'Units', 'units'));
-      const openRate = num(pick(raw, 'OpenRate', 'openRate'));
-      const leverage = num(pick(raw, 'Leverage', 'leverage'), 1) || 1;
-      const currentRate = num(pick(raw, 'CurrentRate', 'currentRate', 'Rate', 'rate'), openRate);
-      const isBuy = pick(raw, 'IsBuy', 'isBuy') !== false;
-      const grossValue = units > 0 && currentRate > 0 ? units * currentRate : invested;
-      const pnl = openRate > 0 && units > 0
-        ? (isBuy ? (currentRate - openRate) : (openRate - currentRate)) * units
-        : num(pick(raw, 'NetProfit', 'netProfit', 'Profit', 'profit'));
-      return {
-        positionId: num(pick(raw, 'PositionID', 'positionId', 'PositionId')),
-        instrumentId: num(pick(raw, 'InstrumentID', 'instrumentId', 'InstrumentId')),
-        invested,
-        units,
-        openRate,
-        currentRate,
-        leverage,
-        isBuy,
-        valueUsd: Math.round((invested + pnl) * 100) / 100,
-        grossValueUsd: Math.round(grossValue * 100) / 100,
-        pnlUsd: Math.round(pnl * 100) / 100,
-        openedAt: String(pick(raw, 'OpenDateTime', 'openDateTime', 'OpenTime') ?? ''),
-      };
+    return snapshotFromRoot(root);
+  }
+
+  /**
+   * Capitale reale allocato dal proprietario a uno specifico copy/mirror.
+   * L'Agent Portfolio opera su 10.000 USD virtuali, ma il P&L della owner key
+   * contiene il mirror reale che li replica proporzionalmente.
+   */
+  async mirrorPortfolio(mirrorId) {
+    const data = await this.request('v1', 'trading/info/real/pnl', { userKey: this.userKey });
+    const account = asRecord(pick(data, 'clientPortfolio', 'ClientPortfolio', 'portfolio', 'Portfolio'));
+    const root = Object.keys(account).length ? account : asRecord(data);
+    const mirrors = recordList(pick(root, 'Mirrors', 'mirrors', 'CopyPortfolios', 'copyPortfolios'));
+    const wanted = String(mirrorId ?? '').trim();
+    const mirror = mirrors.find((item) => String(pick(item, 'MirrorID', 'mirrorID', 'mirrorId', 'MirrorId', 'CopyID', 'copyId') ?? '') === wanted);
+    if (!mirror) {
+      throw new EtoroError(`Mirror reale ${wanted || 'non disponibile'} non trovato nel portafoglio eToro`, 404, {
+        availableMirrorIds: mirrors.map((item) => pick(item, 'MirrorID', 'mirrorID', 'mirrorId', 'MirrorId', 'CopyID', 'copyId')).filter(Boolean),
+      });
+    }
+    return snapshotFromRoot(mirror, {
+      cashKeys: ['AvailableAmount', 'availableAmount', 'Credit', 'credit'],
+      source: 'owner-mirror',
+      mirrorId: wanted,
     });
-    const cashUsd = num(pick(root, 'Credit', 'credit'));
-    const investedUsd = positions.reduce((sum, item) => sum + item.invested, 0);
-    const positionsValue = positions.reduce((sum, item) => sum + item.valueUsd, 0);
-    const reportedEquity = num(pick(root, 'Equity', 'equity'), 0);
-    const equityUsd = reportedEquity > 0 ? reportedEquity : cashUsd + positionsValue;
-    return {
-      takenAt: Date.now(),
-      cashUsd: Math.round(cashUsd * 100) / 100,
-      investedUsd: Math.round(investedUsd * 100) / 100,
-      positionsValueUsd: Math.round(positionsValue * 100) / 100,
-      equityUsd: Math.round(equityUsd * 100) / 100,
-      positions,
-    };
   }
 
   /** Estrae le righe da qualunque forma di risposta a lista. */
@@ -437,11 +499,12 @@ export class EtoroClient {
     const rows = EtoroClient.searchRows(data, ['agentPortfolios', 'AgentPortfolios', 'portfolios', 'Portfolios']);
     return rows.map((raw) => {
       const id = String(pick(raw, 'agentPortfolioId', 'AgentPortfolioId', 'portfolioId', 'id', 'Id') ?? '');
-      const name = String(pick(raw, 'name', 'Name', 'displayName', 'DisplayName', 'portfolioName', 'PortfolioName', 'title', 'Title') ?? '');
+      const name = String(pick(raw, 'agentPortfolioName', 'AgentPortfolioName', 'name', 'Name', 'displayName', 'DisplayName', 'portfolioName', 'PortfolioName', 'title', 'Title') ?? '');
       return {
         id,
         name: name || `Portfolio ${id.slice(0, 8)}`,
-        virtualBalanceUsd: num(pick(raw, 'virtualBalance', 'VirtualBalance', 'balance', 'Balance')),
+        virtualBalanceUsd: num(pick(raw, 'agentPortfolioVirtualBalance', 'AgentPortfolioVirtualBalance', 'virtualBalance', 'VirtualBalance', 'balance', 'Balance')),
+        mirrorId: String(pick(raw, 'mirrorId', 'MirrorId', 'MirrorID', 'mirrorID') ?? ''),
         createdAt: String(pick(raw, 'createdAt', 'CreatedAt', 'creationDate') ?? ''),
         raw,
       };
