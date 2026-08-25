@@ -200,7 +200,7 @@ export interface RunBundle {
     news: { net: number; top: Array<{ t: string; s: number; topic: string }> };
     sourceDiagnostics: Array<{ name: string; ok: boolean; error?: string; ms: number }>;
   } | null;
-  proposal: { model: string | null; parsed: { targetWeights: Record<string, number>; confidence: number; rationale: string; risks: string[]; watch: string[] } | null; error: string | null; attempts: unknown[] } | null;
+  proposal: { model: string | null; parsed: { targetWeights: Record<string, number>; confidence: number; rationale: string; risks: string[]; watch: string[]; repairs?: Array<{ code: string; originalTotal: number; message: string }> } | null; error: string | null; attempts: unknown[] } | null;
   validation: { ok: boolean; violations: Array<{ code: string; message: string; severity: string }>; plan: { orders: PlanOrder[]; targets: Record<string, number>; turnoverPct: number } | null } | null;
   orders: Array<{ symbol: string; side: string; amount_usd: number; state: string; message: string | null }>;
   logs: Array<{ at: number; level: string; stage: string; message: string }>;
@@ -441,6 +441,7 @@ export const autopilot = {
   runs: (limit = 30) => call<{ runs: RunSummary[] }>(`/agent/runs?limit=${limit}`),
   run: (id: string) => call<RunBundle>(`/agent/runs/${encodeURIComponent(id)}`),
   improveRun: (id: string) => call<{ runId: string; status: string; error?: string; reason?: string; improvedFromRunId: string }>(`/agent/runs/${encodeURIComponent(id)}/improve`, { method: 'POST', body: '{}' }),
+  retryRun: (id: string) => call<{ runId: string; status: string; error?: string; reason?: string; retriedFromRunId: string }>(`/agent/runs/${encodeURIComponent(id)}/retry`, { method: 'POST', body: '{}' }),
   config: () => call<{ config: AutopilotConfig; defaults: AutopilotConfig }>('/agent/config'),
   updateConfig: (patch: Partial<AutopilotConfig>) =>
     call<{ config: AutopilotConfig; applied: string[]; rejected: string[] }>('/agent/config', { method: 'PUT', body: JSON.stringify(patch) }),

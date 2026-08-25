@@ -169,6 +169,13 @@ confidence non viene alterata: anche la revisione deve superare realmente la
 soglia. La proposta originale resta consultabile e la nuova run conserva il
 collegamento alla run di origine nell'audit.
 
+Una run senza proposta valida espone invece **Correggi e riprova in shadow**.
+Gli errori dei provider vengono tradotti in una spiegazione leggibile e passati
+al nuovo tentativo. Le somme moderatamente errate sono riparate in modo
+deterministico e visibile: un totale sotto il 100% completa la differenza in
+cassa; un totale sopra il 100% viene riscalato proporzionalmente. Errori estremi,
+simboli non ammessi e strutture non JSON restano bloccanti.
+
 ---
 
 ## 5. Profili di strategia
@@ -426,9 +433,9 @@ Telegram e webhook generico, entrambi opzionali e non bloccanti.
 
 ## 14. Test
 
-88 test complessivi, tutti senza rete reale:
+96 test complessivi, tutti senza rete reale:
 
-- 49 in `worker/selftest.mjs` per feature, capitale reale, guardrail, revisione multi-provider, esposizioni equivalenti, watcher, executor e
+- 57 in `worker/selftest.mjs` per feature, capitale reale, parsing Responses API GPT-OSS, riparazione dei pesi, retry AI, guardrail, revisione multi-provider, esposizioni equivalenti, asset statici, watcher, executor e
   riconciliazione
 - 18 in `worker/strategy-selftest.mjs` per onboarding, consenso e StrategySpec
 - 11 in `worker/universe-policy-selftest.mjs` per universo dinamico e sell-only

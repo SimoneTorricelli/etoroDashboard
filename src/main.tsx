@@ -22,3 +22,18 @@ createRoot(document.getElementById('root')!).render(
     <App />
   </BrowserRouter>,
 )
+
+// Attende che anche CSS e risorse critiche siano caricati prima di chiudere il
+// recupero. Evita loop sui browser mobili che sospendono sessionStorage.
+window.addEventListener('load', () => {
+  window.setTimeout(() => {
+    try {
+      window.sessionStorage.removeItem('torri.asset-recovery-at');
+      const url = new URL(window.location.href);
+      if (url.searchParams.has('__torri_reload')) {
+        url.searchParams.delete('__torri_reload');
+        window.history.replaceState(window.history.state, '', `${url.pathname}${url.search}${url.hash}`);
+      }
+    } catch { /* storage e history sono best effort su Safari privato */ }
+  }, 1500);
+}, { once: true });

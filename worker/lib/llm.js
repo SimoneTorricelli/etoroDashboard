@@ -54,12 +54,35 @@ export const PROVIDERS = {
   },
 };
 
-function extractText(payload) {
-  return payload?.choices?.[0]?.message?.content
-    ?? payload?.response
-    ?? payload?.result?.response
-    ?? payload?.candidates?.[0]?.content?.parts?.[0]?.text
-    ?? '';
+export function extractModelText(payload) {
+  if (typeof payload === 'string') return payload;
+  const chatContent = payload?.choices?.[0]?.message?.content;
+  if (typeof chatContent === 'string') return chatContent;
+  if (Array.isArray(chatContent)) {
+    const joined = chatContent.map((part) => typeof part === 'string' ? part : part?.text ?? '').filter(Boolean).join('\n');
+    if (joined) return joined;
+  }
+  for (const direct of [payload?.output_text, payload?.response, payload?.result?.response]) {
+    if (typeof direct === 'string' && direct.trim()) return direct;
+  }
+  // GPT-OSS sul binding Workers AI può restituire il formato Responses API:
+  // output[].content[].text, preceduto da elementi di reasoning senza testo finale.
+  const output = payload?.output ?? payload?.result?.output;
+  if (Array.isArray(output)) {
+    const texts = [];
+    for (const item of output) {
+      if (typeof item?.text === 'string') texts.push(item.text);
+      if (typeof item?.content === 'string') texts.push(item.content);
+      if (Array.isArray(item?.content)) {
+        for (const part of item.content) {
+          if (typeof part?.text === 'string' && ['output_text', 'text'].includes(part.type ?? 'text')) texts.push(part.text);
+        }
+      }
+    }
+    if (texts.length) return texts.join('\n');
+  }
+  const geminiText = payload?.candidates?.[0]?.content?.parts?.[0]?.text;
+  return typeof geminiText === 'string' ? geminiText : '';
 }
 
 async function callOpenRouter({ apiKey, model, messages, temperature, maxTokens, jsonMode, referer, signal }) {
@@ -88,17 +111,22 @@ async function callOpenRouter({ apiKey, model, messages, temperature, maxTokens,
     const message = payload?.error?.message ?? payload?.message ?? `HTTP ${response.status}`;
     throw new Error(String(message).slice(0, 300));
   }
-  const content = extractText(payload);
+  const content = extractModelText(payload);
   if (!content) throw new Error('risposta senza contenuto');
   return { content, usage: payload?.usage ?? null, resolvedModel: payload?.model ?? model };
 }
 
-async function callWorkersAi({ ai, model, messages, temperature, maxTokens }) {
+async function callWorkersAi({ ai, model, messages, temperature, maxTokens, jsonMode }) {
   if (!ai) throw new Error('binding AI non configurato: aggiungi "ai": { "binding": "AI" } a wrangler.jsonc');
-  const result = await ai.run(model, { messages, temperature, max_tokens: maxTokens });
-  const content = extractText(result) || (typeof result === 'string' ? result : '');
+  const result = await ai.run(model, {
+    messages,
+    temperature,
+    max_tokens: maxTokens,
+    ...(jsonMode ? { response_format: { type: 'json_object' } } : {}),
+  });
+  const content = extractModelText(result);
   if (!content) throw new Error('risposta senza contenuto');
-  return { content, usage: null };
+  return { content, usage: result?.usage ?? null };
 }
 
 async function callGemini({ apiKey, model, messages, temperature, maxTokens, jsonMode, signal }) {
@@ -126,7 +154,7 @@ async function callGemini({ apiKey, model, messages, temperature, maxTokens, jso
   );
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(String(payload?.error?.message ?? `HTTP ${response.status}`).slice(0, 300));
-  const content = extractText(payload);
+  const content = extractModelText(payload);
   if (!content) throw new Error('risposta senza contenuto');
   return { content, usage: payload?.usageMetadata ?? null };
 }
@@ -147,7 +175,7 @@ async function callGroq({ apiKey, model, messages, temperature, maxTokens, jsonM
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(String(payload?.error?.message ?? `HTTP ${response.status}`).slice(0, 300));
-  const content = extractText(payload);
+  const content = extractModelText(payload);
   if (!content) throw new Error('risposta senza contenuto');
   return { content, usage: payload?.usage ?? null };
 }

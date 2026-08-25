@@ -6,6 +6,48 @@
     <link rel="icon" type="image/svg+xml" href="./logo.svg" />
     <meta name="description" content="Torri — terminale di comando per eToro: portfolio, mercati in tempo reale, Agent automatizzato e modulo EUR/USD." />
     <title>Torri — eToro Command Center</title>
+    <script>
+      // Se una vecchia pagina richiede bundle rimossi da un deploy recente,
+      // Safari mobile recupera una sola volta senza cancellare CONTROL_TOKEN.
+      (function () {
+        var recoveryKey = 'torri.asset-recovery-at';
+        function showRecovery() {
+          function render() {
+            var root = document.getElementById('root');
+            if (!root) return;
+            root.innerHTML = '<main style="min-height:100vh;display:grid;place-items:center;padding:24px;background:#faf9f5;color:#223129;font-family:system-ui,sans-serif"><section style="max-width:520px;padding:24px;border:1px solid #dce4dd;border-radius:16px;background:white"><h1 style="margin:0 0 8px;font-size:22px">Aggiornamento non completato</h1><p style="line-height:1.55;color:#5d6b63">Il telefono ha caricato una versione non più disponibile. Ricarica la pagina: la chiave Autopilot salvata su questo dispositivo non verrà cancellata.</p><button onclick="location.reload()" style="margin-top:8px;padding:10px 16px;border:0;border-radius:9px;background:#0d6040;color:white;font-weight:600">Ricarica Autopilot</button></section></main>';
+          }
+          if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', render, { once: true });
+          else render();
+        }
+        function recover() {
+          var currentUrl = new URL(location.href);
+          if (currentUrl.searchParams.has('__torri_reload')) {
+            showRecovery();
+            return;
+          }
+          var previous = 0;
+          try { previous = Number(sessionStorage.getItem(recoveryKey) || 0); } catch (_) {}
+          if (!previous || Date.now() - previous > 60000) {
+            try { sessionStorage.setItem(recoveryKey, String(Date.now())); } catch (_) {}
+            currentUrl.searchParams.set('__torri_reload', String(Date.now()));
+            location.replace(currentUrl.toString());
+            return;
+          }
+          showRecovery();
+        }
+        window.addEventListener('error', function (event) {
+          var target = event.target;
+          var resourceUrl = target && (target.src || target.href) || '';
+          if (target && (target.tagName === 'SCRIPT' || target.tagName === 'LINK')
+            && /\/assets\/.*\.(?:js|css)(?:\?|$)/i.test(resourceUrl)) recover();
+        }, true);
+        window.addEventListener('unhandledrejection', function (event) {
+          var message = String(event.reason && (event.reason.message || event.reason) || '');
+          if (/chunk|dynamically imported|module script/i.test(message)) recover();
+        });
+      })();
+    </script>
     <!-- SPA redirect (companion di public/404.html): ripristina la route da ?/... per GitHub Pages -->
     <script>
       (function () {

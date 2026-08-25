@@ -8,6 +8,7 @@ import Agent from '@/pages/Agent'
 import Autopilot from '@/pages/Autopilot'
 import Fx from '@/pages/Fx'
 import Settings from '@/pages/Settings'
+import { PageErrorBoundary } from '@/components/PageErrorBoundary'
 
 /**
  * Routing (pattern B — nested routes + <Outlet/>, vedi react-dev.md).
@@ -23,7 +24,7 @@ export default function App() {
           <Route path="mercati" element={<Markets />} />
           <Route path="portfolio" element={<Portfolio />} />
           <Route path="agent" element={<Agent />} />
-          <Route path="autopilot" element={<Autopilot />} />
+          <Route path="autopilot" element={<PageErrorBoundary pageName="Autopilot"><Autopilot /></PageErrorBoundary>} />
           <Route path="fx" element={<Fx />} />
           <Route path="impostazioni" element={<Settings />} />
         </Route>

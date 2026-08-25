@@ -15,10 +15,11 @@ import { checkChurnRules, filterMarginalSubstitutions, isWorthTheCost } from './
 import { buildShortlist, scoreInstrument } from './lib/screening.js';
 import { decideWatcherAction, detectAnomalies, isStabilized, relevantHeadlines } from './lib/watcher.js';
 import { executePlan, reconcile } from './lib/executor.js';
-import { buildAttemptPlan } from './lib/llm.js';
-import { buildCandleRefreshQueue, scaleAgentSnapshotToReal, shortlistDeploymentCapacity } from './lib/pipeline.js';
+import { buildAttemptPlan, callModel, extractModelText } from './lib/llm.js';
+import { buildCandleRefreshQueue, buildFailedProposalRetryContext, scaleAgentSnapshotToReal, shortlistDeploymentCapacity } from './lib/pipeline.js';
 import { buildStrategyActivationNotification } from './lib/notify.js';
 import { EtoroClient } from './lib/etoro.js';
+import { serveStaticAsset } from './index.js';
 
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -231,6 +232,35 @@ test('readiness: misura la capacità della shortlist entro i cap di classe', () 
   assert.ok(Math.abs(capacity - 0.9) < 1e-9);
 });
 
+test('asset statici: un fallback HTML su URL JavaScript diventa 404 recuperabile', async () => {
+  const env = {
+    ASSETS: {
+      fetch: async () => new Response('<!doctype html><title>SPA</title>', {
+        headers: { 'content-type': 'text/html; charset=utf-8' },
+      }),
+    },
+  };
+  const response = await serveStaticAsset(new Request('https://example.test/assets/index-obsoleto.js'), env);
+  assert.equal(response.status, 404);
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
+  assert.match(await response.text(), /Ricarica/i);
+});
+
+test('asset statici: i bundle validi mantengono MIME e cache immutabile', async () => {
+  const env = {
+    ASSETS: {
+      fetch: async () => new Response('console.log("ok")', {
+        headers: { 'content-type': 'text/javascript; charset=utf-8' },
+      }),
+    },
+  };
+  const response = await serveStaticAsset(new Request('https://example.test/assets/index-corrente.js'), env);
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get('content-type'), /javascript/);
+  assert.match(response.headers.get('cache-control'), /immutable/);
+});
+
 test('readiness: ticker equivalenti contano come una sola capacità di rischio', () => {
   const capacity = shortlistDeploymentCapacity([
     { symbol: 'GLD', class: 'commodity', maxWeight: 0.22 },
@@ -292,6 +322,62 @@ test('normalizzazione accetta pesi espressi in percentuale', () => {
   assert.equal(result.ok, true);
   assert.equal(result.value.targetWeights.SPY, 0.6);
   assert.equal(result.value.confidence, 0.8);
+});
+
+test('GPT-OSS: estrae il testo finale dal formato Responses API', () => {
+  const text = extractModelText({
+    output: [
+      { type: 'reasoning', summary: [{ type: 'summary_text', text: 'ragionamento non operativo' }] },
+      { type: 'message', content: [{ type: 'output_text', text: '{"targetWeights":{"SPY":1}}' }] },
+    ],
+  });
+  assert.equal(text, '{"targetWeights":{"SPY":1}}');
+});
+
+test('GPT-OSS: il binding riceve JSON mode e restituisce output Responses API', async () => {
+  let input;
+  const result = await callModel({
+    provider: 'workers-ai',
+    model: '@cf/openai/gpt-oss-120b',
+    messages: [{ role: 'user', content: 'test' }],
+    config: { llmTemperature: 0.1, llmMaxTokens: 200 },
+    credentials: {},
+    env: { AI: { run: async (_model, payload) => { input = payload; return { output: [{ type: 'message', content: [{ type: 'output_text', text: '{"ok":true}' }] }] }; } } },
+    jsonMode: true,
+  });
+  assert.equal(result.content, '{"ok":true}');
+  assert.equal(input.response_format.type, 'json_object');
+});
+
+test('normalizzazione completa in cassa una proposta all’83%', () => {
+  const result = normalizeProposal({ targetWeights: { SPY: 0.5, GLD: 0.33 }, confidence: 0.7, rationale: '' }, ['SPY', 'GLD']);
+  assert.equal(result.ok, true);
+  assert.equal(result.value.targetWeights.CASH, 0.17);
+  assert.equal(result.value.repairs[0].code, 'missing_weight_to_cash');
+});
+
+test('normalizzazione riscala proporzionalmente una proposta al 110%', () => {
+  const result = normalizeProposal({ targetWeights: { SPY: 0.7, GLD: 0.4 }, confidence: 0.7, rationale: '' }, ['SPY', 'GLD']);
+  assert.equal(result.ok, true);
+  assert.equal(result.value.repairs[0].code, 'weights_rescaled');
+  assert.equal(Object.values(result.value.targetWeights).reduce((sum, value) => sum + value, 0), 1);
+});
+
+test('normalizzazione blocca ancora somme troppo lontane dal 100%', () => {
+  const result = normalizeProposal({ targetWeights: { SPY: 0.4 }, confidence: 0.7, rationale: '' }, ['SPY']);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /manca il 60.0%/);
+  assert.equal(result.details.repairable, false);
+});
+
+test('retry AI passa al nuovo modello gli errori della run precedente', () => {
+  const context = buildFailedProposalRetryContext({ proposal: { attempts: [
+    { provider: 'workers-ai', model: '@cf/openai/gpt-oss-120b', error: 'risposta senza contenuto' },
+    { provider: 'workers-ai', model: '@cf/meta/llama', error: 'somma pesi 0.830 fuori tolleranza' },
+  ] } });
+  assert.match(context, /risposta senza contenuto/);
+  assert.match(context, /somma pesi 0.830/);
+  assert.match(context, /Somma i pesi numericamente/);
 });
 
 test('guardrail: peso oltre il cap viene ridotto', () => {

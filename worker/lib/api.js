@@ -764,6 +764,18 @@ export async function handleAgentApi(request, env, ctx, pathname) {
     return json({ ...result, improvedFromRunId: sourceRunId });
   }
 
+  // POST /agent/runs/:id/retry — corregge una risposta AI invalida, in shadow.
+  if (route.startsWith('runs/') && route.endsWith('/retry') && method === 'POST') {
+    const sourceRunId = route.slice('runs/'.length, -'/retry'.length);
+    const source = await getRunBundle(db, sourceRunId);
+    if (!source.run) return json({ error: 'run di origine non trovata' }, 404);
+    if (!source.proposal || source.proposal.parsed) {
+      return json({ error: 'si può correggere soltanto una run senza proposta AI valida' }, 400);
+    }
+    const result = await runPipeline({ env, kind: 'rebalance', modeOverride: 'shadow', retryFromRunId: sourceRunId });
+    return json({ ...result, retriedFromRunId: sourceRunId });
+  }
+
   // GET|PUT /agent/config
   if (route === 'config') {
     if (method === 'GET') return json({ config: await loadConfig(db), defaults: DEFAULT_CONFIG });

@@ -68,6 +68,22 @@ function allocationRows(weights: Record<string, number>) {
   return rows.sort((a, b) => a.index - b.index).map(({ symbol, units }) => ({ symbol, percentage: units / 10 }));
 }
 
+function explainProposalError(error = '') {
+  const totalMatch = error.match(/somma pesi\s+([0-9.]+)/i);
+  if (totalMatch) {
+    const total = Number(totalMatch[1]);
+    if (Number.isFinite(total)) {
+      const delta = Math.abs(1 - total) * 100;
+      return total < 1
+        ? `Il modello ha distribuito solo il ${(total * 100).toFixed(1)}%: manca il ${delta.toFixed(1)}%.`
+        : `Il modello ha distribuito il ${(total * 100).toFixed(1)}%: supera il budget del ${delta.toFixed(1)}%.`;
+    }
+  }
+  if (/risposta senza contenuto/i.test(error)) return 'Il provider ha risposto, ma non ha restituito un testo finale leggibile.';
+  if (/non è un oggetto|targetWeights assente/i.test(error)) return 'La risposta non conteneva l’oggetto JSON di allocazione richiesto.';
+  return error;
+}
+
 const MODES: Array<{ id: ExecutionMode; icon: typeof Eye; title: string; short: string; tone: string }> = [
   { id: 'shadow', icon: Eye, title: 'Shadow', short: 'Propone e basta. Nessun ordine viene costruito.', tone: 'text-text-0' },
   { id: 'dry-run', icon: FlaskConical, title: 'Dry-run', short: 'Costruisce gli ordini e li valida su eToro, ma non li invia.', tone: 'text-warn' },
@@ -178,7 +194,7 @@ export default function Autopilot() {
     try {
       const [nextState, nextRuns] = await Promise.all([autopilot.state(), autopilot.runs(40)]);
       setState(nextState);
-      setRuns(nextRuns.runs);
+      setRuns(Array.isArray(nextRuns.runs) ? nextRuns.runs : []);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -301,7 +317,8 @@ export default function Autopilot() {
     ? runs.filter((run) => run.started_at >= Number(config.realCapitalTrackingStartedAt))
     : [];
 
-  const credentialsOk = state?.credentials.filter((item) => item.required).every((item) => item.configured) ?? false;
+  const requiredCredentials = (state?.credentials ?? []).filter((item) => item.required);
+  const credentialsOk = requiredCredentials.length > 0 && requiredCredentials.every((item) => item.configured);
   const hasRun = realRuns.length > 0;
 
   if (activeStrategyPreview) {
@@ -660,7 +677,7 @@ export default function Autopilot() {
                     draft={config.strategyDraft as unknown as StrategyOnboardingDraft}
                     answers={config.guidedOnboardingAnswers as Partial<StrategyOnboardingAnswers> | null | undefined}
                     collaboration={config.strategyCollaboration ?? null}
-                    equityCurve={state.equityCurve}
+                    equityCurve={state.equityCurve ?? []}
                     loading={loading}
                     onReview={openSavedStrategy}
                     onDryRun={() => void guarded('Run dry-run completata', () => autopilot.trigger('rebalance', 'dry-run'))}
@@ -703,7 +720,7 @@ export default function Autopilot() {
 
               <TabsContent value="credenziali" className="pt-4">
                 <CredentialsSection
-                  credentials={state.credentials}
+                  credentials={state.credentials ?? []}
                   notificationsActive={state.notificationsActive}
                   onChanged={refresh}
                 />
@@ -799,6 +816,15 @@ export default function Autopilot() {
                                   <span className="text-text-0">Rischi segnalati: </span>{detail.proposal.parsed.risks.join(' · ')}
                                 </p>
                               )}
+                              {detail.proposal.parsed.repairs && detail.proposal.parsed.repairs.length > 0 && (
+                                <div className="rounded-xl border border-warn/30 bg-warn/5 p-3">
+                                  <p className="text-sm font-medium text-text-0">Correzione aritmetica applicata</p>
+                                  {detail.proposal.parsed.repairs.map((repair) => (
+                                    <p key={repair.code} className="mt-1 text-xs leading-relaxed text-text-1">{repair.message}</p>
+                                  ))}
+                                  <p className="mt-1 text-xs text-text-2">La correzione non approva il piano: tutti i guardrail restano obbligatori.</p>
+                                </div>
+                              )}
                               {detail.validation && !detail.validation.ok && (
                                 <div className="rounded-xl border border-agent/25 bg-agent/5 p-4">
                                   <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -824,14 +850,34 @@ export default function Autopilot() {
                             <div className="space-y-2">
                               <p className="text-sm text-loss">{detail.proposal?.error ?? 'Nessuna proposta: questa run non ha coinvolto il modello.'}</p>
                               {Array.isArray(detail.proposal?.attempts) && detail.proposal.attempts.length > 0 && (
-                                <div className="space-y-1 rounded-lg bg-bg-0 p-3">
-                                  <p className="text-xs text-text-1">Tentativi per modello, in ordine:</p>
-                                  {(detail.proposal.attempts as Array<{ provider?: string; model: string; format: string; ok: boolean; error?: string }>).map((attempt, index) => (
-                                    <p key={index} className={cn('font-mono text-[11px]', attempt.ok ? 'text-gain' : 'text-text-1')}>
-                                      {attempt.ok ? '✓' : '✗'} {attempt.provider ? `${attempt.provider}/` : ''}{attempt.model} [{attempt.format}]{attempt.error ? ` — ${attempt.error}` : ''}
+                                <>
+                                  <div className="rounded-xl border border-warn/30 bg-warn/5 p-4">
+                                    <p className="text-sm font-medium text-text-0">Non è un errore del tuo portafoglio</p>
+                                    <p className="mt-1 text-xs leading-relaxed text-text-1">
+                                      I provider hanno restituito formati incompleti o percentuali che non chiudevano al 100%. Autopilot non ha creato ordini.
                                     </p>
-                                  ))}
-                                </div>
+                                    <Button
+                                      type="button"
+                                      size="sm"
+                                      className="mt-3 gap-2"
+                                      disabled={loading}
+                                      onClick={() => void guarded('Nuovo tentativo completato', () => autopilot.retryRun(detail.run!.id))}
+                                    >
+                                      <RefreshCw className="size-4" /> Correggi e riprova in shadow
+                                    </Button>
+                                  </div>
+                                  <div className="space-y-2 rounded-lg bg-bg-0 p-3">
+                                    <p className="text-xs text-text-1">Tentativi per modello, in ordine:</p>
+                                    {(detail.proposal.attempts as Array<{ provider?: string; model: string; format: string; ok: boolean; error?: string }>).map((attempt, index) => (
+                                      <div key={index}>
+                                        <p className={cn('font-mono text-[11px]', attempt.ok ? 'text-gain' : 'text-text-1')}>
+                                          {attempt.ok ? '✓' : '✗'} {attempt.provider ? `${attempt.provider}/` : ''}{attempt.model} [{attempt.format}]{attempt.error ? ` — ${attempt.error}` : ''}
+                                        </p>
+                                        {attempt.error && <p className="mt-0.5 text-xs text-text-2">{explainProposalError(attempt.error)}</p>}
+                                      </div>
+                                    ))}
+                                  </div>
+                                </>
                               )}
                             </div>
                           )}

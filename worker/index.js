@@ -66,6 +66,37 @@ const forbidden = () => new Response(JSON.stringify({ error: 'origine non consen
   headers: { 'content-type': 'application/json' },
 });
 
+/**
+ * Impedisce che il fallback SPA venga spacciato per un asset JS o CSS non più
+ * presente durante il passaggio fra due deploy.
+ */
+export async function serveStaticAsset(request, env) {
+  const url = new URL(request.url);
+  const response = await env.ASSETS.fetch(request);
+  const contentType = response.headers.get('content-type') ?? '';
+  if (url.pathname.startsWith('/assets/') && contentType.includes('text/html')) {
+    return new Response('Asset non disponibile: ricarica la pagina.', {
+      status: 404,
+      headers: {
+        'content-type': 'text/plain; charset=utf-8',
+        'cache-control': 'no-store',
+        'x-content-type-options': 'nosniff',
+      },
+    });
+  }
+  const headers = new Headers(response.headers);
+  if (contentType.includes('text/html')) headers.set('cache-control', 'no-store');
+  if (url.pathname.startsWith('/assets/')) {
+    headers.set('cache-control', 'public, max-age=31536000, immutable');
+    headers.set('x-content-type-options', 'nosniff');
+  }
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
 async function proxyEtoro(request, env, url) {
   const cors = corsHeaders(request, env);
   if (cors === null) return forbidden();
@@ -136,7 +167,7 @@ export default {
       return withHeaders(await handleAgentApi(request, env, ctx, url.pathname), cors);
     }
 
-    return env.ASSETS.fetch(request);
+    return serveStaticAsset(request, env);
   },
 
   /**

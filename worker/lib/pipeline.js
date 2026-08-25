@@ -153,6 +153,26 @@ export function buildPlanRevisionContext(bundle) {
   ].join('\n').slice(0, 6000);
 }
 
+export function buildFailedProposalRetryContext(bundle) {
+  const attempts = bundle?.proposal?.attempts ?? [];
+  if (!attempts.length) return 'La run precedente non ha prodotto un JSON valido. Ricontrolla aritmeticamente la somma dei pesi prima di rispondere.';
+  const failures = [];
+  const seen = new Set();
+  for (const attempt of attempts) {
+    const message = String(attempt.error ?? 'risposta non valida');
+    const key = `${attempt.provider}/${attempt.model}: ${message}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    failures.push(`- ${key}`);
+  }
+  return [
+    'La run precedente non ha prodotto una proposta utilizzabile.',
+    'Errori osservati:',
+    ...failures.slice(0, 8),
+    'Genera un nuovo JSON completo. Somma i pesi numericamente prima di rispondere; non omettere CASH e non aggiungere testo esterno al JSON.',
+  ].join('\n').slice(0, 5000);
+}
+
 export function romeParts(date = new Date()) {
   const formatter = new Intl.DateTimeFormat('en-GB', {
     timeZone: 'Europe/Rome',
@@ -480,7 +500,7 @@ async function runWatcher({ env, db, config, credentials, client, snapshot, feat
 
 // ---------------------------------------------------------------- pipeline
 
-export async function runPipeline({ env, kind, modeOverride, improveFromRunId = '' }) {
+export async function runPipeline({ env, kind, modeOverride, improveFromRunId = '', retryFromRunId = '' }) {
   const db = env.DB;
   const config = await loadConfig(db);
   if (config.strategySpec?.diversification) {
@@ -505,13 +525,22 @@ export async function runPipeline({ env, kind, modeOverride, improveFromRunId = 
 
   await startRun(db, runId, kind, mode);
   await audit(db, runId, 'info', 'start', `Run ${kind} avviata in modalità ${mode} · profilo ${profile.label}`);
-  const previousBundle = improveFromRunId ? await getRunBundle(db, improveFromRunId) : null;
-  const revisionContext = buildPlanRevisionContext(previousBundle);
+  const sourceRunId = improveFromRunId || retryFromRunId;
+  const previousBundle = sourceRunId ? await getRunBundle(db, sourceRunId) : null;
+  const revisionContext = improveFromRunId
+    ? buildPlanRevisionContext(previousBundle)
+    : retryFromRunId ? buildFailedProposalRetryContext(previousBundle) : '';
   if (improveFromRunId) {
     await audit(db, runId, 'info', 'improvement', `Revisione del piano bloccato ${improveFromRunId}`, {
       sourceRunId: improveFromRunId,
       sourceModel: previousBundle?.proposal?.model ?? null,
       sourceConfidence: previousBundle?.proposal?.parsed?.confidence ?? null,
+    });
+  }
+  if (retryFromRunId) {
+    await audit(db, runId, 'info', 'retry', `Correzione della proposta non valida ${retryFromRunId}`, {
+      sourceRunId: retryFromRunId,
+      sourceAttempts: previousBundle?.proposal?.attempts?.length ?? 0,
     });
   }
 

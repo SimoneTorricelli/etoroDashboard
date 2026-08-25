@@ -112,10 +112,40 @@ export function normalizeProposal(raw, allowedSymbols) {
   if (unknown.length) return { ok: false, error: `simboli non ammessi: ${unknown.join(', ')}` };
   if (!Object.keys(weights).length) return { ok: false, error: 'nessun peso valido' };
 
-  const total = Object.values(weights).reduce((sum, value) => sum + value, 0);
+  let total = Object.values(weights).reduce((sum, value) => sum + value, 0);
   if (total <= 0) return { ok: false, error: 'somma pesi nulla' };
-  if (Math.abs(total - 1) > 0.05) return { ok: false, error: `somma pesi ${total.toFixed(3)} fuori tolleranza` };
+  const repairs = [];
+  if (Math.abs(total - 1) > 0.05) {
+    const difference = 1 - total;
+    if (total < 0.75 || total > 1.30) {
+      const direction = difference > 0 ? `manca il ${(difference * 100).toFixed(1)}%` : `eccede del ${(-difference * 100).toFixed(1)}%`;
+      return {
+        ok: false,
+        error: `somma pesi ${total.toFixed(3)} fuori tolleranza: ${direction}`,
+        details: { kind: 'weight_total', total, difference, repairable: false },
+      };
+    }
+    if (difference > 0) {
+      weights.CASH = (weights.CASH ?? 0) + difference;
+      repairs.push({
+        code: 'missing_weight_to_cash',
+        originalTotal: total,
+        message: `Il modello aveva assegnato ${(total * 100).toFixed(1)}%: il ${(difference * 100).toFixed(1)}% mancante è stato messo provvisoriamente in cassa prima dei guardrail.`,
+      });
+    } else {
+      for (const key of Object.keys(weights)) weights[key] /= total;
+      repairs.push({
+        code: 'weights_rescaled',
+        originalTotal: total,
+        message: `Il modello aveva assegnato ${(total * 100).toFixed(1)}%: tutti i pesi sono stati riscalati proporzionalmente al 100% prima dei guardrail.`,
+      });
+    }
+    total = Object.values(weights).reduce((sum, value) => sum + value, 0);
+  }
   for (const key of Object.keys(weights)) weights[key] = Math.round((weights[key] / total) * 10000) / 10000;
+  const roundedTotal = Object.values(weights).reduce((sum, value) => sum + value, 0);
+  const balanceKey = Object.hasOwn(weights, 'CASH') ? 'CASH' : Object.keys(weights)[0];
+  weights[balanceKey] = Math.round((weights[balanceKey] + (1 - roundedTotal)) * 10000) / 10000;
 
   const confidence = Number(raw.confidence);
   return {
@@ -126,6 +156,7 @@ export function normalizeProposal(raw, allowedSymbols) {
       rationale: String(raw.rationale ?? '').slice(0, 1500),
       risks: Array.isArray(raw.risks) ? raw.risks.map(String).slice(0, 6) : [],
       watch: Array.isArray(raw.watch) ? raw.watch.map(String).slice(0, 6) : [],
+      repairs,
     },
   };
 }
@@ -213,7 +244,7 @@ export async function askBrain({ config, credentials, env, featuresPrompt, allow
         const { content, usage, resolvedModel } = await callModel({ ...entry, messages, config, credentials, env, jsonMode });
         const normalized = normalizeProposal(extractJson(content), allowedSymbols);
         if (!normalized.ok) {
-          attempts.push({ ...entry, format: label, ok: false, error: normalized.error });
+          attempts.push({ ...entry, format: label, ok: false, error: normalized.error, details: normalized.details ?? null });
           continue;
         }
         attempts.push({ ...entry, format: label, ok: true, usage });
