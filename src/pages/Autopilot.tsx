@@ -145,7 +145,8 @@ export default function Autopilot() {
   const [error, setError] = useState<string | null>(null);
   const [confirmLive, setConfirmLive] = useState(false);
   const [remember, setRemember] = useState(isTokenRemembered());
-  const [connected, setConnected] = useState(true);
+  const [connected, setConnected] = useState(false);
+  const [editingConnection, setEditingConnection] = useState(!getControlToken());
   const [storageWarning, setStorageWarning] = useState(false);
   const onboardingQuery = typeof window !== 'undefined'
     ? new URLSearchParams(window.location.search).get('onboarding')
@@ -186,17 +187,22 @@ export default function Autopilot() {
     if (!getControlToken()) {
       setState(null);
       setConnected(false);
-      return;
+      setEditingConnection(true);
+      return false;
     }
-    setConnected(true);
     setLoading(true);
     setError(null);
     try {
       const [nextState, nextRuns] = await Promise.all([autopilot.state(), autopilot.runs(40)]);
       setState(nextState);
       setRuns(Array.isArray(nextRuns.runs) ? nextRuns.runs : []);
+      setConnected(true);
+      return true;
     } catch (caught) {
+      setConnected(false);
+      setEditingConnection(true);
       setError(caught instanceof Error ? caught.message : String(caught));
+      return false;
     } finally {
       setLoading(false);
     }
@@ -206,7 +212,11 @@ export default function Autopilot() {
     setBaseUrl(baseUrl);
     const persisted = setControlToken(token.trim(), remember);
     setStorageWarning(!persisted);
-    await refresh();
+    const success = await refresh();
+    if (success) {
+      setEditingConnection(false);
+      toast.success('Autopilot connesso. Dati del Worker caricati.');
+    }
   }, [baseUrl, token, remember, refresh]);
 
   useEffect(() => { void refresh(); }, [refresh]);
@@ -320,6 +330,7 @@ export default function Autopilot() {
   const requiredCredentials = (state?.credentials ?? []).filter((item) => item.required);
   const credentialsOk = requiredCredentials.length > 0 && requiredCredentials.every((item) => item.configured);
   const hasRun = realRuns.length > 0;
+  const showConnectionForm = editingConnection || !state || Boolean(error);
 
   if (activeStrategyPreview) {
     const previewDraft = createStrategyOnboardingPreview(DEFAULT_STRATEGY_ONBOARDING_ANSWERS);
@@ -427,47 +438,65 @@ export default function Autopilot() {
       {/* Connessione */}
       <motion.div {...stagger(1)} className="col-span-12">
         <Card>
-          <CardHeader className="pb-3">
-            <CardTitle className="flex items-center gap-2 text-base text-text-0"><Lock className="size-4 text-agent" /> Connessione al Worker</CardTitle>
+          <CardHeader className="pb-3 sm:flex-row sm:items-start sm:justify-between sm:space-y-0">
+            <div className="space-y-1.5">
+              <CardTitle className="flex items-center gap-2 text-base text-text-0">
+                <Lock className="size-4 text-agent" /> Connessione al Worker
+                {connected && state ? <Badge className="bg-gain/15 text-gain hover:bg-gain/15">Connesso</Badge> : null}
+              </CardTitle>
             <CardDescription className="text-text-1">
-              Il <strong className="text-text-0">CONTROL_TOKEN</strong> è la password dell’agente, quella che hai generato con <code className="rounded bg-bg-2 px-1">openssl rand -base64 32</code> e
-              caricato con <code className="rounded bg-bg-2 px-1">wrangler secret put</code>. Resta in sessionStorage e si cancella chiudendo la scheda.
+                {connected && state
+                  ? 'Connessione verificata: la dashboard qui sotto usa i dati aggiornati del Worker.'
+                  : <>
+                    Il <strong className="text-text-0">CONTROL_TOKEN</strong> è la password dell’agente, quella che hai generato con <code className="rounded bg-bg-2 px-1">openssl rand -base64 32</code> e
+                    caricato con <code className="rounded bg-bg-2 px-1">wrangler secret put</code>. Resta in sessionStorage e si cancella chiudendo la scheda.
+                  </>}
             </CardDescription>
+            </div>
+            {!showConnectionForm ? (
+              <Button variant="outline" size="sm" onClick={() => setEditingConnection(true)}>
+                Cambia connessione
+              </Button>
+            ) : null}
           </CardHeader>
-          <CardContent className="grid gap-3 sm:grid-cols-[1fr_1fr_auto] sm:items-end">
-            <div className="grid gap-1.5">
-              <Label htmlFor="ap-base" className="text-text-0">URL del Worker</Label>
-              <Input id="ap-base" value={baseUrl} onChange={(event) => setBase(event.target.value)} placeholder="vuoto = stessa origine del sito" />
-            </div>
-            <div className="grid gap-1.5">
-              <Label htmlFor="ap-token" className="text-text-0">CONTROL_TOKEN</Label>
-              <Input id="ap-token" type="password" value={token} onChange={(event) => setToken(event.target.value)} placeholder="incolla il token" />
-            </div>
-            <Button onClick={() => void connect()} disabled={!token.trim() || loading}>
-              {loading ? <RefreshCw className="size-4 animate-spin" /> : null} Connetti
-            </Button>
-          </CardContent>
-          <CardContent className="pt-0">
-            <label className="flex items-start gap-2 text-xs text-text-1">
-              <input
-                type="checkbox"
-                className="mt-0.5 accent-current"
-                checked={remember}
-                onChange={(event) => setRemember(event.target.checked)}
-              />
-              <span>
-                Ricorda su questo dispositivo. Consigliato su telefono, dove il browser scarica le schede in background e
-                altrimenti dovresti reinserire il token ogni volta. Il token resta su questo dispositivo e non viene mai inviato
-                altrove.
-              </span>
-            </label>
-            {storageWarning && (
-              <p className="mt-2 text-xs text-warn">
-                Il browser non ha permesso di salvare il token (navigazione privata o restrizioni di storage). La connessione
-                funziona lo stesso, ma dovrai reinserirlo se ricarichi la pagina.
-              </p>
-            )}
-          </CardContent>
+          {showConnectionForm ? (
+            <>
+              <CardContent className="grid gap-3 sm:grid-cols-[1fr_1fr_auto] sm:items-end">
+                <div className="grid gap-1.5">
+                  <Label htmlFor="ap-base" className="text-text-0">URL del Worker</Label>
+                  <Input id="ap-base" value={baseUrl} onChange={(event) => setBase(event.target.value)} placeholder="vuoto = stessa origine del sito" />
+                </div>
+                <div className="grid gap-1.5">
+                  <Label htmlFor="ap-token" className="text-text-0">CONTROL_TOKEN</Label>
+                  <Input id="ap-token" type="password" value={token} onChange={(event) => setToken(event.target.value)} placeholder="incolla il token" />
+                </div>
+                <Button onClick={() => void connect()} disabled={!token.trim() || loading}>
+                  {loading ? <RefreshCw className="size-4 animate-spin" /> : null} Connetti
+                </Button>
+              </CardContent>
+              <CardContent className="pt-0">
+                <label className="flex items-start gap-2 text-xs text-text-1">
+                  <input
+                    type="checkbox"
+                    className="mt-0.5 accent-current"
+                    checked={remember}
+                    onChange={(event) => setRemember(event.target.checked)}
+                  />
+                  <span>
+                    Ricorda su questo dispositivo. Consigliato su telefono, dove il browser scarica le schede in background e
+                    altrimenti dovresti reinserire il token ogni volta. Il token resta su questo dispositivo e non viene mai inviato
+                    altrove.
+                  </span>
+                </label>
+                {storageWarning && (
+                  <p className="mt-2 text-xs text-warn">
+                    Il browser non ha permesso di salvare il token (navigazione privata o restrizioni di storage). La connessione
+                    funziona lo stesso, ma dovrai reinserirlo se ricarichi la pagina.
+                  </p>
+                )}
+              </CardContent>
+            </>
+          ) : null}
         </Card>
       </motion.div>
 
@@ -712,8 +741,8 @@ export default function Autopilot() {
                     </AlertDescription>
                   </Alert>
                 ) : null}
-                <ProfileSelector current={config.strategyProfile} onApplied={refresh} />
-                <GuardrailsEditor config={config} onSaved={refresh} />
+                <ProfileSelector current={config.strategyProfile} onApplied={async () => { await refresh(); }} />
+                <GuardrailsEditor config={config} onSaved={async () => { await refresh(); }} />
               </TabsContent>
 
               <TabsContent value="watcher" className="pt-4"><WatcherPanel /></TabsContent>
@@ -722,7 +751,7 @@ export default function Autopilot() {
                 <CredentialsSection
                   credentials={state.credentials ?? []}
                   notificationsActive={state.notificationsActive}
-                  onChanged={refresh}
+                  onChanged={async () => { await refresh(); }}
                 />
               </TabsContent>
 
@@ -797,11 +826,33 @@ export default function Autopilot() {
                                 <Badge variant={detail.proposal.parsed.confidence >= config.minConfidence ? 'default' : 'outline'}>
                                   affidabilità {detail.proposal.parsed.confidence.toFixed(2)} (minimo {config.minConfidence})
                                 </Badge>
+                                {(detail.proposal.attempts as Array<{ ok?: boolean; reasoningTier?: string }>).some((attempt) => attempt.ok && attempt.reasoningTier === 'basic-fallback') ? (
+                                  <Badge variant="outline" className="border-warn/40 text-warn">Fallback: i reasoning model precedenti non erano validi</Badge>
+                                ) : null}
                                 {detail.improvement && <Badge variant="outline">Revisione di {detail.improvement.sourceModel ?? 'un piano precedente'}</Badge>}
                               </div>
                               <p className="text-xs leading-relaxed text-text-1">
                                 L’affidabilità è la stima prudenziale del modello sulla qualità della decisione rispetto a non cambiare nulla. Non dipende dalla grandezza del capitale; sotto il minimo il piano resta visibile, ma non può produrre ordini.
                               </p>
+                              {Array.isArray(detail.proposal.attempts) && detail.proposal.attempts.length > 0 ? (
+                                <details className="rounded-xl border border-hairline bg-bg-0 p-3">
+                                  <summary className="cursor-pointer text-xs font-medium text-text-0">
+                                    Percorso modelli · priorità reasoning
+                                  </summary>
+                                  <p className="mt-2 text-xs leading-relaxed text-text-2">
+                                    L’ordine qui sotto è quello realmente eseguito. Un modello fallback viene usato soltanto se quelli più forti sopra di lui non hanno prodotto una proposta valida.
+                                  </p>
+                                  <div className="mt-2 space-y-1.5">
+                                    {(detail.proposal.attempts as Array<{ provider?: string; model: string; format: string; ok: boolean; error?: string; reasoningTier?: string }>).map((attempt, index) => (
+                                      <p key={index} className={cn('font-mono text-[11px]', attempt.ok ? 'text-gain' : 'text-text-1')}>
+                                        {attempt.ok ? '✓' : '✗'} {attempt.provider ? `${attempt.provider}/` : ''}{attempt.model}
+                                        {attempt.reasoningTier ? ` · ${attempt.reasoningTier}` : ''}
+                                        {attempt.error ? ` — ${attempt.error}` : ''}
+                                      </p>
+                                    ))}
+                                  </div>
+                                </details>
+                              ) : null}
                               <p className="text-sm leading-relaxed text-text-0">{detail.proposal.parsed.rationale}</p>
                               <div>
                                 <p className="mb-1 text-xs text-text-1">Allocazione proposta</p>

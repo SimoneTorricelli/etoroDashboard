@@ -8,7 +8,7 @@
  */
 
 const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
-const PROVIDER_FALLBACK_ORDER = ['workers-ai', 'gemini', 'groq', 'openrouter'];
+const PROVIDER_FALLBACK_ORDER = ['openrouter', 'workers-ai', 'gemini', 'groq'];
 
 /**
  * Modelli OpenRouter gratuiti scelti per ragionamento e, quando disponibile,
@@ -52,17 +52,45 @@ export function modelVendor(entry) {
   return model.split('/')[0] || String(entry?.provider ?? 'unknown');
 }
 
-const REVIEW_MODEL_SCORE = new Map([
+const MODEL_REASONING_SCORE = new Map([
   ['nvidia/nemotron-3-ultra-550b-a55b:free', 100],
   ['z-ai/glm-5.2:free', 98],
   ['@cf/openai/gpt-oss-120b', 97],
   ['nvidia/nemotron-3-super-120b-a12b:free', 96],
   ['@cf/nvidia/nemotron-3-120b-a12b', 95],
   ['minimax/minimax-m3:free', 92],
+  ['gemini-3.7-flash', 91],
   ['google/gemma-4-31b-it:free', 90],
   ['@cf/qwen/qwen3-30b-a3b-fp8', 88],
+  ['thinkingmachines/inkling:free', 87],
+  ['thinkingmachines/inkling-small:free', 86],
+  ['gemini-3.6-flash', 85],
   ['minimax/minimax-m2.7:free', 84],
+  ['stealth/ox-alpha', 75],
+  ['openrouter/free', 65],
+  ['@cf/meta/llama-3.3-70b-instruct-fp8-fast', 45],
+  ['llama-3.3-70b-versatile', 44],
+  ['llama-3.1-8b-instant', 25],
 ]);
+
+export function modelReasoningScore(entry) {
+  return MODEL_REASONING_SCORE.get(String(entry?.model ?? '')) ?? 50;
+}
+
+/**
+ * La qualità del modello precede sempre l'ordine del provider salvato. L'ordine
+ * originario resta soltanto come spareggio stabile fra modelli non classificati.
+ */
+export function prioritizeReasoningPlan(plan) {
+  return plan
+    .map((entry, index) => ({ ...entry, index, score: modelReasoningScore(entry) }))
+    .sort((left, right) => right.score - left.score || left.index - right.index)
+    .map(({ index: _index, score, ...entry }) => ({
+      ...entry,
+      reasoningScore: score,
+      reasoningTier: score >= 90 ? 'advanced' : score >= 80 ? 'strong' : score >= 60 ? 'fallback' : 'basic-fallback',
+    }));
+}
 
 /** Revisori: reasoning forte prima, poi laboratori diversi dal modello guida. */
 export function prioritizeReviewPlan(plan, leadAttempt = null) {
@@ -71,7 +99,7 @@ export function prioritizeReviewPlan(plan, leadAttempt = null) {
     const leftSameVendor = leadVendor && modelVendor(left) === leadVendor ? 1 : 0;
     const rightSameVendor = leadVendor && modelVendor(right) === leadVendor ? 1 : 0;
     if (leftSameVendor !== rightSameVendor) return leftSameVendor - rightSameVendor;
-    return (REVIEW_MODEL_SCORE.get(right.model) ?? 0) - (REVIEW_MODEL_SCORE.get(left.model) ?? 0);
+    return modelReasoningScore(right) - modelReasoningScore(left);
   });
 }
 
@@ -254,12 +282,10 @@ export function buildAttemptPlan({ config, credentials, env }) {
   const requested = Array.isArray(config.llmProviders) && config.llmProviders.length
     ? config.llmProviders
     : ['workers-ai'];
-  // Le vecchie configurazioni salvavano soltanto Workers AI. Salvo opt-out
-  // esplicito, aggiungiamo in coda ogni provider oggi disponibile e proviamo un
-  // modello per provider prima di tornare al secondo modello dello stesso.
-  const providerIds = config.llmFallbackAcrossProviders === false
-    ? [...new Set(requested)]
-    : [...new Set([...requested, ...PROVIDER_FALLBACK_ORDER])];
+  // Le configurazioni storiche potevano disabilitare il fallback fra provider.
+  // La policy quality-first corrente considera invece sempre ogni provider
+  // realmente disponibile: il provider non deve precedere un modello migliore.
+  const providerIds = [...new Set([...requested, ...PROVIDER_FALLBACK_ORDER])];
   const routes = [];
   for (const providerId of providerIds) {
     const provider = PROVIDERS[providerId];
@@ -276,14 +302,8 @@ export function buildAttemptPlan({ config, credentials, env }) {
     if (models.length) routes.push({ provider: providerId, models });
   }
 
-  const plan = [];
-  const depth = Math.max(0, ...routes.map((route) => route.models.length));
-  for (let index = 0; index < depth; index += 1) {
-    for (const route of routes) {
-      if (route.models[index]) plan.push({ provider: route.provider, model: route.models[index] });
-    }
-  }
-  return plan;
+  const plan = routes.flatMap((route) => route.models.map((model) => ({ provider: route.provider, model })));
+  return prioritizeReasoningPlan(plan);
 }
 
 /**

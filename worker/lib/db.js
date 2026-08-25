@@ -159,8 +159,8 @@ export const DEFAULT_CONFIG = {
   minConfidence: 0.55,
 
   /**
-   * Ordine dei provider AI. Il router prova un modello per provider prima di
-   * tornare al secondo modello dello stesso provider.
+   * Provider AI abilitati. L'ordine non determina più la qualità: il router
+   * costruisce una graduatoria globale dei modelli per capacità di reasoning.
    */
   llmProviders: ['workers-ai', 'gemini', 'groq', 'openrouter'],
   /** Include automaticamente nella cascata gli altri provider con credenziali disponibili. */

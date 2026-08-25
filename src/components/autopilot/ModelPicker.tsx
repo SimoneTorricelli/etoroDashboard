@@ -1,13 +1,13 @@
 /**
  * Selezione dei provider AI e dei relativi modelli.
  *
- * Vengono provati nell'ordine mostrato. Workers AI è un binding interno di
- * Cloudflare: non richiede chiavi, non consuma subrequest ed è incluso nel
- * piano gratuito, quindi conviene tenerlo per primo.
+ * I provider indicano soltanto i canali abilitati. Il Worker costruisce poi
+ * una priorità globale dei modelli per qualità del reasoning, senza favorire
+ * il provider mostrato per primo.
  */
 import { useEffect, useState } from 'react';
 import { toast } from 'sonner';
-import { ArrowDown, ArrowUp, Cpu, Loader2, Plus, RefreshCw, Trash2 } from 'lucide-react';
+import { Cpu, Loader2, Plus, RefreshCw, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
@@ -56,14 +56,6 @@ export function ModelPicker({ providers, models, onChange }: Props) {
     }
   };
 
-  const moveProvider = (index: number, delta: number) => {
-    const next = [...providers];
-    const target = index + delta;
-    if (target < 0 || target >= next.length) return;
-    [next[index], next[target]] = [next[target], next[index]];
-    onChange({ llmProviders: next });
-  };
-
   const toggleProvider = (id: string) => {
     onChange({
       llmProviders: providers.includes(id) ? providers.filter((item) => item !== id) : [...providers, id],
@@ -88,8 +80,8 @@ export function ModelPicker({ providers, models, onChange }: Props) {
             <Cpu className="size-4 text-agent" /> Provider AI
           </h3>
           <p className="text-xs leading-relaxed text-text-1">
-            Provati nell'ordine: si usa il primo che risponde con una proposta valida. Tenerne più di uno protegge dai rate limit
-            e dai modelli ritirati senza preavviso.
+            Priorità globale per capacità di reasoning: il modello più forte disponibile viene provato prima, anche se appartiene
+            a un provider mostrato più sotto. Llama 70B resta soltanto un fallback tardivo.
           </p>
         </div>
         <Button variant="outline" size="sm" onClick={() => void reload()} disabled={loading}>
@@ -98,21 +90,15 @@ export function ModelPicker({ providers, models, onChange }: Props) {
       </div>
 
       <div className="space-y-2">
-        {providers.map((providerId, index) => {
+        {providers.map((providerId) => {
           const meta = known.find((item) => item.id === providerId);
           const list = models[providerId] ?? [];
           return (
             <div key={providerId} className="rounded-lg border border-hairline bg-bg-2/40 p-2.5">
               <div className="flex items-center gap-2">
-                <Badge variant="outline" className="shrink-0 tabular-nums">{index + 1}</Badge>
+                <Badge variant="outline" className="shrink-0">attivo</Badge>
                 <span className="min-w-0 flex-1 truncate text-sm font-medium text-text-0">{meta?.label ?? providerId}</span>
                 {meta?.needsKey && <Badge variant="secondary" className="shrink-0 text-[10px]">richiede chiave</Badge>}
-                <Button variant="ghost" size="icon" className="size-7" disabled={index === 0} onClick={() => moveProvider(index, -1)}>
-                  <ArrowUp className="size-3.5" />
-                </Button>
-                <Button variant="ghost" size="icon" className="size-7" disabled={index === providers.length - 1} onClick={() => moveProvider(index, 1)}>
-                  <ArrowDown className="size-3.5" />
-                </Button>
                 <Button variant="ghost" size="icon" className="size-7 text-loss" onClick={() => toggleProvider(providerId)}>
                   <Trash2 className="size-3.5" />
                 </Button>

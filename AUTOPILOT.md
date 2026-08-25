@@ -96,7 +96,7 @@ interna all'executor e viene applicata soltanto al momento dell'invio a eToro.
 | `schema.sql` | Schema D1 per migrazione manuale |
 | `lib/strategy.js` | Contratto versionato onboarding → StrategySpec + scenari deterministici |
 | `lib/universe-policy.js` | Catalogo tassonomico e policy dell’universo dinamico |
-| `selftest.mjs` e `*-selftest.mjs` | 103 test deterministici e di regressione |
+| `selftest.mjs` e `*-selftest.mjs` | 104 test deterministici e di regressione |
 
 ### Frontend — `src/`
 
@@ -282,8 +282,9 @@ Costo stimato: 2–5 chiamate AI al mese invece di 720.
 
 ## 8. Provider AI
 
-L'ordine predefinito è `workers-ai → gemini → groq → openrouter`: si usa il
-primo che risponde con una proposta valida.
+Il router non segue più l'ordine dei provider: costruisce una graduatoria
+globale dei modelli disponibili e prova prima quelli con reasoning più forte.
+Il provider serve soltanto come canale di accesso e come fallback operativo.
 
 | Provider | Chiave | Costo | Note |
 |---|---|---|---|
@@ -297,12 +298,18 @@ primo che risponde con una proposta valida.
 free"`). Costruire su un catalogo che si svuota non è sostenibile.
 
 OpenRouter accetta soltanto endpoint a prezzo zero. La priorità automatica
-attuale è: **Nemotron 3 Ultra → GLM 5.2 → Nemotron 3 Super → MiniMax M3 →
-Gemma 4 31B → MiniMax M2.7 → router free**. Sui modelli compatibili viene
-abilitato reasoning `medium`: lascia spazio sufficiente all'output JSON senza
-rinunciare al controllo multi-step. I revisori vengono ordinati anche per
-laboratorio, così due risposte dello stesso vendor non vengono trattate come
-vera validazione indipendente.
+globale attuale inizia con: **Nemotron 3 Ultra → GLM 5.2 → GPT-OSS 120B →
+Nemotron 3 Super → Nemotron 3 120B → MiniMax M3 → Gemini 3.7 Flash → Gemma 4
+31B → Qwen 3**. MiniMax M2.7, il router free e Llama 70B restano fallback:
+Llama non può precedere un reasoning model disponibile soltanto perché
+Workers AI era elencato per primo. Anche una vecchia configurazione con
+fallback tra provider disattivato viene migrata di fatto alla policy
+`quality-first`. Sui modelli compatibili viene abilitato reasoning `medium`:
+lascia spazio sufficiente all'output JSON senza rinunciare al controllo
+multi-step. I revisori vengono ordinati anche per laboratorio, così due
+risposte dello stesso vendor non vengono trattate come vera validazione
+indipendente. Nel dettaglio run è sempre visibile il percorso reale dei
+tentativi, inclusi gli errori che hanno eventualmente portato a un fallback.
 
 ### Ottimizzazione del prompt
 
@@ -449,7 +456,7 @@ Telegram e webhook generico, entrambi opzionali e non bloccanti.
 
 ## 14. Test
 
-103 test complessivi, tutti senza rete reale:
+104 test complessivi, tutti senza rete reale:
 
 - 64 in `worker/selftest.mjs` per feature, capitale reale, parsing Responses API GPT-OSS, riparazione dei pesi, retry AI, catalogo gratuito, guardrail settoriali, revisione aritmetica multi-provider, esposizioni equivalenti, asset statici, watcher, executor e
   riconciliazione

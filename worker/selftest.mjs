@@ -102,13 +102,13 @@ test('prompt compatto sotto i 6000 caratteri', () => {
   assert.ok(!prompt.includes(`equity=${features.portfolio.equityUsd}`), 'non espone il capitale esatto ai provider AI');
 });
 
-test('router AI: alterna i provider prima dei modelli secondari', () => {
+test('router AI: ordina globalmente per reasoning, non per provider', () => {
   const plan = buildAttemptPlan({
     config: {
       ...DEFAULT_CONFIG,
       llmProviders: ['workers-ai'],
       llmModels: {
-        'workers-ai': ['workers-legacy'],
+        'workers-ai': ['@cf/meta/llama-3.3-70b-instruct-fp8-fast', 'workers-legacy'],
         gemini: ['gemini-custom'],
         groq: ['groq-custom'],
         openrouter: ['openrouter/custom'],
@@ -117,8 +117,30 @@ test('router AI: alterna i provider prima dei modelli secondari', () => {
     credentials: { geminiApiKey: 'x', groqApiKey: 'x', openrouterApiKey: 'x' },
     env: { AI: {} },
   });
-  assert.deepEqual(plan.slice(0, 4).map((entry) => entry.provider), ['workers-ai', 'gemini', 'groq', 'openrouter']);
+  assert.deepEqual(plan.slice(0, 5).map((entry) => entry.model), [
+    'nvidia/nemotron-3-ultra-550b-a55b:free',
+    'z-ai/glm-5.2:free',
+    '@cf/openai/gpt-oss-120b',
+    'nvidia/nemotron-3-super-120b-a12b:free',
+    '@cf/nvidia/nemotron-3-120b-a12b',
+  ]);
+  assert.ok(plan.findIndex((entry) => entry.model === '@cf/meta/llama-3.3-70b-instruct-fp8-fast') > 4);
   assert.ok(plan.some((entry) => entry.model === 'workers-legacy'));
+});
+
+test('router AI: una vecchia preferenza provider non può escludere modelli reasoning migliori', () => {
+  const plan = buildAttemptPlan({
+    config: {
+      ...DEFAULT_CONFIG,
+      llmProviders: ['workers-ai'],
+      llmFallbackAcrossProviders: false,
+      llmModels: { ...DEFAULT_CONFIG.llmModels, openrouter: [] },
+    },
+    credentials: { openrouterApiKey: 'x' },
+    env: { AI: {} },
+  });
+  assert.equal(plan[0].model, 'nvidia/nemotron-3-ultra-550b-a55b:free');
+  assert.equal(plan[0].reasoningTier, 'advanced');
 });
 
 test('router AI: OpenRouter resta un fallback anche senza modello scelto', () => {
