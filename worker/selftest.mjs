@@ -1422,7 +1422,41 @@ test('OpenRouter: Ultra usa un solo prompt JSON senza fingere supporto nativo', 
     });
     assert.equal(body.response_format, undefined);
     assert.equal(body.plugins, undefined);
+    assert.equal(body.max_tokens, 65_536);
+    assert.deepEqual(body.reasoning, { effort: 'high', exclude: true });
     assert.equal(result.debug.structuredMode, 'prompt_only');
+    assert.equal(result.debug.maxTokens, 65_536);
+    assert.equal(result.debug.reasoningEffort, 'high');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Brain: Nemotron Ultra conserva il budget completo e un timeout dedicato', async () => {
+  const originalFetch = globalThis.fetch;
+  let body;
+  globalThis.fetch = async (_url, init) => {
+    body = JSON.parse(init.body);
+    return new Response(JSON.stringify({
+      choices: [{
+        finish_reason: 'stop',
+        message: { content: '{"targetWeights":{"CASH":1},"confidence":0.4,"rationale":"attesa","risks":[],"watch":[]}' },
+      }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  try {
+    const result = await askBrain({
+      config: DEFAULT_CONFIG,
+      credentials: { openrouterApiKey: 'test-key' },
+      env: {},
+      featuresPrompt: 'STRUMENTI\nCASH',
+      allowedSymbols: [],
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.model, 'openrouter/nvidia/nemotron-3-ultra-550b-a55b:free');
+    assert.equal(body.max_tokens, 65_536);
+    assert.equal(result.attempts[0].debug.maxTokens, 65_536);
+    assert.equal(result.attempts[0].debug.timeoutMs, 240_000);
   } finally {
     globalThis.fetch = originalFetch;
   }

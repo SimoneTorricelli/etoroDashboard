@@ -9,6 +9,13 @@
 
 const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
 const PROVIDER_FALLBACK_ORDER = ['openrouter', 'workers-ai', 'gemini', 'groq'];
+export const OPENROUTER_NEMOTRON_ULTRA_MODEL = 'nvidia/nemotron-3-ultra-550b-a55b:free';
+const MODEL_COMPLETION_TOKEN_FLOOR = new Map([
+  // L'endpoint Nvidia gratuito dichiara 65.536 token massimi. Ultra usa parte
+  // del budget per il reasoning: il limite configurabile generico (1.600–8.000)
+  // non basta sempre a lasciare spazio al JSON finale.
+  [OPENROUTER_NEMOTRON_ULTRA_MODEL, 65_536],
+]);
 
 /**
  * Modelli OpenRouter gratuiti scelti per ragionamento e, quando disponibile,
@@ -16,7 +23,7 @@ const PROVIDER_FALLBACK_ORDER = ['openrouter', 'workers-ai', 'gemini', 'groq'];
  * non sono adatti a decidere o revisionare una policy di portafoglio.
  */
 export const OPENROUTER_REASONING_MODELS = [
-  'nvidia/nemotron-3-ultra-550b-a55b:free',
+  OPENROUTER_NEMOTRON_ULTRA_MODEL,
   'z-ai/glm-5.2:free',
   'nvidia/nemotron-3-super-120b-a12b:free',
   'minimax/minimax-m3:free',
@@ -56,6 +63,7 @@ const WORKERS_REASONING_MODEL_SET = new Set([
   '@cf/qwen/qwen3-30b-a3b-fp8',
 ]);
 const OPENROUTER_REASONING_EFFORT = new Map([
+  [OPENROUTER_NEMOTRON_ULTRA_MODEL, 'high'],
   // GLM 5.2 accetta soltanto high/xhigh: `medium` viene rifiutato da alcuni endpoint.
   ['z-ai/glm-5.2:free', 'high'],
 ]);
@@ -781,7 +789,8 @@ export async function callModel({ provider, model, messages, config, credentials
     : ['openrouter', 'groq'].includes(provider) && reasoningEffort && reasoningEffort !== 'none'
       ? 2_048
       : 0;
-  const effectiveMaxTokens = Math.max(configuredMaxTokens, reasoningFloor);
+  const modelCompletionFloor = Number(MODEL_COMPLETION_TOKEN_FLOOR.get(model)) || 0;
+  const effectiveMaxTokens = Math.max(configuredMaxTokens, reasoningFloor, modelCompletionFloor);
   const controller = new AbortController();
   let timerFired = false;
   let timer;

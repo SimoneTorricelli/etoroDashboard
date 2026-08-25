@@ -8,7 +8,7 @@
 
 import {
   buildAttemptPlan, callModel, isWorkersReasoningModel, llmErrorDebug, modelVendor,
-  supportsNativeJson,
+  OPENROUTER_NEMOTRON_ULTRA_MODEL, supportsNativeJson,
 } from './llm.js';
 
 export { listFreeModels } from './llm.js';
@@ -344,6 +344,15 @@ function decisionMinimumMaxTokens(entry) {
   return isWorkersReasoningModel(entry?.model) ? 3_200 : 0;
 }
 
+function decisionAttemptTimeoutMs(entry) {
+  // Con reasoning `high`, Ultra può usare gran parte del budget prima di
+  // emettere il JSON finale. Il vecchio timeout di 60 s annullava quindi il
+  // beneficio del limite a 65.536 token proprio sugli output più approfonditi.
+  if (entry?.provider === 'openrouter' && entry?.model === OPENROUTER_NEMOTRON_ULTRA_MODEL) return 240_000;
+  if (entry?.provider === 'workers-ai' && entry?.model === '@cf/openai/gpt-oss-120b') return 75_000;
+  return 60_000;
+}
+
 function responseWasTruncated(debug) {
   const stop = `${debug?.finishReason ?? ''} ${debug?.nativeFinishReason ?? ''} ${debug?.incompleteReason ?? ''}`;
   return /length|max[_ -]?(?:output[_ -]?)?tokens?|token[_ -]?limit|incomplete/i.test(stop);
@@ -478,7 +487,7 @@ export async function askBrain({ config, credentials, env, featuresPrompt, allow
         jsonMode,
         minimumMaxTokens,
         responseSchema: RESPONSE_SCHEMA,
-        timeoutMs: entry.provider === 'workers-ai' && entry.model === '@cf/openai/gpt-oss-120b' ? 75_000 : 60_000,
+        timeoutMs: decisionAttemptTimeoutMs(entry),
       });
       const found = findNormalizedProposal(response.content, allowedSymbols);
       if (!found.ok && found.kind === 'invalid_json') {
