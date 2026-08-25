@@ -12,6 +12,7 @@
  */
 import { annualizedVol, distanceFromSma, maxDrawdown, pctChange, rsi } from './features.js';
 import { extractJson } from './brain.js';
+import { buildAttemptPlan, callModel } from './llm.js';
 import { checkChurnRules } from './churn.js';
 
 const round = (value, digits = 2) => (Number.isFinite(value) ? Math.round(value * 10 ** digits) / 10 ** digits : null);
@@ -115,7 +116,7 @@ export function relevantHeadlines(anomaly, news, limit = 8) {
   return [...specific, ...fallback].slice(0, limit);
 }
 
-export async function classifyAnomaly({ apiKey, models, anomaly, news, config, referer }) {
+export async function classifyAnomaly({ config, credentials, env, anomaly, news }) {
   const headlines = relevantHeadlines(anomaly, news);
   const prompt = [
     `STRUMENTO ${anomaly.symbol} — ${anomaly.name} (${anomaly.class})`,
@@ -126,35 +127,27 @@ export async function classifyAnomaly({ apiKey, models, anomaly, news, config, r
     anomaly.held ? `IN PORTAFOGLIO peso ${anomaly.metrics.heldWeight}% · P&L ${anomaly.metrics.heldPnlPct}%` : 'NON IN PORTAFOGLIO',
     '',
     'TITOLI RECENTI:',
-    ...headlines.map((item) => `- ${item.title}`),
-    headlines.length ? '' : '- nessuna notizia rilevante trovata',
+    ...(headlines.length ? headlines.map((item) => `- ${item.title}`) : ['- nessuna notizia rilevante trovata']),
   ].join('\n');
 
-  for (const model of models.slice(0, 3)) {
+  const messages = [
+    { role: 'system', content: CLASSIFIER_SYSTEM },
+    { role: 'user', content: prompt },
+  ];
+
+  // Solo due tentativi: il watcher gira ogni ora e non deve mai diventare costoso.
+  for (const entry of buildAttemptPlan({ config, credentials, env }).slice(0, 2)) {
     try {
-      const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          authorization: `Bearer ${apiKey}`,
-          'content-type': 'application/json',
-          'HTTP-Referer': referer || 'https://etorodashboard.workers.dev',
-          'X-Title': 'Torino Autopilot Watcher',
-        },
-        body: JSON.stringify({
-          model,
-          messages: [{ role: 'system', content: CLASSIFIER_SYSTEM }, { role: 'user', content: prompt }],
-          temperature: 0.1,
-          max_tokens: 700,
-          response_format: { type: 'json_object' },
-        }),
+      const { content } = await callModel({
+        ...entry, messages, credentials, env,
+        config: { ...config, llmTemperature: 0.1, llmMaxTokens: 700 },
+        timeoutMs: 30_000,
       });
-      if (!response.ok) continue;
-      const payload = await response.json();
-      const parsed = extractJson(payload?.choices?.[0]?.message?.content ?? '');
+      const parsed = extractJson(content);
       if (!parsed?.classification) continue;
       const confidence = Number(parsed.confidence);
       return {
-        model,
+        model: `${entry.provider}/${entry.model}`,
         classification: ['structural_break', 'technical_overreaction', 'unclear'].includes(parsed.classification) ? parsed.classification : 'unclear',
         confidence: Number.isFinite(confidence) ? Math.max(0, Math.min(1, confidence > 1 ? confidence / 100 : confidence)) : 0.5,
         suggestedAction: ['avoid', 'watch', 'accumulate', 'exit'].includes(parsed.suggestedAction) ? parsed.suggestedAction : 'watch',
@@ -162,9 +155,8 @@ export async function classifyAnomaly({ apiKey, models, anomaly, news, config, r
         keyFactors: Array.isArray(parsed.keyFactors) ? parsed.keyFactors.map(String).slice(0, 5) : [],
         headlinesUsed: headlines.length,
       };
-    } catch { /* modello non disponibile: si prova il successivo */ }
+    } catch { /* provider non disponibile: si prova il successivo */ }
   }
-  void config;
   return null;
 }
 

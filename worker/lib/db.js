@@ -118,14 +118,18 @@ export const DEFAULT_CONFIG = {
   /** Confidenza minima della proposta perché sia eseguibile. */
   minConfidence: 0.55,
 
-  /** Cascata modelli OpenRouter: il primo che risponde valido vince. */
-  models: [
-    'deepseek/deepseek-chat-v3-0324:free',
-    'meta-llama/llama-3.3-70b-instruct:free',
-    'qwen/qwen3-235b-a22b:free',
-    'mistralai/mistral-small-3.2-24b-instruct:free',
-    'google/gemma-3-27b-it:free',
-  ],
+  /**
+   * Ordine dei provider AI. Workers AI è primo perché è un binding interno:
+   * non consuma subrequest ed è incluso nel piano gratuito di Cloudflare.
+   */
+  llmProviders: ['workers-ai', 'gemini', 'groq', 'openrouter'],
+  /** Modelli per provider. Vuoto = si usano i default del provider. */
+  llmModels: {
+    'workers-ai': ['@cf/meta/llama-3.3-70b-instruct-fp8-fast', '@cf/mistralai/mistral-small-3.1-24b-instruct'],
+    gemini: ['gemini-2.0-flash', 'gemini-2.0-flash-lite'],
+    groq: ['llama-3.3-70b-versatile'],
+    openrouter: [],
+  },
   llmTemperature: 0.2,
   llmMaxTokens: 1600,
   /** Politica di rischio in linguaggio naturale, iniettata nel prompt. */

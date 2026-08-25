@@ -30,7 +30,7 @@ function etoroHint(status) {
  * @param {{values: object}} resolved
  * @param {object} config
  */
-export async function runDiagnostics(resolved, config) {
+export async function runDiagnostics(resolved, config, env = {}) {
   const credentials = resolved.values ?? resolved;
   const checks = [];
 
@@ -115,43 +115,18 @@ export async function runDiagnostics(resolved, config) {
           'Usa la ricerca nel tab Strategia: cerca il nome dello strumento e scegli la voce giusta dal catalogo eToro, invece di scrivere il ticker a mano.'));
   }
 
-  // --- OpenRouter ---------------------------------------------------------
-  if (!credentials.openrouterApiKey) {
-    checks.push(ko('openrouter', 'OpenRouter — chiave AI', 'chiave non configurata', 'Creala su openrouter.ai → Keys.'));
-  } else {
-    try {
-      const response = await fetch('https://openrouter.ai/api/v1/key', {
-        headers: { authorization: `Bearer ${credentials.openrouterApiKey}` },
-      });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        checks.push(ko('openrouter', 'OpenRouter — chiave AI',
-          payload?.error?.message ?? `HTTP ${response.status}`,
-          response.status === 401 ? 'Chiave revocata o errata: creane una nuova su openrouter.ai → Keys.' : undefined));
-      } else {
-        const data = payload?.data ?? {};
-        const remaining = data.limit_remaining;
-        checks.push(ok('openrouter', 'OpenRouter — chiave AI',
-          `valida${data.label ? ` · ${data.label}` : ''}${remaining != null ? ` · credito residuo ${remaining}` : ' · piano free'}`));
-      }
-    } catch (error) {
-      checks.push(ko('openrouter', 'OpenRouter — chiave AI', error instanceof Error ? error.message : String(error)));
-    }
-  }
-
-  // --- Modelli configurati -------------------------------------------------
-  if (credentials.openrouterApiKey && config.models?.length) {
-    const probes = await probeModels({ apiKey: credentials.openrouterApiKey, models: config.models });
-    const working = probes.filter((item) => item.ok);
-    const broken = probes.filter((item) => !item.ok);
-    checks.push(working.length
-      ? ok('models', 'Modelli AI configurati',
-          `${working.length}/${probes.length} funzionanti: ${working.map((item) => item.model).join(', ')}${broken.length ? ` · non disponibili: ${broken.map((item) => `${item.model} (${item.error})`).join('; ')}` : ''}`,
-          { data: probes })
-      : ko('models', 'Modelli AI configurati',
-          broken.map((item) => `${item.model}: ${item.error}`).join(' · '),
-          'Il catalogo gratuito di OpenRouter cambia spesso: apri Strategia → Modelli AI e scegli fra quelli disponibili adesso.'));
-  }
+  // --- Provider AI ---------------------------------------------------------
+  const probes = await probeModels({ config, credentials, env });
+  const working = probes.filter((item) => item.ok);
+  const broken = probes.filter((item) => !item.ok);
+  checks.push(working.length
+    ? ok('models', 'Provider AI',
+        `${working.length}/${probes.length} funzionanti: ${working.map((item) => `${item.provider}/${item.model}`).join(', ')}`
+        + (broken.length ? ` · non disponibili: ${broken.map((item) => `${item.provider}/${item.model} (${item.error})`).join('; ')}` : ''),
+        { data: probes })
+    : ko('models', 'Provider AI',
+        broken.map((item) => `${item.provider}/${item.model}: ${item.error}`).join(' · '),
+        'Workers AI è incluso nel piano gratuito di Cloudflare e non richiede chiavi: verifica che il binding "AI" sia in wrangler.jsonc. In alternativa aggiungi una chiave Gemini o Groq nelle Credenziali.'));
 
   // --- Notifiche ----------------------------------------------------------
   if (!credentials.telegramBotToken && !credentials.telegramChatId && !credentials.notifyWebhookUrl) {
@@ -185,8 +160,7 @@ export async function runDiagnostics(resolved, config) {
     checkedAt: Date.now(),
     ok: failures.length === 0,
     readyForShadow: checks.find((item) => item.id === 'etoro.read')?.ok === true
-      && checks.find((item) => item.id === 'openrouter')?.ok === true
-      && checks.find((item) => item.id === 'models')?.ok !== false,
+      && checks.find((item) => item.id === 'models')?.ok === true,
     readyForLive: checks.find((item) => item.id === 'etoro.agent')?.ok === true,
     checks,
   };

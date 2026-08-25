@@ -114,13 +114,13 @@ async function cryptoFearGreed() {
 
 // ---------------------------------------------------------------- News
 
+// Il Worker ha un budget di subrequest per invocazione: la lista resta corta
+// e senza duplicati.
 const RSS_FEEDS = [
   { id: 'cnbc-markets', url: 'https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=20910258', topic: 'markets' },
-  { id: 'cnbc-economy', url: 'https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=20910258', topic: 'economy' },
   { id: 'marketwatch-top', url: 'https://feeds.content.dowjones.io/public/rss/mw_topstories', topic: 'markets' },
   { id: 'yahoo-finance', url: 'https://finance.yahoo.com/news/rssindex', topic: 'markets' },
   { id: 'coindesk', url: 'https://www.coindesk.com/arc/outboundfeeds/rss/', topic: 'crypto' },
-  { id: 'investing-econ', url: 'https://www.investing.com/rss/news_14.rss', topic: 'economy' },
   { id: 'fed-press', url: 'https://www.federalreserve.gov/feeds/press_monetary.xml', topic: 'macro' },
 ];
 
@@ -218,7 +218,17 @@ async function fmpRatios(key, symbols) {
  * @param {{finnhubKey?: string, marketauxKey?: string, fmpKey?: string, symbols?: string[]}} options
  */
 export async function collectExternalContext(options = {}) {
-  const { finnhubKey, marketauxKey, fmpKey, symbols = [] } = options;
+  const { finnhubKey, marketauxKey, fmpKey, symbols = [], kv = null, ttlSeconds = 3 * 60 * 60 } = options;
+
+  // Il contesto di mercato cambia lentamente: una cache di poche ore evita di
+  // rifare quindici chiamate a ogni heartbeat orario.
+  const cacheKey = 'external-context:v1';
+  if (kv) {
+    try {
+      const cached = await kv.get(cacheKey, 'json');
+      if (cached?.collectedAt) return { ...cached, fromCache: true };
+    } catch { /* cache non disponibile */ }
+  }
 
   const tasks = [
     settle('fx.eurusd', eurUsd),
@@ -253,7 +263,7 @@ export async function collectExternalContext(options = {}) {
     if (rows) series[key] = rows;
   }
 
-  return {
+  const context = {
     collectedAt: Date.now(),
     eurUsd: valueOf('fx.eurusd'),
     crypto: { global: valueOf('crypto.global'), fearGreed: valueOf('crypto.feargreed') },
@@ -262,4 +272,9 @@ export async function collectExternalContext(options = {}) {
     fundamentals: valueOf('fmp.quotes', []),
     diagnostics: settled.map(({ name, ok, error, ms }) => ({ name, ok, error, ms })),
   };
+
+  if (kv) {
+    try { await kv.put(cacheKey, JSON.stringify(context), { expirationTtl: ttlSeconds }); } catch { /* cache non disponibile */ }
+  }
+  return context;
 }

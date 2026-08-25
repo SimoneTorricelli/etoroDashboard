@@ -73,8 +73,14 @@ export class EtoroClient {
       try { parsed = text ? JSON.parse(text) : {}; } catch { parsed = { message: text }; }
       if (!response.ok) {
         const record = asRecord(parsed);
-        const message = pick(record, 'message', 'Message', 'error', 'Error') ?? `HTTP ${response.status}`;
-        throw new EtoroError(typeof message === 'string' ? message : JSON.stringify(message), response.status, parsed);
+        const nested = asRecord(pick(record, 'error', 'Error', 'data', 'Data'));
+        const message = pick(record, 'message', 'Message', 'detail', 'Detail', 'title', 'Title')
+          ?? pick(nested, 'message', 'Message', 'detail', 'Detail')
+          ?? pick(record, 'error', 'Error');
+        const details = pick(record, 'errors', 'Errors', 'validationErrors', 'ValidationErrors');
+        const label = typeof message === 'string' && message ? message : `HTTP ${response.status}`;
+        const extra = details ? ` — ${JSON.stringify(details).slice(0, 300)}` : (typeof message === 'object' ? ` — ${JSON.stringify(message).slice(0, 300)}` : '');
+        throw new EtoroError(`${label}${extra}`, response.status, parsed);
       }
       return parsed;
     } finally {
@@ -385,21 +391,45 @@ export class EtoroClient {
     }).filter((item) => item.id);
   }
 
+  /** Scope minimi perché il token possa leggere e operare sull'Agent Portfolio. */
+  static get AGENT_SCOPES() {
+    return ['etoro-public:trade.real:read', 'etoro-public:trade.real:write'];
+  }
+
+  /** Verifica che gli scope necessari siano concessi prima di creare il token. */
+  async assertAgentScopes() {
+    const data = await this.request('v2', 'agent-portfolios/user-tokens/scopes');
+    const rows = EtoroClient.searchRows(data, ['scopes', 'Scopes', 'scopeNames', 'ScopeNames']);
+    const allowed = new Set(rows.flatMap((raw) => [
+      pick(raw, 'scopeName', 'ScopeName', 'name', 'Name', 'scope', 'Scope'),
+    ].filter(Boolean).map(String)));
+    // Alcune risposte restituiscono direttamente un array di stringhe.
+    if (Array.isArray(data)) for (const value of data) if (typeof value === 'string') allowed.add(value);
+    if (!allowed.size) return;
+    const missing = EtoroClient.AGENT_SCOPES.filter((scope) => !allowed.has(scope));
+    if (missing.length) {
+      throw new EtoroError(`eToro non concede gli scope richiesti: ${missing.join(', ')}`, 403, { allowed: [...allowed] });
+    }
+  }
+
   /**
    * Genera un nuovo user-token per un Agent Portfolio esistente.
    * eToro mostra il segreto una sola volta: va salvato immediatamente.
    */
-  async createAgentUserToken(agentPortfolioId, tokenName = `autopilot-${Date.now()}`) {
+  async createAgentUserToken(agentPortfolioId, tokenLabel = `autopilot-${Date.now()}`) {
+    await this.assertAgentScopes();
+    // eToro accetta solo nomi in minuscolo con trattini, massimo 32 caratteri.
+    const userTokenName = String(tokenLabel).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 32) || 'autopilot';
     const data = await this.request('v2', `agent-portfolios/${encodeURIComponent(agentPortfolioId)}/user-tokens`, {
       method: 'POST',
-      body: { name: tokenName },
+      body: { userTokenName, scopeNames: EtoroClient.AGENT_SCOPES },
     });
     const root = asRecord(pick(asRecord(data), 'data', 'Data', 'userToken', 'UserToken') ?? data);
     const direct = pick(root, 'userTokenValue', 'UserTokenValue', 'tokenValue', 'TokenValue', 'userToken', 'UserToken', 'token', 'Token', 'value', 'Value');
-    if (typeof direct === 'string' && direct.trim()) return { token: direct.trim(), name: tokenName };
+    if (typeof direct === 'string' && direct.trim()) return { token: direct.trim(), name: userTokenName };
     const nested = asRecord(direct);
     const nestedValue = pick(nested, 'userTokenValue', 'UserTokenValue', 'tokenValue', 'TokenValue', 'value', 'Value');
-    if (typeof nestedValue === 'string' && nestedValue.trim()) return { token: nestedValue.trim(), name: tokenName };
-    throw new EtoroError('eToro non ha restituito il valore del token', 502, data);
+    if (typeof nestedValue === 'string' && nestedValue.trim()) return { token: nestedValue.trim(), name: userTokenName };
+    throw new EtoroError('eToro ha creato il token ma non ne ha restituito il segreto', 502, data);
   }
 }

@@ -150,14 +150,7 @@ async function runWatcher({ env, db, config, credentials, client, snapshot, feat
 
   // Solo le tre anomalie più gravi vengono classificate: limita il costo e il rumore.
   for (const anomaly of anomalies.slice(0, 3)) {
-    const verdict = await classifyAnomaly({
-      apiKey: credentials.openrouterApiKey,
-      models: config.models,
-      anomaly,
-      news: external.news,
-      config,
-      referer: env.PUBLIC_URL,
-    });
+    const verdict = await classifyAnomaly({ config, credentials, env, anomaly, news: external.news });
     escalated += 1;
 
     const decision = decideWatcherAction({
@@ -258,6 +251,9 @@ export async function runPipeline({ env, kind, modeOverride }) {
         marketauxKey: credentials.marketauxKey,
         fmpKey: credentials.fmpKey,
         symbols: [...universe.keys()],
+        kv: env.STATE,
+        // Sul ribilanciamento serve il dato fresco, sugli heartbeat no.
+        ttlSeconds: kind === 'rebalance' ? 60 : 3 * 60 * 60,
       }),
     ]);
     const history = await equityHistory(db, 400);
@@ -273,7 +269,7 @@ export async function runPipeline({ env, kind, modeOverride }) {
     });
 
     // --- 4. Watcher (gira su heartbeat e snapshot) -------------------------
-    if (kind !== 'rebalance' && config.watcherEnabled && credentials.openrouterApiKey) {
+    if (kind !== 'rebalance' && config.watcherEnabled) {
       const result = await runWatcher({ env, db, config, credentials, client, snapshot, features, universe, candles, external, runId, mode });
       await finishRun(db, runId, 'ok', equityUsd);
       return { runId, status: 'ok', kind, equityUsd, watcher: result };
@@ -295,7 +291,7 @@ export async function runPipeline({ env, kind, modeOverride }) {
     }
 
     // --- 6. Cervello -------------------------------------------------------
-    if (!credentials.openrouterApiKey) throw new Error('OpenRouter API key non configurata');
+
     const shortlistWithWeights = screening.shortlist.map((item) => ({
       ...item,
       weight: features.instruments.find((row) => row.symbol === item.symbol)?.weight ?? 0,
@@ -306,12 +302,11 @@ export async function runPipeline({ env, kind, modeOverride }) {
     const ledgerNotes = describeLedger(ledger, config);
 
     const brain = await askBrain({
-      apiKey: credentials.openrouterApiKey,
-      models: config.models,
+      config,
+      credentials,
+      env,
       featuresPrompt,
       allowedSymbols: dynamic ? shortlistSymbols : [...universe.keys()],
-      config,
-      referer: env.PUBLIC_URL,
       dynamic,
       profileDescription: describeProfile(config),
       ledgerNotes,
@@ -320,7 +315,7 @@ export async function runPipeline({ env, kind, modeOverride }) {
     if (!brain.ok) {
       await audit(db, runId, 'error', 'brain', 'Nessuna proposta valida dai modelli', brain.attempts);
       await finishRun(db, runId, 'error', equityUsd, brain.error);
-      await notify(credentials, 'warn', 'Autopilot: nessuna proposta', [brain.error ?? '', `Modelli provati: ${config.models.join(', ')}`]);
+      await notify(credentials, 'warn', 'Autopilot: nessuna proposta', [brain.error ?? '']);
       return { runId, status: 'error', error: brain.error, attempts: brain.attempts };
     }
     await audit(db, runId, 'info', 'brain', `Proposta da ${brain.model} (confidence ${brain.parsed.confidence})`, { targets: brain.parsed.targetWeights });

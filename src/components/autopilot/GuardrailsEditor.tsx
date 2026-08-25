@@ -428,7 +428,11 @@ export function GuardrailsEditor({ config, onSaved }: Props) {
         <Separator className="bg-hairline" />
 
         <section className="space-y-3">
-          <ModelPicker models={draft.models} onChange={(models) => set('models', models)} />
+          <ModelPicker
+            providers={draft.llmProviders ?? []}
+            models={draft.llmModels ?? {}}
+            onChange={(patch) => setDraft((current) => ({ ...current, ...patch }))}
+          />
         </section>
 
         <Separator className="bg-hairline" />

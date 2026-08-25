@@ -10,6 +10,7 @@ import { clearCredentials, describeCredentials, resolveCredentials, saveCredenti
 import { runDiagnostics } from './diagnose.js';
 import { EtoroClient } from './etoro.js';
 import { applyProfile, listProfiles } from './profiles.js';
+import { PROVIDERS } from './llm.js';
 import {
   audit, equityHistory, getRunBundle, listRuns, listWatcherEvents, loadConfig,
   loadLedger, saveConfig, DEFAULT_CONFIG,
@@ -135,6 +136,21 @@ export function sanitizeConfigPatch(patch) {
         }));
       if (!cleaned.length) { rejected.push('whitelist: nessuna voce valida'); continue; }
       out[key] = cleaned;
+      continue;
+    }
+    if (key === 'llmProviders') {
+      if (!Array.isArray(value) || !value.length) { rejected.push('llmProviders: array non vuoto richiesto'); continue; }
+      const allowed = Object.keys(PROVIDERS);
+      const cleaned = value.map(String).filter((item) => allowed.includes(item));
+      if (!cleaned.length) { rejected.push('llmProviders: nessun provider valido'); continue; }
+      out[key] = [...new Set(cleaned)];
+      continue;
+    }
+    if (key === 'llmModels') {
+      if (!value || typeof value !== 'object') { rejected.push('llmModels: oggetto richiesto'); continue; }
+      out[key] = Object.fromEntries(Object.entries(value)
+        .filter(([provider]) => provider in PROVIDERS)
+        .map(([provider, list]) => [provider, (Array.isArray(list) ? list : []).map(String).slice(0, 6)]));
       continue;
     }
     if (key === 'models') {
@@ -355,7 +371,7 @@ export async function handleAgentApi(request, env, ctx, pathname) {
   // POST /agent/diagnose
   if (route === 'diagnose' && method === 'POST') {
     const [config, resolved] = await Promise.all([loadConfig(db), resolveCredentials(db, env)]);
-    const report = await runDiagnostics(resolved, config);
+    const report = await runDiagnostics(resolved, config, env);
     await audit(db, null, report.ok ? 'info' : 'warn', 'diagnose',
       `Diagnostica: ${report.checks.filter((item) => item.ok === false).length} problemi`,
       report.checks.map(({ id, ok: state, error }) => ({ id, ok: state, error })));
@@ -376,7 +392,7 @@ export async function handleAgentApi(request, env, ctx, pathname) {
   if (route === 'models' && method === 'GET') {
     try {
       const { values: credentials } = await resolveCredentials(db, env);
-      return json({ models: await listFreeModels(credentials.openrouterApiKey) });
+      return json({ models: await listFreeModels(credentials.openrouterApiKey), providers: Object.values(PROVIDERS) });
     } catch (error) {
       return json({ error: error instanceof Error ? error.message : String(error) }, 502);
     }

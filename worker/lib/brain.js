@@ -6,7 +6,9 @@
  * Non conosce l'esistenza degli ordini e non può richiederne l'invio.
  */
 
-const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
+import { buildAttemptPlan, callModel } from './llm.js';
+
+export { listFreeModels } from './llm.js';
 
 const SYSTEM_PROMPT = `Sei un risk manager quantitativo. Ricevi lo stato di un portafoglio reale di piccola taglia e un insieme di indicatori già calcolati.
 
@@ -124,109 +126,41 @@ export function normalizeProposal(raw, allowedSymbols) {
   };
 }
 
-async function callOpenRouter(apiKey, model, messages, { temperature, maxTokens, responseFormat, referer }) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 60_000);
-  try {
-    const response = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        authorization: `Bearer ${apiKey}`,
-        'content-type': 'application/json',
-        'HTTP-Referer': referer || 'https://etorodashboard.workers.dev',
-        'X-Title': 'Torino Autopilot',
-      },
-      signal: controller.signal,
-      body: JSON.stringify({
-        model,
-        messages,
-        temperature,
-        max_tokens: maxTokens,
-        ...(responseFormat ? { response_format: responseFormat } : {}),
-      }),
-    });
-    const text = await response.text();
-    let payload = {};
-    try { payload = text ? JSON.parse(text) : {}; } catch { payload = { raw: text }; }
-    if (!response.ok) {
-      const message = payload?.error?.message ?? payload?.message ?? `HTTP ${response.status}`;
-      throw new Error(typeof message === 'string' ? message : JSON.stringify(message));
-    }
-    const content = payload?.choices?.[0]?.message?.content;
-    if (!content) throw new Error('risposta senza contenuto');
-    return { content: typeof content === 'string' ? content : JSON.stringify(content), usage: payload?.usage ?? null };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
 /**
- * Prova ogni modello configurato con una richiesta minima, e riporta l'errore
- * esatto di OpenRouter. È il modo più diretto per scoprire che un id di modello
- * gratuito è stato ritirato: il catalogo free ruota spesso.
+ * Prova ogni coppia provider/modello con una richiesta minima e riporta
+ * l'errore esatto. È il modo più diretto per scoprire che un modello gratuito
+ * è stato ritirato: i cataloghi cambiano di continuo.
  */
-export async function probeModels({ apiKey, models, referer }) {
+export async function probeModels({ config, credentials, env }) {
+  const plan = buildAttemptPlan({ config, credentials, env });
+  if (!plan.length) return [{ provider: '—', model: '—', ok: false, error: 'nessun provider configurato o chiave mancante' }];
   const results = [];
-  for (const model of models) {
+  // Il piano gratuito di Cloudflare concede 50 subrequest per invocazione:
+  // un probe illimitato le esaurirebbe da solo.
+  for (const attempt of plan.slice(0, 8)) {
     const startedAt = Date.now();
     try {
-      const response = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          authorization: `Bearer ${apiKey}`,
-          'content-type': 'application/json',
-          'HTTP-Referer': referer || 'https://etorodashboard.workers.dev',
-          'X-Title': 'Torino Autopilot',
-        },
-        body: JSON.stringify({
-          model,
-          messages: [{ role: 'user', content: 'Rispondi solo con: {"ok":true}' }],
-          max_tokens: 20,
-          temperature: 0,
-        }),
+      const { content } = await callModel({
+        ...attempt,
+        messages: [{ role: 'user', content: 'Rispondi solo con: {"ok":true}' }],
+        config: { ...config, llmMaxTokens: 32 },
+        credentials,
+        env,
+        timeoutMs: 20_000,
       });
-      const text = await response.text();
-      let payload = {};
-      try { payload = text ? JSON.parse(text) : {}; } catch { payload = { raw: text.slice(0, 200) }; }
-      if (!response.ok) {
-        const message = payload?.error?.message ?? payload?.message ?? `HTTP ${response.status}`;
-        results.push({ model, ok: false, status: response.status, error: String(message).slice(0, 300), ms: Date.now() - startedAt });
-        continue;
-      }
-      const content = payload?.choices?.[0]?.message?.content;
-      results.push(content
-        ? { model, ok: true, ms: Date.now() - startedAt }
-        : { model, ok: false, error: 'risposta senza contenuto', ms: Date.now() - startedAt });
+      results.push({ ...attempt, ok: Boolean(content), ms: Date.now() - startedAt });
     } catch (error) {
-      results.push({ model, ok: false, error: error instanceof Error ? error.message : String(error), ms: Date.now() - startedAt });
+      results.push({ ...attempt, ok: false, error: error instanceof Error ? error.message : String(error), ms: Date.now() - startedAt });
     }
   }
   return results;
 }
 
-/** Elenco aggiornato dei modelli gratuiti disponibili su OpenRouter. */
-export async function listFreeModels(apiKey) {
-  const response = await fetch(`${OPENROUTER_BASE}/models`, {
-    headers: apiKey ? { authorization: `Bearer ${apiKey}` } : {},
-  });
-  if (!response.ok) throw new Error(`OpenRouter models HTTP ${response.status}`);
-  const payload = await response.json();
-  return (payload?.data ?? [])
-    .filter((model) => Number(model?.pricing?.prompt ?? 1) === 0 && Number(model?.pricing?.completion ?? 1) === 0)
-    .map((model) => ({
-      id: model.id,
-      name: model.name,
-      contextLength: model.context_length ?? null,
-      supportsJsonSchema: Boolean(model?.supported_parameters?.includes?.('structured_outputs')),
-    }))
-    .sort((a, b) => (b.contextLength ?? 0) - (a.contextLength ?? 0));
-}
-
 /**
- * Esegue la cascata di modelli. Per ogni modello prova, nell'ordine:
- * json_schema → json_object → testo libero con estrazione.
+ * Cascata multi-provider. Per ogni coppia provider/modello prova prima la
+ * modalità JSON nativa, poi il testo libero con estrazione.
  */
-export async function askBrain({ apiKey, models, featuresPrompt, allowedSymbols, config, referer, dynamic = false, profileDescription = '', ledgerNotes = [] }) {
+export async function askBrain({ config, credentials, env, featuresPrompt, allowedSymbols, dynamic = false, profileDescription = '', ledgerNotes = [] }) {
   const horizon = config.cadence === 'daily' ? 'giornaliero' : config.cadence === 'monthly' ? 'mensile' : 'settimanale';
   const userPrompt = [
     featuresPrompt,
@@ -237,53 +171,58 @@ export async function askBrain({ apiKey, models, featuresPrompt, allowedSymbols,
     `Orizzonte del ribilanciamento: ${horizon}.`,
     'Rispondi solo con il JSON dello schema richiesto.',
   ].filter((line) => line !== '').join('\n');
+
+  const systemPrompt = dynamic ? DYNAMIC_SYSTEM_PROMPT : SYSTEM_PROMPT;
   const messages = [
-    { role: 'system', content: dynamic ? DYNAMIC_SYSTEM_PROMPT : SYSTEM_PROMPT },
+    { role: 'system', content: systemPrompt },
     { role: 'user', content: userPrompt },
   ];
-  const formats = [
-    { type: 'json_schema', json_schema: { name: 'allocation', strict: true, schema: RESPONSE_SCHEMA } },
-    { type: 'json_object' },
-    null,
-  ];
+
+  const plan = buildAttemptPlan({ config, credentials, env });
+  if (!plan.length) {
+    return { ok: false, attempts: [], error: 'nessun provider AI disponibile: attiva Workers AI o inserisci una chiave', promptChars: userPrompt.length };
+  }
 
   const attempts = [];
-  for (const model of models) {
-    for (const responseFormat of formats) {
-      const label = responseFormat?.type ?? 'text';
+  // Due tentativi per modello e un tetto complessivo: il Worker ha un budget
+  // di subrequest da rispettare.
+  for (const entry of plan.slice(0, 5)) {
+    for (const jsonMode of [true, false]) {
+      if (attempts.length >= 10) break;
+      const label = jsonMode ? 'json' : 'text';
       try {
-        const { content, usage } = await callOpenRouter(apiKey, model, messages, {
-          temperature: config.llmTemperature,
-          maxTokens: config.llmMaxTokens,
-          responseFormat,
-          referer,
-        });
-        const parsedRaw = extractJson(content);
-        const normalized = normalizeProposal(parsedRaw, allowedSymbols);
+        const { content, usage } = await callModel({ ...entry, messages, config, credentials, env, jsonMode });
+        const normalized = normalizeProposal(extractJson(content), allowedSymbols);
         if (!normalized.ok) {
-          attempts.push({ model, format: label, ok: false, error: normalized.error });
+          attempts.push({ ...entry, format: label, ok: false, error: normalized.error });
           continue;
         }
-        attempts.push({ model, format: label, ok: true, usage });
-        return { ok: true, model, attempts, rawText: content, promptChars: userPrompt.length + (dynamic ? DYNAMIC_SYSTEM_PROMPT : SYSTEM_PROMPT).length, parsed: normalized.value, usage };
+        attempts.push({ ...entry, format: label, ok: true, usage });
+        return {
+          ok: true,
+          model: `${entry.provider}/${entry.model}`,
+          attempts,
+          rawText: content,
+          promptChars: userPrompt.length + systemPrompt.length,
+          parsed: normalized.value,
+          usage,
+        };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        attempts.push({ model, format: label, ok: false, error: message });
-        // Un 404/400 sul formato strutturato è tipico dei modelli free: si passa al formato successivo.
-        if (/rate limit|429|quota|temporarily/i.test(message)) break;
+        attempts.push({ ...entry, format: label, ok: false, error: message });
+        // Modello ritirato o budget esaurito: inutile insistere sul formato.
+        if (/unavailable|not found|404|no endpoints|subrequest|rate limit|429/i.test(message)) break;
       }
     }
   }
-  // Un solo errore per modello: quello del primo formato è il più informativo.
+
   const perModel = [];
-  for (const model of models) {
-    const first = attempts.find((item) => item.model === model && !item.ok);
-    if (first) perModel.push(`${model}: ${first.error}`);
+  const seen = new Set();
+  for (const attempt of attempts) {
+    const key = `${attempt.provider}/${attempt.model}`;
+    if (attempt.ok || seen.has(key)) continue;
+    seen.add(key);
+    perModel.push(`${key}: ${attempt.error}`);
   }
-  return {
-    ok: false,
-    attempts,
-    error: perModel.length ? `nessuna proposta valida — ${perModel.join(' · ')}` : 'nessun modello configurato',
-    promptChars: userPrompt.length,
-  };
+  return { ok: false, attempts, error: `nessuna proposta valida — ${perModel.join(' · ')}`, promptChars: userPrompt.length };
 }

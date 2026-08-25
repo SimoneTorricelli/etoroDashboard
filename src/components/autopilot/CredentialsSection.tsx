@@ -25,8 +25,8 @@ const GROUPS: Array<{ title: string; description: string; keys: CredentialKey[] 
   },
   {
     title: 'Modello AI',
-    description: 'Chiave OpenRouter. Con i modelli :free il costo per run resta zero.',
-    keys: ['openrouterApiKey'],
+    description: 'Tutte opzionali: Cloudflare Workers AI è già attivo e gratuito, senza chiavi. Queste servono solo come alternative o riserva.',
+    keys: ['geminiApiKey', 'groqApiKey', 'openrouterApiKey'],
   },
   {
     title: 'Notifiche',

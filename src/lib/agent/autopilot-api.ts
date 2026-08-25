@@ -91,6 +91,8 @@ export interface AutopilotConfig {
   reconcileTolerancePct: number;
   minConfidence: number;
   models: string[];
+  llmProviders: string[];
+  llmModels: Record<string, string[]>;
   llmTemperature: number;
   llmMaxTokens: number;
   riskProfile: string;
@@ -116,9 +118,18 @@ export interface EquityPoint {
 }
 
 export type CredentialKey =
-  | 'etoroApiKey' | 'etoroUserKey' | 'etoroAgentToken' | 'openrouterApiKey'
+  | 'etoroApiKey' | 'etoroUserKey' | 'etoroAgentToken'
+  | 'openrouterApiKey' | 'geminiApiKey' | 'groqApiKey'
   | 'telegramBotToken' | 'telegramChatId' | 'notifyWebhookUrl'
   | 'finnhubKey' | 'marketauxKey' | 'fmpKey';
+
+export interface LlmProvider {
+  id: string;
+  label: string;
+  note: string;
+  needsKey: string | false;
+  defaultModels: string[];
+}
 
 export interface CredentialStatus {
   key: CredentialKey;
@@ -277,7 +288,7 @@ export const autopilot = {
       method: 'POST',
       body: JSON.stringify(mode === 'live' ? { kind, mode, confirm: 'ATTIVA ORDINI REALI' } : { kind, mode }),
     }),
-  freeModels: () => call<{ models: Array<{ id: string; name: string; contextLength: number | null }> }>('/agent/models'),
+  freeModels: () => call<{ models: Array<{ id: string; name: string; contextLength: number | null }>; providers: LlmProvider[] }>('/agent/models'),
   credentials: () => call<{ credentials: CredentialStatus[] }>('/agent/credentials'),
   saveCredentials: (patch: Partial<Record<CredentialKey, string>>) =>
     call<{ credentials: CredentialStatus[]; applied: string[]; rejected: string[] }>('/agent/credentials', { method: 'PUT', body: JSON.stringify(patch) }),
