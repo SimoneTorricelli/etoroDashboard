@@ -30,7 +30,7 @@ const GROUPS: Array<{ title: string; description: string; keys: CredentialKey[] 
   },
   {
     title: 'Notifiche',
-    description: 'Se compili bot token e chat id, l\'agente ti scrive su Telegram a ogni run, ordine, blocco e freeze.',
+    description: 'Se compili bot token e chat id, l\'agente ti invia il piano appena attivato e ti aggiorna su run, ordini, blocchi e freeze.',
     keys: ['telegramBotToken', 'telegramChatId', 'notifyWebhookUrl'],
   },
   {

@@ -476,7 +476,7 @@ export const autopilot = {
     generatedBy?: string;
     reviewMaxDrawdownPct?: number;
     collaboration?: StrategyCollaboration | null;
-  }) => call<{ ok: true; config: AutopilotConfig; strategySpec: Record<string, unknown>; scenario: Record<string, unknown>; draft: TDraft }>('/agent/strategy/activate', {
+  }) => call<{ ok: true; config: AutopilotConfig; strategySpec: Record<string, unknown>; scenario: Record<string, unknown>; draft: TDraft; telegramQueued: boolean }>('/agent/strategy/activate', {
     method: 'POST',
       body: JSON.stringify(payload),
   }),

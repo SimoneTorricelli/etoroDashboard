@@ -5,7 +5,7 @@
  */
 import { runPipeline } from './pipeline.js';
 import { extractJson, listFreeModels } from './brain.js';
-import { notify, notifyTest } from './notify.js';
+import { buildStrategyActivationNotification, notify, notifyTest } from './notify.js';
 import {
   clearCredentials, describeCredentials, hasVerifiedAgentBinding, resolveCredentials,
   saveCredentials, saveVerifiedAgentToken,
@@ -920,7 +920,24 @@ export async function handleAgentApi(request, env, ctx, pathname) {
         cashFloorPct: spec.capital.cashFloorPct,
         policyCandidates: policyPool.length,
       });
-      return json({ ok: true, config: next, strategySpec: spec, scenario, draft: persistedDraft });
+      const telegramQueued = Boolean(resolved.values.telegramBotToken && resolved.values.telegramChatId);
+      const notification = buildStrategyActivationNotification({
+        spec,
+        guided: activationGuided,
+        draft: persistedDraft,
+        portfolioId: requestedPortfolioId,
+        portfolioName: current.activeAgentPortfolioName,
+        collaboration: next.strategyCollaboration,
+      });
+      const notificationTask = notify(resolved.values, notification.level, notification.title, notification.lines)
+        .then((result) => audit(db, null, result.sent > 0 || result.attempted === 0 ? 'info' : 'warn', 'notify',
+          result.attempted === 0
+            ? 'Riepilogo strategia non inviato: nessun canale configurato'
+            : `Riepilogo strategia inviato su ${result.sent}/${result.attempted} canali`,
+          { telegramQueued, results: result.results }));
+      if (ctx?.waitUntil) ctx.waitUntil(notificationTask);
+      else await notificationTask;
+      return json({ ok: true, config: next, strategySpec: spec, scenario, draft: persistedDraft, telegramQueued });
     } catch (error) {
       return json({ error: error instanceof Error ? error.message : String(error) }, 400);
     }

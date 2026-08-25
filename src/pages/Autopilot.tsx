@@ -261,7 +261,7 @@ export default function Autopilot() {
       bundle = await autopilot.strategyDraft<StrategyOnboardingDraft>(effectiveAnswers as unknown as Record<string, unknown>);
       setStrategyBundle(bundle);
     }
-    await autopilot.activateStrategy<StrategyOnboardingDraft>({
+    const activation = await autopilot.activateStrategy<StrategyOnboardingDraft>({
       answers: effectiveAnswers as unknown as Record<string, unknown>,
       strategySpec: bundle.strategySpec,
       portfolioId: answers.portfolioId,
@@ -273,7 +273,7 @@ export default function Autopilot() {
     setActivatedStrategyName(draft.strategyName);
     setActiveTab('strategia');
     closeOnboarding();
-    toast.success(`“${draft.strategyName}” è attiva in shadow. Nessun ordine reale verrà inviato.`);
+    toast.success(`“${draft.strategyName}” è attiva in shadow. Nessun ordine reale verrà inviato.${activation.telegramQueued ? ' Riepilogo Telegram in invio.' : ''}`);
   };
 
   const config = state?.config;

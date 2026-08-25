@@ -58,6 +58,92 @@ export async function notify(credentials, level, title, lines = []) {
   return { results, sent: results.filter((item) => item.ok).length, attempted: results.length };
 }
 
+const PREFERENCE_LABELS = {
+  'global-equities': 'Azioni globali',
+  technology: 'Tecnologia',
+  healthcare: 'Salute',
+  'crypto-large-cap': 'Crypto large cap',
+  bonds: 'Obbligazionario',
+  commodities: 'Materie prime',
+};
+
+function clean(value, max = 180) {
+  return String(value ?? '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max);
+}
+
+function signedPct(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return '—';
+  return `${numeric > 0 ? '+' : ''}${numeric.toFixed(1)}%`;
+}
+
+/**
+ * Crea un riepilogo Telegram leggibile della strategia appena attivata.
+ * Usa soltanto dati già normalizzati dal Worker e non include prompt, token,
+ * chain-of-thought o altre informazioni sensibili.
+ */
+export function buildStrategyActivationNotification({
+  spec,
+  guided,
+  draft,
+  portfolioId,
+  portfolioName,
+  collaboration,
+}) {
+  const allocations = (Array.isArray(draft?.allocations) ? draft.allocations : [])
+    .slice(0, 12)
+    .map((item) => `  • ${clean(item.label, 60)}: ${Number(item.weightPct).toFixed(0)}%`);
+  const preferences = (Array.isArray(guided?.macroPreferences) ? guided.macroPreferences : [])
+    .map((item) => PREFERENCE_LABELS[item] ?? clean(item, 50))
+    .filter(Boolean);
+  const crypto = guided?.cryptoPreference === 'none'
+    ? 'escluse'
+    : guided?.cryptoPreference === 'majors'
+      ? 'solo large cap'
+      : guided?.cryptoPreference === 'broad'
+        ? 'large cap e altcoin'
+        : guided?.cryptoPreference === 'meme-opt-in' ? 'meme coin abilitate' : 'come da policy';
+  const collaborationLabel = collaboration?.status === 'validated'
+    ? `validata da ${Math.max(1, 1 + (collaboration.reviewerModels?.length ?? 0))} modelli`
+    : collaboration?.status === 'deterministic-fallback'
+      ? 'baseline deterministica protetta dai guardrail'
+      : 'validata con attenzioni e guardrail deterministici';
+  const portfolioLabel = clean(portfolioName, 80) || `Portfolio ${clean(portfolioId, 8)}`;
+  const budget = new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR', maximumFractionDigits: 2 })
+    .format(Number(spec?.capital?.budgetEur) || 0);
+
+  return {
+    level: 'info',
+    title: `Strategia attivata · ${clean(spec?.name || draft?.strategyName, 80)}`,
+    lines: [
+      `📁 Agent Portfolio: ${portfolioLabel} (${clean(portfolioId, 36)})`,
+      `🛡 Modalità: shadow per ${Math.max(1, Number(draft?.shadowDays) || 14)} giorni · nessun ordine reale`,
+      `💶 Capitale reale gestito: ${budget}`,
+      `🎯 Obiettivo: ${clean(spec?.objective?.description || draft?.summary, 240)}`,
+      preferences.length ? `🌍 Preferenze: ${preferences.join(', ')} · crypto ${crypto}` : `🌍 Universo dinamico · crypto ${crypto}`,
+      '',
+      '📊 Allocazione obiettivo:',
+      ...allocations,
+      '',
+      `📈 Scenari modellati a ${Number(draft?.scenario?.horizonMonths) || 12} mesi — non sono previsioni:`,
+      `  • Favorevole: ${signedPct(draft?.scenario?.favorablePct)}`,
+      `  • Mediano: ${signedPct(draft?.scenario?.medianPct)}`,
+      `  • Avverso: ${signedPct(draft?.scenario?.adversePct)}`,
+      '',
+      '🧱 Guardrail principali:',
+      `  • Drawdown massimo: −${Number(spec?.risk?.maxDrawdownPct) || 0}%`,
+      `  • Tetto per asset: ${Number(spec?.diversification?.maxInstrumentWeightPct) || 0}%`,
+      `  • Tetto per settore: ${Number(spec?.diversification?.maxSectorWeightPct) || 0}%`,
+      `  • Posizioni: ${Number(spec?.diversification?.minPositions) || 1}–${Number(spec?.diversification?.maxPositions) || 1}`,
+      `  • Turnover massimo per ciclo: ${Number(spec?.execution?.maxTurnoverPct) || 0}%`,
+      `  • Liquidità target: ${Math.max(0, 100 - (Number(spec?.capital?.targetDeploymentPct) || 100))}%`,
+      '',
+      `🤝 Validazione: ${collaborationLabel}`,
+      '🧭 A ogni ciclo la shortlist viene aggiornata entro queste preferenze; pesi e ordini sono ricalcolati sul budget effettivo.',
+    ],
+  };
+}
+
 /**
  * Diagnostica del canale Telegram: verifica prima il bot, poi la chat, così
  * distingue i due errori più comuni — token sbagliato e chat mai avviata.

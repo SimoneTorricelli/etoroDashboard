@@ -17,6 +17,7 @@ import { decideWatcherAction, detectAnomalies, isStabilized, relevantHeadlines }
 import { executePlan, reconcile } from './lib/executor.js';
 import { buildAttemptPlan } from './lib/llm.js';
 import { buildCandleRefreshQueue } from './lib/pipeline.js';
+import { buildStrategyActivationNotification } from './lib/notify.js';
 
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -121,6 +122,37 @@ test('router AI: OpenRouter resta un fallback anche senza modello scelto', () =>
     env: { AI: {} },
   });
   assert.ok(plan.some((entry) => entry.provider === 'openrouter' && entry.model === 'openrouter/free'));
+});
+
+test('Telegram: riepilogo strategia include allocazione, scenari e guardrail', () => {
+  const message = buildStrategyActivationNotification({
+    spec: {
+      name: 'Dinamico consapevole',
+      objective: { description: 'Crescita bilanciata con controllo del rischio' },
+      capital: { budgetEur: 200, targetDeploymentPct: 97 },
+      risk: { maxDrawdownPct: 24 },
+      diversification: { minPositions: 4, maxPositions: 20, maxInstrumentWeightPct: 12, maxSectorWeightPct: 35 },
+      execution: { maxTurnoverPct: 28 },
+    },
+    guided: { macroPreferences: ['global-equities', 'technology'], cryptoPreference: 'majors' },
+    draft: {
+      strategyName: 'Dinamico consapevole',
+      summary: 'Crescita bilanciata',
+      shadowDays: 14,
+      allocations: [{ label: 'Azioni globali', weightPct: 55 }, { label: 'Liquidità', weightPct: 3 }],
+      scenario: { horizonMonths: 12, favorablePct: 18, medianPct: 8, adversePct: -24 },
+    },
+    portfolioId: '0405bc2a-2bd1-443b-9000-8e6846fe6d10',
+    portfolioName: 'Portfolio 0405bc2a',
+    collaboration: { status: 'validated', reviewerModels: ['gemini/x', 'openrouter/y'] },
+  });
+  const text = [message.title, ...message.lines].join('\n');
+  assert.match(text, /Capitale reale gestito: 200,00/);
+  assert.match(text, /Azioni globali: 55%/);
+  assert.match(text, /Favorevole: \+18\.0%/);
+  assert.match(text, /Drawdown massimo: −24%/);
+  assert.match(text, /validata da 3 modelli/);
+  assert.ok(text.length < 3500);
 });
 
 test('cache storici: priorità alle posizioni e tetto di refresh', () => {
