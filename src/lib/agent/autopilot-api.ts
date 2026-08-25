@@ -214,27 +214,64 @@ export interface DiagnosticsReport {
   checks: DiagnosticCheck[];
 }
 
-export function getControlToken(): string {
-  try { return sessionStorage.getItem(TOKEN_KEY) ?? ''; } catch { return ''; }
+/**
+ * Il token vive prima di tutto in memoria: su Safari iOS e in navigazione
+ * privata la scrittura su storage può fallire, e prima questo lasciava la
+ * pagina muta senza alcun errore visibile.
+ */
+let memoryToken = '';
+let memoryBaseUrl: string | null = null;
+
+function readStorage(storage: Storage | null, key: string): string {
+  try { return storage?.getItem(key) ?? ''; } catch { return ''; }
 }
 
-export function setControlToken(token: string): void {
+function writeStorage(storage: Storage | null, key: string, value: string): boolean {
   try {
-    if (token) sessionStorage.setItem(TOKEN_KEY, token);
-    else sessionStorage.removeItem(TOKEN_KEY);
-  } catch { /* sessione non disponibile */ }
+    if (value) storage?.setItem(key, value); else storage?.removeItem(key);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const session = (): Storage | null => { try { return window.sessionStorage; } catch { return null; } };
+const local = (): Storage | null => { try { return window.localStorage; } catch { return null; } };
+
+export function getControlToken(): string {
+  if (memoryToken) return memoryToken;
+  memoryToken = readStorage(session(), TOKEN_KEY) || readStorage(local(), TOKEN_KEY);
+  return memoryToken;
+}
+
+/**
+ * @param remember true = persiste su localStorage (sopravvive alla chiusura
+ * della scheda, utile su mobile dove i browser scaricano le tab in background).
+ * @returns false se nessuno storage era scrivibile: il token resta comunque
+ * valido in memoria per questa sessione.
+ */
+export function setControlToken(token: string, remember = false): boolean {
+  memoryToken = token;
+  const target = remember ? local() : session();
+  const other = remember ? session() : local();
+  writeStorage(other, TOKEN_KEY, '');
+  return writeStorage(target, TOKEN_KEY, token);
+}
+
+export function isTokenRemembered(): boolean {
+  return Boolean(readStorage(local(), TOKEN_KEY));
 }
 
 /** Base URL del Worker. Vuota = stessa origine del sito. */
 export function getBaseUrl(): string {
-  try { return localStorage.getItem(BASE_KEY) ?? ''; } catch { return ''; }
+  if (memoryBaseUrl !== null) return memoryBaseUrl;
+  memoryBaseUrl = readStorage(local(), BASE_KEY);
+  return memoryBaseUrl;
 }
 
 export function setBaseUrl(url: string): void {
-  try {
-    if (url) localStorage.setItem(BASE_KEY, url.replace(/\/+$/, ''));
-    else localStorage.removeItem(BASE_KEY);
-  } catch { /* storage non disponibile */ }
+  memoryBaseUrl = url.replace(/\/+$/, '');
+  writeStorage(local(), BASE_KEY, memoryBaseUrl);
 }
 
 export class AutopilotError extends Error {

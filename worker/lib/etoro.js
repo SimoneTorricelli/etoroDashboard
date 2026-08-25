@@ -34,6 +34,46 @@ const asRecord = (value) => (value && typeof value === 'object' && !Array.isArra
 
 const recordList = (value) => (Array.isArray(value) ? value.filter((item) => item && typeof item === 'object') : []);
 
+/**
+ * Cerca il segreto del token ovunque nella risposta.
+ * eToro annida il valore in modo diverso a seconda dell'endpoint e della
+ * versione: una lista fissa di chiavi non regge, serve una visita ricorsiva.
+ */
+function deepFindToken(value, exclude = '', depth = 0) {
+  if (depth > 6 || value == null) return null;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = deepFindToken(item, exclude, depth + 1);
+      if (found) return found;
+    }
+    return null;
+  }
+  if (typeof value !== 'object') return null;
+
+  const looksLikeSecret = (key, text) => /token|secret|value|key/i.test(key)
+    && typeof text === 'string'
+    && text.trim().length >= 20
+    && text.trim() !== exclude
+    && !/^https?:/i.test(text);
+
+  for (const [key, item] of Object.entries(value)) {
+    if (looksLikeSecret(key, item)) return item.trim();
+  }
+  for (const item of Object.values(value)) {
+    const found = deepFindToken(item, exclude, depth + 1);
+    if (found) return found;
+  }
+  return null;
+}
+
+/** Struttura della risposta senza i valori: utile a diagnosticare, sicura da loggare. */
+function describeShape(value, depth = 0) {
+  if (depth > 3 || value == null) return typeof value;
+  if (Array.isArray(value)) return `[${value.length ? describeShape(value[0], depth + 1) : ''}]`;
+  if (typeof value !== 'object') return typeof value;
+  return `{${Object.entries(value).map(([key, item]) => `${key}:${describeShape(item, depth + 1)}`).join(',')}}`;
+}
+
 export class EtoroClient {
   /**
    * @param {{apiKey: string, userKey: string, agentToken?: string}} credentials
@@ -424,12 +464,19 @@ export class EtoroClient {
       method: 'POST',
       body: { userTokenName, scopeNames: EtoroClient.AGENT_SCOPES },
     });
-    const root = asRecord(pick(asRecord(data), 'data', 'Data', 'userToken', 'UserToken') ?? data);
-    const direct = pick(root, 'userTokenValue', 'UserTokenValue', 'tokenValue', 'TokenValue', 'userToken', 'UserToken', 'token', 'Token', 'value', 'Value');
-    if (typeof direct === 'string' && direct.trim()) return { token: direct.trim(), name: userTokenName };
-    const nested = asRecord(direct);
-    const nestedValue = pick(nested, 'userTokenValue', 'UserTokenValue', 'tokenValue', 'TokenValue', 'value', 'Value');
-    if (typeof nestedValue === 'string' && nestedValue.trim()) return { token: nestedValue.trim(), name: userTokenName };
-    throw new EtoroError('eToro ha creato il token ma non ne ha restituito il segreto', 502, data);
+    const token = deepFindToken(data, userTokenName);
+    if (token) return { token, name: userTokenName };
+    // Alcune installazioni non restituiscono il segreto nella POST: si rilegge
+    // il token appena creato dall'elenco dedicato.
+    try {
+      const listed = await this.request('v2', `agent-portfolios/${encodeURIComponent(agentPortfolioId)}/user-tokens`);
+      const fromList = deepFindToken(listed, userTokenName);
+      if (fromList) return { token: fromList, name: userTokenName };
+    } catch { /* endpoint non disponibile: si segnala il problema originale */ }
+    throw new EtoroError(
+      `eToro ha creato il token ma non ne ha restituito il segreto. Struttura ricevuta: ${describeShape(data)}`,
+      502,
+      data,
+    );
   }
 }

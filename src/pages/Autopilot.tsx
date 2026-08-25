@@ -31,7 +31,7 @@ import { WatcherPanel } from '@/components/autopilot/WatcherPanel';
 import { CredentialsSection } from '@/components/autopilot/CredentialsSection';
 import { cn } from '@/lib/utils';
 import {
-  autopilot, getBaseUrl, getControlToken, setBaseUrl, setControlToken,
+  autopilot, getBaseUrl, getControlToken, isTokenRemembered, setBaseUrl, setControlToken,
   type AutopilotState, type ExecutionMode, type RunBundle, type RunSummary,
 } from '@/lib/agent/autopilot-api';
 
@@ -78,9 +78,17 @@ export default function Autopilot() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [confirmLive, setConfirmLive] = useState(false);
+  const [remember, setRemember] = useState(isTokenRemembered());
+  const [connected, setConnected] = useState(true);
+  const [storageWarning, setStorageWarning] = useState(false);
 
   const refresh = useCallback(async () => {
-    if (!getControlToken()) return;
+    if (!getControlToken()) {
+      setState(null);
+      setConnected(false);
+      return;
+    }
+    setConnected(true);
     setLoading(true);
     setError(null);
     try {
@@ -93,6 +101,13 @@ export default function Autopilot() {
       setLoading(false);
     }
   }, []);
+
+  const connect = useCallback(async () => {
+    setBaseUrl(baseUrl);
+    const persisted = setControlToken(token.trim(), remember);
+    setStorageWarning(!persisted);
+    await refresh();
+  }, [baseUrl, token, remember, refresh]);
 
   useEffect(() => { void refresh(); }, [refresh]);
 
@@ -169,12 +184,46 @@ export default function Autopilot() {
               <Label htmlFor="ap-token" className="text-text-0">CONTROL_TOKEN</Label>
               <Input id="ap-token" type="password" value={token} onChange={(event) => setToken(event.target.value)} placeholder="incolla il token" />
             </div>
-            <Button onClick={() => { setBaseUrl(baseUrl); setControlToken(token); void refresh(); }} disabled={!token || loading}>
-              Connetti
+            <Button onClick={() => void connect()} disabled={!token.trim() || loading}>
+              {loading ? <RefreshCw className="size-4 animate-spin" /> : null} Connetti
             </Button>
+          </CardContent>
+          <CardContent className="pt-0">
+            <label className="flex items-start gap-2 text-xs text-text-1">
+              <input
+                type="checkbox"
+                className="mt-0.5 accent-current"
+                checked={remember}
+                onChange={(event) => setRemember(event.target.checked)}
+              />
+              <span>
+                Ricorda su questo dispositivo. Consigliato su telefono, dove il browser scarica le schede in background e
+                altrimenti dovresti reinserire il token ogni volta. Il token resta su questo dispositivo e non viene mai inviato
+                altrove.
+              </span>
+            </label>
+            {storageWarning && (
+              <p className="mt-2 text-xs text-warn">
+                Il browser non ha permesso di salvare il token (navigazione privata o restrizioni di storage). La connessione
+                funziona lo stesso, ma dovrai reinserirlo se ricarichi la pagina.
+              </p>
+            )}
           </CardContent>
         </Card>
       </motion.div>
+
+      {!connected && !error && (
+        <motion.div {...stagger(2)} className="col-span-12">
+          <Alert>
+            <Lock className="size-4" />
+            <AlertTitle>Non connesso</AlertTitle>
+            <AlertDescription>
+              Incolla il CONTROL_TOKEN qui sopra e premi Connetti. È il segreto che hai caricato sul Worker con
+              <code className="mx-1 rounded bg-bg-2 px-1">wrangler secret put CONTROL_TOKEN</code>.
+            </AlertDescription>
+          </Alert>
+        </motion.div>
+      )}
 
       {error && (
         <motion.div {...stagger(2)} className="col-span-12">
