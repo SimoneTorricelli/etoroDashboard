@@ -16,6 +16,10 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT, at INTEGER NOT NULL, level TEXT NOT NULL, stage TEXT NOT NULL, message TEXT NOT NULL, data_json TEXT)`,
   `CREATE INDEX IF NOT EXISTS idx_audit_at ON audit (at DESC)`,
   `CREATE TABLE IF NOT EXISTS equity_curve (at INTEGER PRIMARY KEY, equity_usd REAL NOT NULL, invested_usd REAL, cash_usd REAL, hwm_usd REAL)`,
+  `CREATE TABLE IF NOT EXISTS holdings_ledger (symbol TEXT PRIMARY KEY, instrument_id INTEGER, first_bought_at INTEGER, last_bought_at INTEGER, last_sold_at INTEGER, average_down_count INTEGER NOT NULL DEFAULT 0, opportunistic INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL)`,
+  `CREATE TABLE IF NOT EXISTS watcher_events (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, symbol TEXT NOT NULL, instrument_id INTEGER, kind TEXT NOT NULL, metrics_json TEXT, classification TEXT, confidence REAL, rationale TEXT, action TEXT NOT NULL, run_id TEXT, model TEXT)`,
+  `CREATE INDEX IF NOT EXISTS idx_watcher_at ON watcher_events (at DESC)`,
+  `CREATE TABLE IF NOT EXISTS universe_cache (symbol TEXT PRIMARY KEY, instrument_id INTEGER NOT NULL, name TEXT, asset_class TEXT, matched_as TEXT, updated_at INTEGER NOT NULL)`,
 ];
 
 /**
@@ -26,6 +30,9 @@ const SCHEMA = [
 export const DEFAULT_CONFIG = {
   /** shadow: nessun ordine. dry-run: ordini costruiti e simulati. live: invio reale. */
   executionMode: 'shadow',
+
+  /** defensive | balanced | dynamic | aggressive — vedi profiles.js */
+  strategyProfile: 'balanced',
   /** Blocco totale attivato da circuit breaker o dall'utente. */
   frozen: false,
   frozenReason: '',
@@ -41,6 +48,46 @@ export const DEFAULT_CONFIG = {
   budgetEur: 250,
   /** Cambio EUR→USD di fallback se le fonti FX non rispondono. */
   fallbackEurUsd: 1.08,
+
+  /**
+   * fixed: l'AI riceve la whitelist e decide solo i pesi.
+   * dynamic: l'AI sceglie gli strumenti da una shortlist estratta dal pool.
+   */
+  universeMode: 'fixed',
+  /** Numero di candidati che superano lo screening e arrivano al modello. */
+  shortlistSize: 18,
+  /** Quanti strumenti al massimo/minimo tenere contemporaneamente. */
+  maxHoldings: 8,
+  minHoldings: 4,
+  /** Pool di candidati per la modalità dinamica. */
+  pool: [],
+
+  /** --- Disciplina anti-churn --- */
+  /** Giorni minimi di detenzione prima di poter vendere (salvo stop). */
+  minHoldingDays: 21,
+  /** Giorni di attesa prima di ricomprare uno strumento venduto. */
+  reentryCooldownDays: 30,
+  /** Vantaggio di momentum richiesto per sostituire una posizione con un'altra. */
+  substitutionEdge: 18,
+  /** Costo stimato di andata e ritorno, in punti base. Sotto questa soglia non si opera. */
+  transactionCostBps: 20,
+
+  /** --- Watcher orario --- */
+  watcherEnabled: false,
+  /** Variazione giornaliera che fa scattare l'analisi contestuale. */
+  watcherDropPct: 0.07,
+  watcherSpikePct: 0.10,
+  /** Moltiplicatore di volatilità che segnala un regime anomalo. */
+  watcherVolSpike: 2.0,
+  /** Quota di portafoglio riservata alle operazioni opportunistiche. */
+  opportunisticBudgetPct: 0.08,
+  maxOpportunisticPerWeek: 1,
+  /** Quante volte al massimo si può mediare al ribasso sullo stesso strumento. */
+  maxAverageDown: 1,
+  /** Chiusure consecutive senza nuovi minimi richieste prima di entrare. */
+  stabilizationBars: 2,
+  /** Confidenza minima perché una classificazione del watcher sia operativa. */
+  watcherMinConfidence: 0.65,
 
   /** Universo ammesso: nessun ordine fuori da questa lista. */
   whitelist: [
@@ -237,6 +284,104 @@ export async function getRunBundle(db, runId) {
     orders: (orders?.results ?? []).map((row) => ({ ...row, positionIds: parse(row.position_ids, []) })),
     logs: (logs?.results ?? []).map((row) => ({ ...row, data: parse(row.data_json, null) })),
   };
+}
+
+// ------------------------------------------------------ registro posizioni
+
+export async function loadLedger(db) {
+  const { results } = await db.prepare('SELECT * FROM holdings_ledger').all();
+  return new Map((results ?? []).map((row) => [row.symbol, row]));
+}
+
+/**
+ * Allinea il registro alle posizioni realmente aperte: registra le prime
+ * aperture e marca le uscite, così le regole di holding e cooldown lavorano
+ * su dati veri anche se un ordine è stato fatto a mano su eToro.
+ */
+export async function syncLedger(db, openSymbols) {
+  const now = Date.now();
+  const ledger = await loadLedger(db);
+  const open = new Set(openSymbols);
+
+  for (const symbol of open) {
+    const row = ledger.get(symbol);
+    if (!row) {
+      await db.prepare('INSERT OR REPLACE INTO holdings_ledger (symbol, first_bought_at, last_bought_at, last_sold_at, average_down_count, opportunistic, updated_at) VALUES (?, ?, ?, NULL, 0, 0, ?)')
+        .bind(symbol, now, now, now).run();
+    }
+  }
+  for (const [symbol, row] of ledger.entries()) {
+    if (!open.has(symbol) && !row.last_sold_at) {
+      await db.prepare('UPDATE holdings_ledger SET last_sold_at = ?, updated_at = ? WHERE symbol = ?')
+        .bind(now, now, symbol).run();
+    }
+    if (open.has(symbol) && row.last_sold_at) {
+      await db.prepare('UPDATE holdings_ledger SET last_sold_at = NULL, last_bought_at = ?, updated_at = ? WHERE symbol = ?')
+        .bind(now, now, symbol).run();
+    }
+  }
+  return loadLedger(db);
+}
+
+export async function recordLedgerTrade(db, symbol, side, { opportunistic = false, averagingDown = false } = {}) {
+  const now = Date.now();
+  const existing = await db.prepare('SELECT * FROM holdings_ledger WHERE symbol = ?').bind(symbol).first();
+  if (side === 'buy') {
+    await db.prepare(`INSERT INTO holdings_ledger (symbol, first_bought_at, last_bought_at, last_sold_at, average_down_count, opportunistic, updated_at)
+      VALUES (?, ?, ?, NULL, ?, ?, ?)
+      ON CONFLICT(symbol) DO UPDATE SET last_bought_at = excluded.last_bought_at, last_sold_at = NULL,
+        average_down_count = holdings_ledger.average_down_count + ?, opportunistic = MAX(holdings_ledger.opportunistic, excluded.opportunistic), updated_at = excluded.updated_at`)
+      .bind(symbol, existing?.first_bought_at ?? now, now, averagingDown ? 1 : 0, opportunistic ? 1 : 0, now, averagingDown ? 1 : 0)
+      .run();
+  } else {
+    await db.prepare('UPDATE holdings_ledger SET last_sold_at = ?, average_down_count = 0, opportunistic = 0, updated_at = ? WHERE symbol = ?')
+      .bind(now, now, symbol).run();
+  }
+}
+
+// ------------------------------------------------------ eventi del watcher
+
+export async function saveWatcherEvent(db, event) {
+  await db.prepare(`INSERT INTO watcher_events (at, symbol, instrument_id, kind, metrics_json, classification, confidence, rationale, action, run_id, model)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .bind(
+      Date.now(), event.symbol, event.instrumentId ?? null, event.kind,
+      JSON.stringify(event.metrics ?? {}),
+      event.classification ?? null, event.confidence ?? null,
+      (event.rationale ?? '').slice(0, 2000), event.action,
+      event.runId ?? null, event.model ?? null,
+    )
+    .run();
+}
+
+export async function listWatcherEvents(db, limit = 50) {
+  const { results } = await db.prepare('SELECT * FROM watcher_events ORDER BY at DESC LIMIT ?').bind(limit).all();
+  return (results ?? []).map((row) => {
+    let metrics = null;
+    try { metrics = row.metrics_json ? JSON.parse(row.metrics_json) : null; } catch { metrics = null; }
+    return { ...row, metrics };
+  });
+}
+
+export async function countOpportunisticThisWeek(db) {
+  const since = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const row = await db.prepare("SELECT COUNT(*) AS n FROM watcher_events WHERE at > ? AND action = 'executed'").bind(since).first();
+  return Number(row?.n ?? 0);
+}
+
+// ------------------------------------------------------ cache universo
+
+export async function cacheUniverse(db, entries) {
+  for (const entry of entries) {
+    await db.prepare('INSERT OR REPLACE INTO universe_cache (symbol, instrument_id, name, asset_class, matched_as, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .bind(entry.symbol, entry.instrumentId, entry.name ?? '', entry.class ?? '', entry.matchedAs ?? entry.symbol, Date.now())
+      .run();
+  }
+}
+
+export async function loadUniverseCache(db) {
+  const { results } = await db.prepare('SELECT * FROM universe_cache').all();
+  return new Map((results ?? []).map((row) => [row.symbol, row]));
 }
 
 export async function equityHistory(db, limit = 400) {

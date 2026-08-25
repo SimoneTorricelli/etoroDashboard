@@ -26,6 +26,8 @@ import {
 import { HowItWorks } from '@/components/autopilot/HowItWorks';
 import { DiagnosticsPanel } from '@/components/autopilot/DiagnosticsPanel';
 import { GuardrailsEditor } from '@/components/autopilot/GuardrailsEditor';
+import { ProfileSelector } from '@/components/autopilot/ProfileSelector';
+import { WatcherPanel } from '@/components/autopilot/WatcherPanel';
 import { CredentialsSection } from '@/components/autopilot/CredentialsSection';
 import { cn } from '@/lib/utils';
 import {
@@ -251,6 +253,7 @@ export default function Autopilot() {
                 <TabsTrigger value="guida">Come funziona</TabsTrigger>
                 <TabsTrigger value="strategia">Strategia e limiti</TabsTrigger>
                 <TabsTrigger value="credenziali">Credenziali</TabsTrigger>
+                <TabsTrigger value="watcher">Watcher</TabsTrigger>
                 <TabsTrigger value="diagnostica">Diagnostica</TabsTrigger>
                 <TabsTrigger value="storico">Storico</TabsTrigger>
               </TabsList>
@@ -359,9 +362,12 @@ export default function Autopilot() {
 
               <TabsContent value="guida" className="pt-4"><HowItWorks /></TabsContent>
 
-              <TabsContent value="strategia" className="pt-4">
+              <TabsContent value="strategia" className="space-y-4 pt-4">
+                <ProfileSelector current={config.strategyProfile} onApplied={refresh} />
                 <GuardrailsEditor config={config} onSaved={refresh} />
               </TabsContent>
+
+              <TabsContent value="watcher" className="pt-4"><WatcherPanel /></TabsContent>
 
               <TabsContent value="credenziali" className="pt-4">
                 <CredentialsSection
@@ -459,7 +465,19 @@ export default function Autopilot() {
                               )}
                             </>
                           ) : (
-                            <p className="text-sm text-text-1">{detail.proposal?.error ?? 'Nessuna proposta: questa run non ha coinvolto il modello.'}</p>
+                            <div className="space-y-2">
+                              <p className="text-sm text-loss">{detail.proposal?.error ?? 'Nessuna proposta: questa run non ha coinvolto il modello.'}</p>
+                              {Array.isArray(detail.proposal?.attempts) && detail.proposal.attempts.length > 0 && (
+                                <div className="space-y-1 rounded-lg bg-bg-0 p-3">
+                                  <p className="text-xs text-text-1">Tentativi per modello, in ordine:</p>
+                                  {(detail.proposal.attempts as Array<{ model: string; format: string; ok: boolean; error?: string }>).map((attempt, index) => (
+                                    <p key={index} className={cn('font-mono text-[11px]', attempt.ok ? 'text-gain' : 'text-text-1')}>
+                                      {attempt.ok ? '✓' : '✗'} {attempt.model} [{attempt.format}]{attempt.error ? ` — ${attempt.error}` : ''}
+                                    </p>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
                           )}
                         </TabsContent>
 

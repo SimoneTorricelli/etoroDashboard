@@ -10,6 +10,12 @@ import { buildFeatures, renderFeaturesPrompt, rsi, maxDrawdown, annualizedVol } 
 import { validateProposal } from './lib/validator.js';
 import { extractJson, normalizeProposal } from './lib/brain.js';
 import { DEFAULT_CONFIG } from './lib/db.js';
+import { PROFILES, applyProfile, describeProfile, listProfiles } from './lib/profiles.js';
+import { checkChurnRules, filterMarginalSubstitutions, isWorthTheCost } from './lib/churn.js';
+import { buildShortlist, scoreInstrument } from './lib/screening.js';
+import { decideWatcherAction, detectAnomalies, isStabilized, relevantHeadlines } from './lib/watcher.js';
+
+const DAY = 24 * 60 * 60 * 1000;
 
 const tests = [];
 const test = (name, fn) => tests.push([name, fn]);
@@ -160,6 +166,196 @@ test('un portafoglio che viola i cap genera vendite anche senza cambio di vista'
   const { plan, violations } = validateProposal({ proposal, features, config });
   assert.ok(violations.some((item) => item.code === 'symbol_cap'));
   assert.ok(plan.orders.every((order) => order.side === 'sell'));
+});
+
+// ------------------------------------------------- profili di strategia
+
+test('profili: applicazione sovrascrive i guardrail correlati', () => {
+  const applied = applyProfile({ ...DEFAULT_CONFIG }, 'defensive');
+  assert.equal(applied.strategyProfile, 'defensive');
+  assert.equal(applied.maxWeightPerClass.crypto, 0);
+  assert.equal(applied.drawdownStopPct, PROFILES.defensive.drawdownStopPct);
+  assert.ok(applied.minHoldingDays >= DEFAULT_CONFIG.minHoldingDays);
+});
+
+test('profili: aggressivo tollera più rischio del difensivo', () => {
+  const defensive = applyProfile({ ...DEFAULT_CONFIG }, 'defensive');
+  const aggressive = applyProfile({ ...DEFAULT_CONFIG }, 'aggressive');
+  assert.ok(aggressive.drawdownStopPct > defensive.drawdownStopPct);
+  assert.ok(aggressive.maxTurnoverPct > defensive.maxTurnoverPct);
+  assert.ok(aggressive.maxHoldings > defensive.maxHoldings);
+  assert.ok(listProfiles().length === 4);
+  assert.match(describeProfile(aggressive), /Aggressivo/);
+});
+
+// ------------------------------------------------- disciplina anti-churn
+
+test('churn: non si vende prima del periodo minimo di detenzione', () => {
+  const ledger = new Map([['SPY', { symbol: 'SPY', last_bought_at: Date.now() - 3 * DAY }]]);
+  const result = checkChurnRules({ symbol: 'SPY', side: 'sell', ledger, config: { ...DEFAULT_CONFIG, minHoldingDays: 21 } });
+  assert.equal(result.allowed, false);
+  assert.match(result.reason, /minimo 21/);
+});
+
+test('churn: lo stop loss ha la precedenza sul periodo minimo', () => {
+  const ledger = new Map([['BTC', { symbol: 'BTC', last_bought_at: Date.now() - DAY }]]);
+  const result = checkChurnRules({ symbol: 'BTC', side: 'sell', ledger, config: DEFAULT_CONFIG, isStopLoss: true });
+  assert.equal(result.allowed, true);
+});
+
+test('churn: non si rientra prima della fine del cooldown', () => {
+  const ledger = new Map([['GLD', { symbol: 'GLD', last_sold_at: Date.now() - 5 * DAY }]]);
+  const result = checkChurnRules({ symbol: 'GLD', side: 'buy', ledger, config: { ...DEFAULT_CONFIG, reentryCooldownDays: 30 } });
+  assert.equal(result.allowed, false);
+  assert.match(result.reason, /dopo 30/);
+});
+
+test('churn: mediazione al ribasso limitata', () => {
+  const ledger = new Map([['BTC', { symbol: 'BTC', average_down_count: 1 }]]);
+  const result = checkChurnRules({ symbol: 'BTC', side: 'buy', ledger, config: { ...DEFAULT_CONFIG, maxAverageDown: 1 }, isOpportunistic: true });
+  assert.equal(result.allowed, false);
+});
+
+test('churn: il beneficio atteso deve superare il costo', () => {
+  const config = { ...DEFAULT_CONFIG, transactionCostBps: 20 };
+  assert.equal(isWorthTheCost({ amountUsd: 100, expectedEdgePct: 0.1, config }).worth, false);
+  assert.equal(isWorthTheCost({ amountUsd: 100, expectedEdgePct: 1.5, config }).worth, true);
+});
+
+test('churn: sostituzioni marginali vengono rifiutate', () => {
+  const config = { ...DEFAULT_CONFIG, substitutionEdge: 18 };
+  const marginal = filterMarginalSubstitutions({ entering: [{ symbol: 'QQQ', score: 62 }], exiting: [{ symbol: 'SPY', score: 55 }], config });
+  assert.equal(marginal.entering.length, 0);
+  assert.equal(marginal.exiting.length, 0);
+  const decisive = filterMarginalSubstitutions({ entering: [{ symbol: 'QQQ', score: 85 }], exiting: [{ symbol: 'SPY', score: 55 }], config });
+  assert.equal(decisive.entering.length, 1);
+});
+
+// ------------------------------------------------- screening
+
+test('screening: punteggio nell’intervallo e serie corte scartate', () => {
+  const strong = scoreInstrument(syntheticSeries(100, 260, 0.0012, 21).map((row) => row.close), { targetVolPct: [8, 14], benchmarkReturns: [] });
+  assert.ok(strong.score >= 0 && strong.score <= 100);
+  assert.equal(scoreInstrument([1, 2, 3], { targetVolPct: [8, 14], benchmarkReturns: [] }), null);
+});
+
+test('screening: il trend forte batte quello debole', () => {
+  const target = { targetVolPct: [8, 20], benchmarkReturns: [] };
+  const up = scoreInstrument(syntheticSeries(100, 260, 0.0015, 31).map((row) => row.close), target);
+  const down = scoreInstrument(syntheticSeries(100, 260, -0.0015, 31).map((row) => row.close), target);
+  assert.ok(up.score > down.score, `${up.score} deve superare ${down.score}`);
+});
+
+test('screening: le posizioni aperte entrano sempre in shortlist', () => {
+  const bigUniverse = new Map(universe);
+  for (let i = 0; i < 12; i += 1) {
+    bigUniverse.set(`X${i}`, { symbol: `X${i}`, class: 'etf', maxWeight: 0.3, instrumentId: 2000 + i, name: `X${i}` });
+  }
+  const bigCandles = new Map(candles);
+  for (let i = 0; i < 12; i += 1) bigCandles.set(`X${i}`, syntheticSeries(50 + i, 260, 0.001, 41 + i));
+  const result = buildShortlist({
+    universe: bigUniverse, candles: bigCandles, heldSymbols: new Set(['BTC']),
+    config: { ...DEFAULT_CONFIG, shortlistSize: 6 }, profile: PROFILES.balanced,
+  });
+  assert.ok(result.shortlist.some((item) => item.symbol === 'BTC'), 'BTC è in portafoglio e deve restare valutabile');
+  assert.ok(result.shortlist.length <= 7);
+});
+
+// ------------------------------------------------- watcher
+
+test('watcher: stabilizzazione riconosciuta solo senza nuovi minimi', () => {
+  assert.equal(isStabilized([...Array(10).fill(100), 90, 80, 70], 2), false);
+  assert.equal(isStabilized([...Array(10).fill(100), 80, 81, 82], 2), true);
+});
+
+test('watcher: un crollo giornaliero genera un’anomalia', () => {
+  const series = syntheticSeries(100, 200, 0.0002, 5);
+  series.push({ at: '2026-08-25', close: series[series.length - 1].close * 0.88 });
+  const anomalies = detectAnomalies({
+    universe: new Map([['NVDA', { symbol: 'NVDA', class: 'stock', maxWeight: 0.2, instrumentId: 999, name: 'NVIDIA' }]]),
+    candles: new Map([['NVDA', series]]),
+    features: { instruments: [] },
+    config: DEFAULT_CONFIG,
+  });
+  assert.ok(anomalies.some((item) => item.kind === 'crash'));
+});
+
+test('watcher: non compra durante il movimento', () => {
+  const decision = decideWatcherAction({
+    anomaly: { symbol: 'NVDA', kind: 'crash', held: false, metrics: { stabilized: false } },
+    verdict: { classification: 'technical_overreaction', confidence: 0.9, suggestedAction: 'accumulate' },
+    config: DEFAULT_CONFIG, ledger: new Map(), budgetUsd: 500, opportunisticThisWeek: 0, equityUsd: 1000,
+  });
+  assert.equal(decision.action, 'noop');
+  assert.match(decision.reason, /stabilizzazione/);
+});
+
+test('watcher: non compra su rottura strutturale', () => {
+  const decision = decideWatcherAction({
+    anomaly: { symbol: 'NVDA', kind: 'crash', held: false, metrics: { stabilized: true } },
+    verdict: { classification: 'structural_break', confidence: 0.95, suggestedAction: 'avoid' },
+    config: DEFAULT_CONFIG, ledger: new Map(), budgetUsd: 500, opportunisticThisWeek: 0, equityUsd: 1000,
+  });
+  assert.equal(decision.action, 'noop');
+});
+
+test('watcher: confidence bassa non è operativa', () => {
+  const decision = decideWatcherAction({
+    anomaly: { symbol: 'NVDA', kind: 'crash', held: false, metrics: { stabilized: true } },
+    verdict: { classification: 'technical_overreaction', confidence: 0.4, suggestedAction: 'accumulate' },
+    config: DEFAULT_CONFIG, ledger: new Map(), budgetUsd: 500, opportunisticThisWeek: 0, equityUsd: 1000,
+  });
+  assert.equal(decision.action, 'noop');
+  assert.match(decision.reason, /confidence/);
+});
+
+test('watcher: acquisto ammesso solo con tutte le condizioni soddisfatte', () => {
+  const config = { ...DEFAULT_CONFIG, opportunisticBudgetPct: 0.1, maxOpportunisticPerWeek: 1, minOrderUsd: 10 };
+  const decision = decideWatcherAction({
+    anomaly: { symbol: 'NVDA', kind: 'crash', held: false, metrics: { stabilized: true } },
+    verdict: { classification: 'technical_overreaction', confidence: 0.85, suggestedAction: 'accumulate' },
+    config, ledger: new Map(), budgetUsd: 200, opportunisticThisWeek: 0, equityUsd: 2000,
+  });
+  assert.equal(decision.action, 'buy');
+  assert.ok(decision.amountUsd >= config.minOrderUsd && decision.amountUsd <= config.maxOrderUsd);
+});
+
+test('watcher: tetto settimanale rispettato', () => {
+  const decision = decideWatcherAction({
+    anomaly: { symbol: 'NVDA', kind: 'crash', held: false, metrics: { stabilized: true } },
+    verdict: { classification: 'technical_overreaction', confidence: 0.85, suggestedAction: 'accumulate' },
+    config: { ...DEFAULT_CONFIG, maxOpportunisticPerWeek: 1 }, ledger: new Map(),
+    budgetUsd: 500, opportunisticThisWeek: 1, equityUsd: 2000,
+  });
+  assert.equal(decision.action, 'noop');
+  assert.match(decision.reason, /questa settimana/);
+});
+
+test('watcher: le notizie vengono filtrate sullo strumento', () => {
+  const news = { items: [
+    { title: 'NVIDIA beats earnings expectations', score: 1, topic: 'markets' },
+    { title: 'Oil prices steady in Asia', score: 0, topic: 'markets' },
+  ] };
+  const picked = relevantHeadlines({ symbol: 'NVDA', name: 'NVIDIA Corporation' }, news, 5);
+  assert.equal(picked[0].title, 'NVIDIA beats earnings expectations');
+});
+
+// ------------------------------------------------- validator con nuove regole
+
+test('validator: il periodo minimo di detenzione blocca la vendita', () => {
+  const ledger = new Map(features.instruments.map((item) => [item.symbol, { symbol: item.symbol, last_bought_at: Date.now() - DAY }]));
+  const proposal = { targetWeights: { SPY: 0.1, GLD: 0.2, CASH: 0.7 }, confidence: 0.9, rationale: '', risks: [], watch: [] };
+  const { plan, violations } = validateProposal({ proposal, features, config, ledger });
+  assert.ok(violations.some((item) => item.code === 'churn'));
+  assert.equal(plan.orders.filter((order) => order.side === 'sell' && order.symbol === 'SPY').length, 0);
+});
+
+test('validator: il numero massimo di posizioni viene rispettato', () => {
+  const proposal = { targetWeights: { SPY: 0.3, GLD: 0.3, BTC: 0.2, CASH: 0.2 }, confidence: 0.9, rationale: '', risks: [], watch: [] };
+  const { plan, violations } = validateProposal({ proposal, features, config: { ...config, maxHoldings: 2 } });
+  const invested = Object.entries(plan.targets).filter(([symbol, weight]) => symbol !== 'CASH' && weight > 0.001);
+  assert.ok(invested.length <= 2);
+  assert.ok(violations.some((item) => item.code === 'max_holdings'));
 });
 
 let failed = 0;

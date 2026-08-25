@@ -129,11 +129,11 @@ export class EtoroClient {
     };
   }
 
-  /** Estrae le righe da qualunque forma di risposta della ricerca. */
-  static searchRows(data) {
+  /** Estrae le righe da qualunque forma di risposta a lista. */
+  static searchRows(data, extraKeys = []) {
     if (Array.isArray(data)) return recordList(data);
     const record = asRecord(data);
-    for (const key of ['instruments', 'Instruments', 'results', 'Results', 'items', 'Items', 'data', 'Data']) {
+    for (const key of [...extraKeys, 'instruments', 'Instruments', 'results', 'Results', 'items', 'Items', 'data', 'Data']) {
       const value = record[key];
       if (Array.isArray(value)) return recordList(value);
       // Alcune risposte annidano l'array un livello più sotto.
@@ -371,7 +371,7 @@ export class EtoroClient {
 
   async agentPortfolios() {
     const data = await this.request('v1', 'agent-portfolios');
-    const rows = EtoroClient.searchRows(data);
+    const rows = EtoroClient.searchRows(data, ['agentPortfolios', 'AgentPortfolios', 'portfolios', 'Portfolios']);
     return rows.map((raw) => {
       const id = String(pick(raw, 'agentPortfolioId', 'AgentPortfolioId', 'portfolioId', 'id', 'Id') ?? '');
       const name = String(pick(raw, 'name', 'Name', 'displayName', 'DisplayName', 'portfolioName', 'PortfolioName', 'title', 'Title') ?? '');

@@ -5,6 +5,7 @@
  * *quale* credenziale è sbagliata invece di vedere un generico HTTP 401.
  */
 import { EtoroClient } from './etoro.js';
+import { probeModels } from './brain.js';
 import { checkTelegram } from './notify.js';
 import { collectExternalContext } from './sources.js';
 
@@ -138,6 +139,20 @@ export async function runDiagnostics(resolved, config) {
     }
   }
 
+  // --- Modelli configurati -------------------------------------------------
+  if (credentials.openrouterApiKey && config.models?.length) {
+    const probes = await probeModels({ apiKey: credentials.openrouterApiKey, models: config.models });
+    const working = probes.filter((item) => item.ok);
+    const broken = probes.filter((item) => !item.ok);
+    checks.push(working.length
+      ? ok('models', 'Modelli AI configurati',
+          `${working.length}/${probes.length} funzionanti: ${working.map((item) => item.model).join(', ')}${broken.length ? ` · non disponibili: ${broken.map((item) => `${item.model} (${item.error})`).join('; ')}` : ''}`,
+          { data: probes })
+      : ko('models', 'Modelli AI configurati',
+          broken.map((item) => `${item.model}: ${item.error}`).join(' · '),
+          'Il catalogo gratuito di OpenRouter cambia spesso: apri Strategia → Modelli AI e scegli fra quelli disponibili adesso.'));
+  }
+
   // --- Notifiche ----------------------------------------------------------
   if (!credentials.telegramBotToken && !credentials.telegramChatId && !credentials.notifyWebhookUrl) {
     checks.push(skip('telegram', 'Telegram — notifiche', 'Non configurato: l’agente lavorerà in silenzio.'));
@@ -170,7 +185,8 @@ export async function runDiagnostics(resolved, config) {
     checkedAt: Date.now(),
     ok: failures.length === 0,
     readyForShadow: checks.find((item) => item.id === 'etoro.read')?.ok === true
-      && checks.find((item) => item.id === 'openrouter')?.ok === true,
+      && checks.find((item) => item.id === 'openrouter')?.ok === true
+      && checks.find((item) => item.id === 'models')?.ok !== false,
     readyForLive: checks.find((item) => item.id === 'etoro.agent')?.ok === true,
     checks,
   };

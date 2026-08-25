@@ -93,3 +93,42 @@ CREATE TABLE IF NOT EXISTS equity_curve (
   cash_usd     REAL,
   hwm_usd      REAL
 );
+
+-- Registro delle posizioni: alimenta le regole di holding period e cooldown.
+CREATE TABLE IF NOT EXISTS holdings_ledger (
+  symbol             TEXT PRIMARY KEY,
+  instrument_id      INTEGER,
+  first_bought_at    INTEGER,
+  last_bought_at     INTEGER,
+  last_sold_at       INTEGER,
+  average_down_count INTEGER NOT NULL DEFAULT 0,
+  opportunistic      INTEGER NOT NULL DEFAULT 0,
+  updated_at         INTEGER NOT NULL
+);
+
+-- Anomalie rilevate dal watcher orario e relative decisioni.
+CREATE TABLE IF NOT EXISTS watcher_events (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  at             INTEGER NOT NULL,
+  symbol         TEXT NOT NULL,
+  instrument_id  INTEGER,
+  kind           TEXT NOT NULL,
+  metrics_json   TEXT,
+  classification TEXT,
+  confidence     REAL,
+  rationale      TEXT,
+  action         TEXT NOT NULL,
+  run_id         TEXT,
+  model          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_watcher_at ON watcher_events (at DESC);
+
+-- Cache permanente simbolo -> instrumentId eToro.
+CREATE TABLE IF NOT EXISTS universe_cache (
+  symbol        TEXT PRIMARY KEY,
+  instrument_id INTEGER NOT NULL,
+  name          TEXT,
+  asset_class   TEXT,
+  matched_as    TEXT,
+  updated_at    INTEGER NOT NULL
+);

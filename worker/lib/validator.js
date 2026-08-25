@@ -1,3 +1,5 @@
+import { checkChurnRules, filterMarginalSubstitutions, isWorthTheCost } from './churn.js';
+
 /**
  * Livello deterministico con diritto di veto. Trasforma la proposta dell'LLM in
  * un piano di ordini eseguibile, oppure la blocca.
@@ -68,7 +70,7 @@ export function clampWeights(targetWeights, features, config, violations) {
 /**
  * @returns {{ok: boolean, violations: Array, plan: object}}
  */
-export function validateProposal({ proposal, features, config, ordersToday = 0 }) {
+export function validateProposal({ proposal, features, config, ordersToday = 0, ledger = new Map(), scores = new Map() }) {
   const violations = [];
   const equityUsd = features.portfolio.equityUsd;
   const bySymbol = new Map(features.instruments.map((item) => [item.symbol, item]));
@@ -82,7 +84,19 @@ export function validateProposal({ proposal, features, config, ordersToday = 0 }
     violations.push(violation('daily_order_cap', `raggiunto il limite di ${config.maxOrdersPerDay} ordini nelle ultime 24h`));
   }
 
-  const targets = clampWeights(proposal.targetWeights, features, config, violations);
+  let targets = clampWeights(proposal.targetWeights, features, config, violations);
+
+  // Numero massimo di posizioni: si tengono i pesi più alti, il resto va a cassa.
+  const invested = Object.entries(targets).filter(([symbol, weight]) => symbol !== 'CASH' && weight > 0.001);
+  if (config.maxHoldings && invested.length > config.maxHoldings) {
+    const keep = invested.sort((a, b) => b[1] - a[1]).slice(0, config.maxHoldings);
+    const dropped = invested.slice(config.maxHoldings).map(([symbol]) => symbol);
+    violations.push(violation('max_holdings', `proposti ${invested.length} strumenti, il profilo ne ammette ${config.maxHoldings}: esclusi ${dropped.join(', ')}`, 'clamped'));
+    const kept = Object.fromEntries(keep);
+    const total = keep.reduce((sum, [, weight]) => sum + weight, 0);
+    const cashTarget = round(1 - total, 4);
+    targets = { ...kept, CASH: Math.max(cashTarget, config.minCashPct) };
+  }
 
   const deltas = [];
   for (const item of features.instruments) {
@@ -101,6 +115,8 @@ export function validateProposal({ proposal, features, config, ordersToday = 0 }
       deltaUsd: round(deltaAbs * equityUsd, 2),
       positionIds: item.positionIds,
       currentValueUsd: item.valueUsd,
+      pnlPct: item.pnlPct,
+      score: scores.get(item.symbol) ?? null,
       skipped: withinBand ? 'dentro banda di tolleranza' : null,
     });
   }
@@ -111,6 +127,48 @@ export function validateProposal({ proposal, features, config, ordersToday = 0 }
       item.skipped = `sotto l'ordine minimo di ${config.minOrderUsd} USD`;
     }
   }
+
+  // --- Disciplina anti-churn -------------------------------------------
+  const stopLossPct = -(config.drawdownStopPct * 100);
+  candidates = candidates.filter((item) => {
+    const side = item.deltaUsd < 0 ? 'sell' : 'buy';
+    const isStopLoss = side === 'sell' && item.pnlPct != null && item.pnlPct <= stopLossPct;
+    const check = checkChurnRules({ symbol: item.symbol, side, ledger, config, isStopLoss });
+    if (check.allowed) return true;
+    item.skipped = check.reason;
+    violations.push(violation('churn', `${item.symbol}: ${check.reason}`, 'clamped'));
+    return false;
+  });
+
+  // Sostituzioni marginali: entrare in B uscendo da A deve valerne la pena.
+  const entering = candidates.filter((item) => item.deltaUsd > 0 && item.currentWeight <= 0.001);
+  const exiting = candidates.filter((item) => item.deltaUsd < 0 && item.targetWeight <= 0.001);
+  if (entering.length && exiting.length) {
+    const filtered = filterMarginalSubstitutions({ entering, exiting, config });
+    const keptSymbols = new Set([...filtered.entering, ...filtered.exiting].map((item) => item.symbol));
+    for (const item of [...entering, ...exiting]) {
+      if (keptSymbols.has(item.symbol)) continue;
+      item.skipped = 'sostituzione non abbastanza vantaggiosa';
+    }
+    for (const rejection of filtered.rejected) {
+      violations.push(violation('substitution', `${rejection.symbol}: ${rejection.reason}`, 'clamped'));
+    }
+    candidates = candidates.filter((item) => !(entering.includes(item) || exiting.includes(item)) || keptSymbols.has(item.symbol));
+  }
+
+  // Costo di transazione: un ingresso nuovo deve battere spread e commissioni.
+  candidates = candidates.filter((item) => {
+    if (item.currentWeight > 0.001 || item.deltaUsd <= 0 || item.score == null) return true;
+    const bestHeldScore = Math.max(0, ...features.instruments.filter((row) => row.weight > 0.001).map((row) => scores.get(row.symbol) ?? 0));
+    // Un punto di score vale circa 0,1% di rendimento atteso sull'orizzonte.
+    const expectedEdgePct = Math.max(0, item.score - bestHeldScore) * 0.1;
+    const { worth, costUsd, benefitUsd } = isWorthTheCost({ amountUsd: Math.abs(item.deltaUsd), expectedEdgePct, config });
+    if (!worth) {
+      item.skipped = `beneficio atteso ${benefitUsd} USD sotto il costo stimato ${costUsd} USD`;
+      violations.push(violation('transaction_cost', `${item.symbol}: ${item.skipped}`, 'clamped'));
+    }
+    return worth;
+  });
 
   // Cap di turnover: scala proporzionalmente l'intero piano.
   const turnoverUsd = candidates.reduce((sum, item) => sum + Math.abs(item.deltaUsd), 0);

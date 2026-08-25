@@ -20,8 +20,52 @@ export interface WhitelistEntry {
   maxWeight: number;
 }
 
+export interface StrategyProfileInfo {
+  id: string;
+  label: string;
+  summary: string;
+  targetVolPct: [number, number];
+  horizon: string;
+  maxHoldings: number;
+  cryptoCap: number;
+  drawdownStopPct: number;
+  watcherEnabled: boolean;
+}
+
+export interface WatcherEvent {
+  id: number;
+  at: number;
+  symbol: string;
+  kind: string;
+  classification: string | null;
+  confidence: number | null;
+  rationale: string | null;
+  action: string;
+  model: string | null;
+  metrics: Record<string, number | boolean | null> | null;
+}
+
 export interface AutopilotConfig {
   executionMode: ExecutionMode;
+  strategyProfile: string;
+  universeMode: 'fixed' | 'dynamic';
+  shortlistSize: number;
+  maxHoldings: number;
+  minHoldings: number;
+  pool: WhitelistEntry[];
+  minHoldingDays: number;
+  reentryCooldownDays: number;
+  substitutionEdge: number;
+  transactionCostBps: number;
+  watcherEnabled: boolean;
+  watcherDropPct: number;
+  watcherSpikePct: number;
+  watcherVolSpike: number;
+  opportunisticBudgetPct: number;
+  maxOpportunisticPerWeek: number;
+  maxAverageDown: number;
+  stabilizationBars: number;
+  watcherMinConfidence: number;
   frozen: boolean;
   frozenReason: string;
   cadence: 'daily' | 'weekly' | 'monthly';
@@ -243,6 +287,10 @@ export const autopilot = {
   searchInstruments: (query: string) =>
     call<{ results: InstrumentHit[] }>(`/agent/instruments?q=${encodeURIComponent(query)}`),
   agentPortfolios: () => call<{ portfolios: AgentPortfolioSummary[] }>('/agent/agent-portfolios'),
+  profiles: () => call<{ profiles: StrategyProfileInfo[]; current: string }>('/agent/profiles'),
+  setProfile: (profile: string) =>
+    call<{ config: AutopilotConfig }>('/agent/profile', { method: 'POST', body: JSON.stringify({ profile }) }),
+  watcherEvents: (limit = 50) => call<{ events: WatcherEvent[] }>(`/agent/watcher?limit=${limit}`),
   generateAgentToken: (agentPortfolioId: string) =>
     call<{ ok: true; tokenName: string; hint: string; credentials: CredentialStatus[] }>('/agent/agent-token', {
       method: 'POST',

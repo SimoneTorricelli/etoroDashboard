@@ -24,6 +24,29 @@ Regole non negoziabili:
 Schema di output:
 {"targetWeights":{"SIMBOLO":0.00,"CASH":0.00},"confidence":0.00,"rationale":"...","risks":["..."],"watch":["..."]}`;
 
+const DYNAMIC_SYSTEM_PROMPT = `Sei un gestore di portafoglio quantitativo. Ricevi lo stato di un portafoglio reale di piccola taglia e una shortlist di candidati già filtrata da uno screening quantitativo.
+
+Il tuo compito: scegliere quali strumenti tenere e con quale peso. Output in JSON valido, senza testo attorno.
+
+Regole non negoziabili:
+- Puoi usare SOLO i simboli presenti in CANDIDATI, più la voce CASH.
+- I pesi sono decimali fra 0 e 1 e devono sommare esattamente a 1.
+- Rispetta il numero minimo e massimo di strumenti indicato nei vincoli.
+- Non superare il peso massimo di ciascuno strumento né i tetti per classe.
+- Nessuna leva, nessuno short.
+
+Disciplina di rotazione — è la parte che conta di più:
+- Le posizioni marcate IN PORTAFOGLIO hanno un vantaggio implicito: cambiarle costa spread e commissioni. Sostituiscine una solo se il candidato è NETTAMENTE migliore, non marginalmente.
+- Non ruotare il portafoglio per inseguire l'ultima settimana di performance. Preferisci la stabilità quando i segnali sono deboli o contraddittori.
+- L'inazione è una scelta legittima: se l'allocazione attuale è ragionevole, riproponila quasi identica e abbassa la confidence.
+- Le righe elencate in VINCOLI TEMPORALI non sono negoziabili: quegli strumenti non possono essere venduti o riacquistati adesso.
+
+La confidence è la tua probabilità soggettiva che questa allocazione batta il mantenimento dello status quo sull'orizzonte indicato. Sii conservativo.
+rationale: massimo 700 caratteri, in italiano, spiega le scelte citando i numeri.
+
+Schema di output:
+{"targetWeights":{"SIMBOLO":0.00,"CASH":0.00},"confidence":0.00,"rationale":"...","risks":["..."],"watch":["..."]}`;
+
 const RESPONSE_SCHEMA = {
   type: 'object',
   additionalProperties: false,
@@ -137,6 +160,50 @@ async function callOpenRouter(apiKey, model, messages, { temperature, maxTokens,
   }
 }
 
+/**
+ * Prova ogni modello configurato con una richiesta minima, e riporta l'errore
+ * esatto di OpenRouter. È il modo più diretto per scoprire che un id di modello
+ * gratuito è stato ritirato: il catalogo free ruota spesso.
+ */
+export async function probeModels({ apiKey, models, referer }) {
+  const results = [];
+  for (const model of models) {
+    const startedAt = Date.now();
+    try {
+      const response = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${apiKey}`,
+          'content-type': 'application/json',
+          'HTTP-Referer': referer || 'https://etorodashboard.workers.dev',
+          'X-Title': 'Torino Autopilot',
+        },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'user', content: 'Rispondi solo con: {"ok":true}' }],
+          max_tokens: 20,
+          temperature: 0,
+        }),
+      });
+      const text = await response.text();
+      let payload = {};
+      try { payload = text ? JSON.parse(text) : {}; } catch { payload = { raw: text.slice(0, 200) }; }
+      if (!response.ok) {
+        const message = payload?.error?.message ?? payload?.message ?? `HTTP ${response.status}`;
+        results.push({ model, ok: false, status: response.status, error: String(message).slice(0, 300), ms: Date.now() - startedAt });
+        continue;
+      }
+      const content = payload?.choices?.[0]?.message?.content;
+      results.push(content
+        ? { model, ok: true, ms: Date.now() - startedAt }
+        : { model, ok: false, error: 'risposta senza contenuto', ms: Date.now() - startedAt });
+    } catch (error) {
+      results.push({ model, ok: false, error: error instanceof Error ? error.message : String(error), ms: Date.now() - startedAt });
+    }
+  }
+  return results;
+}
+
 /** Elenco aggiornato dei modelli gratuiti disponibili su OpenRouter. */
 export async function listFreeModels(apiKey) {
   const response = await fetch(`${OPENROUTER_BASE}/models`, {
@@ -159,10 +226,19 @@ export async function listFreeModels(apiKey) {
  * Esegue la cascata di modelli. Per ogni modello prova, nell'ordine:
  * json_schema → json_object → testo libero con estrazione.
  */
-export async function askBrain({ apiKey, models, featuresPrompt, allowedSymbols, config, referer }) {
-  const userPrompt = `${featuresPrompt}\n\nOrizzonte del ribilanciamento: ${config.cadence === 'daily' ? 'giornaliero' : config.cadence === 'monthly' ? 'mensile' : 'settimanale'}.\nRispondi solo con il JSON dello schema richiesto.`;
+export async function askBrain({ apiKey, models, featuresPrompt, allowedSymbols, config, referer, dynamic = false, profileDescription = '', ledgerNotes = [] }) {
+  const horizon = config.cadence === 'daily' ? 'giornaliero' : config.cadence === 'monthly' ? 'mensile' : 'settimanale';
+  const userPrompt = [
+    featuresPrompt,
+    '',
+    profileDescription ? `STRATEGIA ${profileDescription}` : '',
+    ledgerNotes.length ? `VINCOLI TEMPORALI (non aggirabili)\n${ledgerNotes.map((note) => `- ${note}`).join('\n')}` : '',
+    '',
+    `Orizzonte del ribilanciamento: ${horizon}.`,
+    'Rispondi solo con il JSON dello schema richiesto.',
+  ].filter((line) => line !== '').join('\n');
   const messages = [
-    { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'system', content: dynamic ? DYNAMIC_SYSTEM_PROMPT : SYSTEM_PROMPT },
     { role: 'user', content: userPrompt },
   ];
   const formats = [
@@ -189,7 +265,7 @@ export async function askBrain({ apiKey, models, featuresPrompt, allowedSymbols,
           continue;
         }
         attempts.push({ model, format: label, ok: true, usage });
-        return { ok: true, model, attempts, rawText: content, promptChars: userPrompt.length + SYSTEM_PROMPT.length, parsed: normalized.value, usage };
+        return { ok: true, model, attempts, rawText: content, promptChars: userPrompt.length + (dynamic ? DYNAMIC_SYSTEM_PROMPT : SYSTEM_PROMPT).length, parsed: normalized.value, usage };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         attempts.push({ model, format: label, ok: false, error: message });
@@ -198,5 +274,16 @@ export async function askBrain({ apiKey, models, featuresPrompt, allowedSymbols,
       }
     }
   }
-  return { ok: false, attempts, error: 'nessun modello ha prodotto una proposta valida', promptChars: userPrompt.length };
+  // Un solo errore per modello: quello del primo formato è il più informativo.
+  const perModel = [];
+  for (const model of models) {
+    const first = attempts.find((item) => item.model === model && !item.ok);
+    if (first) perModel.push(`${model}: ${first.error}`);
+  }
+  return {
+    ok: false,
+    attempts,
+    error: perModel.length ? `nessuna proposta valida — ${perModel.join(' · ')}` : 'nessun modello configurato',
+    promptChars: userPrompt.length,
+  };
 }

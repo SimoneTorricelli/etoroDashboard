@@ -9,8 +9,10 @@ import { notify, notifyTest } from './notify.js';
 import { clearCredentials, describeCredentials, resolveCredentials, saveCredentials } from './vault.js';
 import { runDiagnostics } from './diagnose.js';
 import { EtoroClient } from './etoro.js';
+import { applyProfile, listProfiles } from './profiles.js';
 import {
-  audit, equityHistory, getRunBundle, listRuns, loadConfig, saveConfig, DEFAULT_CONFIG,
+  audit, equityHistory, getRunBundle, listRuns, listWatcherEvents, loadConfig,
+  loadLedger, saveConfig, DEFAULT_CONFIG,
 } from './db.js';
 
 /** Confronto a tempo costante: evita di rivelare il token per timing. */
@@ -57,6 +59,21 @@ const NUMERIC_BOUNDS = {
   llmTemperature: [0, 1.5],
   llmMaxTokens: [256, 8000],
   fallbackEurUsd: [0.5, 2],
+  shortlistSize: [5, 40],
+  maxHoldings: [1, 30],
+  minHoldings: [1, 20],
+  minHoldingDays: [0, 365],
+  reentryCooldownDays: [0, 365],
+  substitutionEdge: [0, 100],
+  transactionCostBps: [0, 500],
+  watcherDropPct: [0.01, 0.5],
+  watcherSpikePct: [0.01, 0.8],
+  watcherVolSpike: [1, 10],
+  opportunisticBudgetPct: [0, 0.5],
+  maxOpportunisticPerWeek: [0, 10],
+  maxAverageDown: [0, 5],
+  stabilizationBars: [0, 10],
+  watcherMinConfidence: [0, 1],
 };
 
 /** Ripulisce la patch di configurazione: chiavi ignote e valori fuori range vengono scartati. */
@@ -73,6 +90,32 @@ export function sanitizeConfigPatch(patch) {
       const [min, max] = NUMERIC_BOUNDS[key];
       if (!Number.isFinite(numeric) || numeric < min || numeric > max) { rejected.push(`${key}: fuori intervallo [${min}, ${max}]`); continue; }
       out[key] = numeric;
+      continue;
+    }
+    if (key === 'universeMode') {
+      if (!['fixed', 'dynamic'].includes(value)) { rejected.push('universeMode: valore non ammesso'); continue; }
+      out[key] = value;
+      continue;
+    }
+    if (key === 'strategyProfile') {
+      rejected.push('strategyProfile: usa POST /agent/profile');
+      continue;
+    }
+    if (key === 'watcherEnabled') {
+      out[key] = Boolean(value);
+      continue;
+    }
+    if (key === 'pool') {
+      if (!Array.isArray(value)) { rejected.push('pool: array richiesto'); continue; }
+      out[key] = value
+        .filter((item) => item && typeof item.symbol === 'string' && item.symbol.trim())
+        .map((item) => ({
+          symbol: String(item.symbol).trim().toUpperCase().slice(0, 16),
+          name: String(item.name ?? item.symbol).slice(0, 80),
+          class: ['etf', 'stock', 'bond', 'commodity', 'crypto'].includes(item.class) ? item.class : 'etf',
+          maxWeight: Math.max(0.01, Math.min(1, Number(item.maxWeight) || 0.2)),
+        }))
+        .slice(0, 200);
       continue;
     }
     if (key === 'cadence') {
@@ -229,6 +272,35 @@ export async function handleAgentApi(request, env, ctx, pathname) {
       await audit(db, null, 'warn', 'credentials', 'Vault credenziali svuotato');
       return json({ credentials: describeCredentials(await resolveCredentials(db, env)) });
     }
+  }
+
+  // GET /agent/profiles
+  if (route === 'profiles' && method === 'GET') {
+    return json({ profiles: listProfiles(), current: (await loadConfig(db)).strategyProfile });
+  }
+
+  // POST /agent/profile { profile }
+  if (route === 'profile' && method === 'POST') {
+    const profileId = String(body.profile ?? '');
+    const known = listProfiles().some((item) => item.id === profileId);
+    if (!known) return json({ error: 'profilo non riconosciuto' }, 400);
+    const current = await loadConfig(db);
+    const next = applyProfile(current, profileId);
+    const config = await saveConfig(db, next);
+    await audit(db, null, 'warn', 'config', `Profilo di strategia impostato su ${profileId}`);
+    return json({ config });
+  }
+
+  // GET /agent/watcher — eventi rilevati e relative decisioni
+  if (route === 'watcher' && method === 'GET') {
+    const limit = Number(new URL(request.url).searchParams.get('limit') ?? 50);
+    return json({ events: await listWatcherEvents(db, Math.min(Math.max(limit, 1), 200)) });
+  }
+
+  // GET /agent/ledger — vincoli temporali attivi sulle posizioni
+  if (route === 'ledger' && method === 'GET') {
+    const ledger = await loadLedger(db);
+    return json({ ledger: [...ledger.values()] });
   }
 
   // GET /agent/instruments?q=...  — ricerca nel catalogo eToro
