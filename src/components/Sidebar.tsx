@@ -9,6 +9,7 @@ import {
   Bot,
   CandlestickChart,
   LayoutDashboard,
+  Radar,
   Repeat,
   Settings,
   Wallet,
@@ -25,6 +26,7 @@ const NAV = [
   { to: '/mercati', label: 'Mercati', icon: CandlestickChart },
   { to: '/portfolio', label: 'Portfolio', icon: Wallet },
   { to: '/agent', label: 'Agent', icon: Bot },
+  { to: '/autopilot', label: 'Autopilot', icon: Radar },
   { to: '/fx', label: 'EUR/USD', icon: Repeat },
   { to: '/impostazioni', label: 'Impostazioni', icon: Settings },
 ];
@@ -52,8 +54,8 @@ export function Sidebar() {
     <aside className="fixed inset-y-0 left-0 z-40 hidden w-16 flex-col border-r border-hairline bg-bg-0 md:flex xl:w-[232px]">
       {/* Logo */}
       <div className="flex h-14 items-center gap-2.5 border-b border-hairline px-3 xl:px-5">
-        <img src="./logo.svg" alt="Torino" className="h-7 w-7 shrink-0" />
-        <span className="hidden font-display text-title font-semibold text-text-0 xl:inline">Torino</span>
+        <img src="./logo.svg" alt="Torri" className="h-7 w-7 shrink-0" />
+        <span className="hidden font-display text-title font-semibold text-text-0 xl:inline">Torri</span>
       </div>
 
       {/* Nav */}

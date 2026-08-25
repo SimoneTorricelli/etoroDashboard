@@ -320,7 +320,7 @@ export default function Portfolio() {
       (r.weight * 100).toFixed(1).replace('.', ','),
     ].join(';'));
     const summary = [
-      `Report Portfolio Torino;${new Date().toLocaleString('it-IT')}`,
+      `Report Portfolio Torri;${new Date().toLocaleString('it-IT')}`,
       `Valuta report;${cur}`,
       `Valore totale;${fromUsd(portfolio.totalValue).toFixed(2).replace('.', ',')}`,
       `P&L totale;${pnl ? fromUsd(pnl.totalPnl).toFixed(2).replace('.', ',') : ''}`,

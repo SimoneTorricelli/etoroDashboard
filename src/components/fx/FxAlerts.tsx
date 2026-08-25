@@ -41,7 +41,7 @@ export function FxAlerts() {
       const msg = `EUR/USD ${a.direction === 'above' ? 'ha superato' : 'è sceso sotto'} ${formatFxRate(a.threshold)} (ora ${formatFxRate(rate)})`;
       toast('Avviso di cambio scattato', { description: a.note ? `${msg} — ${a.note}` : msg });
       if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
-        try { new Notification('Torino — Avviso EUR/USD', { body: msg }); } catch { /* ignora */ }
+        try { new Notification('Torri — Avviso EUR/USD', { body: msg }); } catch { /* ignora */ }
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps

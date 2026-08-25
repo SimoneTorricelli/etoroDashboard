@@ -216,7 +216,7 @@ export async function createAgentPortfolio(
       agentPortfolioName: config.name.trim(),
       userTokenName: tokenName,
       scopeNames: [...REQUIRED_AGENT_SCOPES],
-      agentPortfolioDescription: `Torino — strategia ${config.templateId}; max ${config.maxPositions} posizioni; ${config.cashReservePct}% liquidità.`,
+      agentPortfolioDescription: `Torri — strategia ${config.templateId}; max ${config.maxPositions} posizioni; ${config.cashReservePct}% liquidità.`,
     }),
   });
   const body = await parseResponse(response);

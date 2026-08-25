@@ -220,7 +220,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
             message: `Avviso prezzo: ${symbol} ${direction} ${alert.threshold} (ora ${quote.last}).`,
           });
           if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
-            try { new Notification(`Torino — ${symbol}`, { body: `Prezzo ${direction} ${alert.threshold}: ${quote.last}` }); } catch { /* ignora */ }
+            try { new Notification(`Torri — ${symbol}`, { body: `Prezzo ${direction} ${alert.threshold}: ${quote.last}` }); } catch { /* ignora */ }
           }
         }
       }
@@ -294,7 +294,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
         const direction = alert.direction === 'above' ? 'ha superato' : 'è sceso sotto';
         pushLog({ id: `external-alert-${alert.id}-${now}`, timestamp: now, level: 'warn', message: `Avviso esterno Binance: ${symbol} ${direction} ${alert.threshold} (ora ${price}).` });
         if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
-          try { new Notification(`Torino — ${symbol} (Binance)`, { body: `Prezzo ${direction} ${alert.threshold}: ${price}` }); } catch { /* ignora */ }
+          try { new Notification(`Torri — ${symbol} (Binance)`, { body: `Prezzo ${direction} ${alert.threshold}: ${price}` }); } catch { /* ignora */ }
         }
       }
     };

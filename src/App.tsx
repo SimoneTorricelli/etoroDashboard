@@ -5,6 +5,7 @@ import Overview from '@/pages/Overview'
 import Markets from '@/pages/Markets'
 import Portfolio from '@/pages/Portfolio'
 import Agent from '@/pages/Agent'
+import Autopilot from '@/pages/Autopilot'
 import Fx from '@/pages/Fx'
 import Settings from '@/pages/Settings'
 
@@ -22,6 +23,7 @@ export default function App() {
           <Route path="mercati" element={<Markets />} />
           <Route path="portfolio" element={<Portfolio />} />
           <Route path="agent" element={<Agent />} />
+          <Route path="autopilot" element={<Autopilot />} />
           <Route path="fx" element={<Fx />} />
           <Route path="impostazioni" element={<Settings />} />
         </Route>

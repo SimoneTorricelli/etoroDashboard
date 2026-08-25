@@ -1,4 +1,4 @@
-# eToro Command Center — "Torino"
+# eToro Command Center — "Torri"
 
 Dashboard personale per eToro: portfolio analytics, mercati globali in tempo reale, agente di investimento automatizzato con limiti di capitale, modulo EUR/USD per decidere quando prelevare in euro.
 

@@ -27,7 +27,7 @@ export function Header({ onOpenPalette }: { onOpenPalette(): void }) {
     settings, logs, realExecutionActive,
   } = useAppData();
 
-  const title = TITLES[location.pathname] ?? 'Torino';
+  const title = TITLES[location.pathname] ?? 'Torri';
   const unread = logs.filter((l) => l.level === 'warn' || l.level === 'error').length;
   const isReal = settings.mode === 'live' && settings.live.environment === 'real';
 

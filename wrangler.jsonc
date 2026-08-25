@@ -7,6 +7,31 @@
     "directory": "./dist",
     "binding": "ASSETS",
     "not_found_handling": "single-page-application",
-    "run_worker_first": ["/api/*"]
-  }
+    "run_worker_first": ["/api/*", "/agent/*", "/mcp", "/mcp/*"]
+  },
+  "observability": {
+    "enabled": true
+  },
+  "triggers": {
+    "crons": ["0 * * * *"]
+  },
+  "vars": {
+    "ALLOWED_ORIGINS": "http://localhost:5173",
+    "PUBLIC_URL": "https://etorodashboard.simone-torricelli-00.workers.dev"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "torino",
+      "database_id": "f99e8874-c834-482e-974f-185839e8defa",
+      "remote": true
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "STATE",
+      "id": "fe836b2ef63b4ec8adcb32380b29de84",
+      "remote": true
+    }
+  ]
 }

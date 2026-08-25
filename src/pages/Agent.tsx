@@ -384,7 +384,7 @@ export default function Agent() {
         <div className="mt-4 grid gap-3 md:grid-cols-3">
           <AgentMechanic icon={<BrainCircuit className="h-4 w-4" aria-hidden />} title="1. Legge i segnali" copy="Prezzo live eToro e, per media mobile o RSI, candele giornaliere reali. Non inventa previsioni né cambia gli asset della regola." />
           <AgentMechanic icon={<Scale className="h-4 w-4" aria-hidden />} title="2. Applica i limiti" copy="Controlla budget del gruppo, importo per ordine, cooldown, massimo ordini giornalieri e kill switch prima di creare un ordine." />
-          <AgentMechanic icon={<Clock3 className="h-4 w-4" aria-hidden />} title="3. Esegue solo mentre è operativo" copy="In questa versione il motore gira quando Torino è aperto. La cadenza di ribilanciamento delle strategie è salvata, ma non invia ancora ribilanciamenti automatici." />
+          <AgentMechanic icon={<Clock3 className="h-4 w-4" aria-hidden />} title="3. Esegue solo mentre è operativo" copy="In questa versione il motore gira quando Torri è aperto. La cadenza di ribilanciamento delle strategie è salvata, ma non invia ancora ribilanciamenti automatici." />
         </div>
         <div className="mt-3 rounded-lg border border-agent/25 bg-agent/5 px-3 py-2.5 text-caption leading-relaxed text-text-1">
           <span className="font-medium text-agent">Come deve entrare l’AI:</span> analizza regime di mercato, volatilità, correlazioni, trend e fondamentali; propone nuovi pesi con motivazione e confidenza. Un motore deterministico separato applica universo consentito, turnover massimo, riserva cash e limiti di perdita prima di autorizzare qualsiasi ordine. L’AI non deve poter aggirare questi vincoli.

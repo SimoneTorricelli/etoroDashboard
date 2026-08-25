@@ -1,5 +1,5 @@
 /**
- * Tipi condivisi del data layer di Torino.
+ * Tipi condivisi del data layer di Torri.
  * Il provider Live e gli import reali producono queste strutture.
  * Gli import devono usare `import type` (verbatimModuleSyntax).
  */
