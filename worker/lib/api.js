@@ -23,7 +23,7 @@ import {
 import { buildPolicyUniverse } from './universe-policy.js';
 import {
   audit, equityHistory, getRunBundle, listRuns, listWatcherEvents, loadConfig,
-  loadLedger, saveConfig, DEFAULT_CONFIG,
+  loadLedger, mutateSafetyConfig, saveConfig, DEFAULT_CONFIG,
 } from './db.js';
 
 /** Confronto a tempo costante: evita di rivelare il token per timing. */
@@ -67,7 +67,6 @@ const NUMERIC_BOUNDS = {
   rebalanceWeekday: [1, 7],
   rebalanceDayOfMonth: [1, 28],
   rebalanceHour: [0, 23],
-  rebalanceMinute: [0, 59],
   llmTemperature: [0, 1.5],
   llmMaxTokens: [256, 8000],
   fallbackEurUsd: [0.5, 2],
@@ -106,6 +105,16 @@ export function sanitizeConfigPatch(patch) {
       'lastManagedCapitalAt', 'lastManagedEurUsd', 'realCapitalTrackingStartedAt',
     ].includes(key)) {
       rejected.push(`${key}: gestito esclusivamente dal flusso token Agent`);
+      continue;
+    }
+
+    if (key === 'rebalanceMinute') {
+      const numeric = Number(value);
+      if (![0, 15, 30, 45].includes(numeric)) {
+        rejected.push('rebalanceMinute: usa uno dei minuti 0, 15, 30, 45');
+        continue;
+      }
+      out[key] = numeric;
       continue;
     }
 
@@ -857,7 +866,7 @@ export async function handleAgentApi(request, env, ctx, pathname) {
       return json({ error: 'si può migliorare soltanto un piano AI bloccato dai guardrail' }, 400);
     }
     const result = await runPipeline({ env, kind: 'rebalance', modeOverride: 'dry-run', improveFromRunId: sourceRunId });
-    return json({ ...result, improvedFromRunId: sourceRunId });
+    return json({ ...result, improvedFromRunId: sourceRunId }, result.busy ? 409 : 200);
   }
 
   // POST /agent/runs/:id/retry — corregge una risposta AI invalida, in shadow.
@@ -869,7 +878,7 @@ export async function handleAgentApi(request, env, ctx, pathname) {
       return json({ error: 'si può correggere soltanto una run senza proposta AI valida' }, 400);
     }
     const result = await runPipeline({ env, kind: 'rebalance', modeOverride: 'shadow', retryFromRunId: sourceRunId });
-    return json({ ...result, retriedFromRunId: sourceRunId });
+    return json({ ...result, retriedFromRunId: sourceRunId }, result.busy ? 409 : 200);
   }
 
   // GET|PUT /agent/config
@@ -1088,13 +1097,26 @@ export async function handleAgentApi(request, env, ctx, pathname) {
     if (mode === 'live' && body.confirm !== 'ATTIVA ORDINI REALI') {
       return json({ error: 'per la modalità live serve confirm = "ATTIVA ORDINI REALI"' }, 400);
     }
+    const current = await loadConfig(db);
+    if (mode === 'live' && current.frozen) {
+      return json({
+        error: `Autopilot congelato: ${current.frozenReason || 'freeze attivo'}. Riattivalo esplicitamente prima del live.`,
+        config: current,
+      }, 409);
+    }
     const resolved = await resolveCredentials(db, env);
     const credentials = resolved.values;
-    const current = await loadConfig(db);
     if (mode === 'live' && !hasVerifiedAgentBinding(resolved, current)) {
       return json({ error: 'Agent Portfolio non verificato: genera un nuovo token e attendi la verifica prima del live' }, 400);
     }
-    const config = await saveConfig(db, { executionMode: mode });
+    const config = await mutateSafetyConfig(db, { executionMode: mode });
+    if (mode === 'live' && config.frozen) {
+      const stopped = await mutateSafetyConfig(db, { executionMode: 'shadow' });
+      return json({
+        error: `Autopilot congelato durante il cambio modalità: ${config.frozenReason || 'freeze attivo'}. Il live resta bloccato.`,
+        config: stopped,
+      }, 409);
+    }
     await audit(db, null, 'warn', 'config', `Modalità di esecuzione impostata su ${mode}`);
     await notify(credentials, mode === 'live' ? 'critical' : 'info', `Autopilot: modalità ${mode}`, [
       mode === 'live' ? 'Da ora gli ordini vengono inviati davvero su eToro.' : 'Nessun ordine reale verrà inviato.',
@@ -1102,15 +1124,33 @@ export async function handleAgentApi(request, env, ctx, pathname) {
     return json({ config });
   }
 
-  // POST /agent/freeze | /agent/unfreeze
+  // POST /agent/safe-stop | /agent/freeze | /agent/unfreeze
+  if (route === 'safe-stop' && method === 'POST') {
+    const reason = String(body.reason ?? 'arresto remoto in sicurezza').slice(0, 300);
+    const config = await mutateSafetyConfig(db, {
+      executionMode: 'shadow',
+      frozen: true,
+      frozenReason: reason,
+    });
+    await audit(db, null, 'warn', 'config', `Arresto in sicurezza: ${reason}`);
+    return json({ ok: true, config });
+  }
   if (route === 'freeze' && method === 'POST') {
     const reason = String(body.reason ?? 'freeze manuale').slice(0, 300);
-    const config = await saveConfig(db, { frozen: true, frozenReason: reason });
+    const config = await mutateSafetyConfig(db, {
+      executionMode: 'shadow',
+      frozen: true,
+      frozenReason: reason,
+    });
     await audit(db, null, 'warn', 'config', `Agente congelato: ${reason}`);
     return json({ config });
   }
   if (route === 'unfreeze' && method === 'POST') {
-    const config = await saveConfig(db, { frozen: false, frozenReason: '' });
+    const config = await mutateSafetyConfig(db, {
+      executionMode: 'shadow',
+      frozen: false,
+      frozenReason: '',
+    });
     await audit(db, null, 'warn', 'config', 'Agente riattivato');
     return json({ config });
   }
@@ -1129,7 +1169,7 @@ export async function handleAgentApi(request, env, ctx, pathname) {
       }
     }
     const result = await runPipeline({ env, kind, modeOverride });
-    return json(result);
+    return json(result, result.busy ? 409 : 200);
   }
 
   // GET|PUT|DELETE /agent/credentials

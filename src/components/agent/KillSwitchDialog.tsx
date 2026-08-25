@@ -70,10 +70,11 @@ export function KillSwitchDialog({ open, onOpenChange, onEngage }: KillSwitchDia
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2 text-loss">
               <OctagonX className="h-5 w-5" aria-hidden />
-              Kill switch — Interrompi tutto
+              Kill switch — Interrompi l’Agent locale
             </DialogTitle>
             <DialogDescription className="text-text-1">
-              Interrompi immediatamente tutte le regole e cancella la coda di conferma.
+              Interrompi immediatamente tutte le regole locali e cancella la coda di conferma.
+              Questo comando non arresta l’Autopilot server-side.
               Le posizioni aperte non verranno chiuse.
             </DialogDescription>
           </DialogHeader>
@@ -117,7 +118,7 @@ export function KillSwitchDialog({ open, onOpenChange, onEngage }: KillSwitchDia
               aria-hidden
             />
             <span className="relative">
-              {ready ? 'Tieni premuto per interrompere tutto' : 'Pulsante bloccato'}
+              {ready ? 'Tieni premuto per interrompere l’Agent locale' : 'Pulsante bloccato'}
             </span>
           </button>
           <p className="text-caption text-text-2">

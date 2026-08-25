@@ -16,6 +16,7 @@ const TITLES: Record<string, string> = {
   '/mercati': 'Mercati',
   '/portfolio': 'Portfolio',
   '/agent': 'eToro Agent',
+  '/autopilot': 'Autopilot',
   '/fx': 'EUR/USD',
   '/impostazioni': 'Impostazioni',
 };
@@ -28,6 +29,7 @@ export function Header({ onOpenPalette }: { onOpenPalette(): void }) {
   } = useAppData();
 
   const title = TITLES[location.pathname] ?? 'Torri';
+  const isAutopilot = location.pathname.startsWith('/autopilot');
   const unread = logs.filter((l) => l.level === 'warn' || l.level === 'error').length;
   const isReal = settings.mode === 'live' && settings.live.environment === 'real';
 
@@ -107,22 +109,26 @@ export function Header({ onOpenPalette }: { onOpenPalette(): void }) {
       </button>
 
       {/* Environment badge */}
-      <span
-        className={cn(
-          'rounded-md px-2 py-1 text-micro font-semibold uppercase tracking-wide',
-          isReal ? 'border border-loss text-loss' : 'border border-warn text-warn',
-        )}
-      >
-        {isReal ? 'Real' : 'Live'}
-      </span>
+      {!isAutopilot && (
+        <span
+          className={cn(
+            'rounded-md px-2 py-1 text-micro font-semibold uppercase tracking-wide',
+            isReal ? 'border border-loss text-loss' : 'border border-warn text-warn',
+          )}
+        >
+          {isReal ? 'Real' : 'Live'}
+        </span>
+      )}
 
       {/* Account chip */}
-      <div className="hidden items-center gap-2 rounded-lg border border-hairline bg-bg-1 px-2.5 py-1.5 xl:flex">
-        <StatusDot variant={realExecutionActive ? 'error' : 'live'} />
-        <span className="font-mono text-micro text-text-1">
-          {maskKey(settings.live.userKey)}
-        </span>
-      </div>
+      {!isAutopilot && (
+        <div className="hidden items-center gap-2 rounded-lg border border-hairline bg-bg-1 px-2.5 py-1.5 xl:flex">
+          <StatusDot variant={realExecutionActive ? 'error' : 'live'} />
+          <span className="font-mono text-micro text-text-1">
+            {maskKey(settings.live.userKey)}
+          </span>
+        </div>
+      )}
     </header>
   );
 }

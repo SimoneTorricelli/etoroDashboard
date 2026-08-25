@@ -1,6 +1,6 @@
 /**
  * Eventi del watcher: cosa ha visto ogni ora, come l'ha classificato l'AI e
- * perché ha agito o si è fermato.
+ * quale azione propone o perché si è fermato.
  */
 import { useCallback, useEffect, useState } from 'react';
 import { toast } from 'sonner';
@@ -59,7 +59,7 @@ export function WatcherPanel() {
             </CardTitle>
             <CardDescription className="text-text-1">
               Ogni ora fa uno scan gratuito. Solo davanti a un'anomalia reale chiede all'AI se sia un deterioramento strutturale o un
-              eccesso tecnico. Non compra mai dentro il movimento: attende la stabilizzazione.
+              eccesso tecnico. È solo propositivo: non invia ordini automatici, neppure quando Autopilot è live.
             </CardDescription>
           </div>
           <Button variant="outline" size="sm" onClick={() => void load()} disabled={loading}>

@@ -13,6 +13,8 @@ const BASE_KEY = 'torino.autopilot.base-url';
 export type ExecutionMode = 'shadow' | 'dry-run' | 'live';
 export type RunKind = 'heartbeat' | 'snapshot' | 'rebalance' | 'manual';
 
+const EXECUTION_MODES = new Set<ExecutionMode>(['shadow', 'dry-run', 'live']);
+
 export interface WhitelistEntry {
   symbol: string;
   name: string;
@@ -377,8 +379,9 @@ function readStorage(storage: Storage | null, key: string): string {
 }
 
 function writeStorage(storage: Storage | null, key: string, value: string): boolean {
+  if (!storage) return false;
   try {
-    if (value) storage?.setItem(key, value); else storage?.removeItem(key);
+    if (value) storage.setItem(key, value); else storage.removeItem(key);
     return true;
   } catch {
     return false;
@@ -387,6 +390,39 @@ function writeStorage(storage: Storage | null, key: string, value: string): bool
 
 const session = (): Storage | null => { try { return window.sessionStorage; } catch { return null; } };
 const local = (): Storage | null => { try { return window.localStorage; } catch { return null; } };
+
+function browserOrigin(): string {
+  try { return window.location.origin; } catch { return ''; }
+}
+
+/**
+ * L'API Autopilot vive sempre alla radice del Worker. Accettiamo quindi soltanto
+ * origini HTTP(S): un URL copiato dalla barra del browser (per esempio con
+ * `/autopilot`) viene ricondotto alla sua origin invece di generare richieste a
+ * `/autopilot/agent/*`, che il fallback SPA potrebbe rispondere con HTML 200.
+ */
+export function normalizeBaseUrl(value: string, sameOrigin = browserOrigin()): string {
+  const candidate = String(value ?? '').trim() || String(sameOrigin ?? '').trim();
+  if (!candidate) return '';
+
+  let parsed: URL;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    throw new Error('URL del Worker non valido: usa un indirizzo completo che inizi con http:// o https://.');
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    throw new Error('URL del Worker non valido: sono ammessi soltanto indirizzi http:// o https://.');
+  }
+  const loopbackHosts = new Set(['localhost', '127.0.0.1', '[::1]']);
+  if (parsed.protocol === 'http:' && !loopbackHosts.has(parsed.hostname)) {
+    throw new Error('URL del Worker non sicuro: fuori dal computer locale è obbligatorio usare https://.');
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error('URL del Worker non valido: non inserire credenziali nell’indirizzo.');
+  }
+  return parsed.origin;
+}
 
 export function getControlToken(): string {
   if (memoryToken) return memoryToken;
@@ -412,16 +448,25 @@ export function isTokenRemembered(): boolean {
   return Boolean(readStorage(local(), TOKEN_KEY));
 }
 
-/** Base URL del Worker. Vuota = stessa origine del sito. */
+/** Base URL del Worker. Un valore vuoto viene risolto sulla stessa origine. */
 export function getBaseUrl(): string {
   if (memoryBaseUrl !== null) return memoryBaseUrl;
-  memoryBaseUrl = readStorage(local(), BASE_KEY);
+  const stored = readStorage(local(), BASE_KEY);
+  try {
+    memoryBaseUrl = normalizeBaseUrl(stored);
+  } catch {
+    // Recupero da valori storici/corrotti: la stessa origine resta la scelta più
+    // sicura e permette alla schermata di connessione di essere riaperta.
+    memoryBaseUrl = normalizeBaseUrl('');
+    writeStorage(local(), BASE_KEY, memoryBaseUrl);
+  }
   return memoryBaseUrl;
 }
 
-export function setBaseUrl(url: string): void {
-  memoryBaseUrl = url.replace(/\/+$/, '');
+export function setBaseUrl(url: string): string {
+  memoryBaseUrl = normalizeBaseUrl(url);
   writeStorage(local(), BASE_KEY, memoryBaseUrl);
+  return memoryBaseUrl;
 }
 
 export class AutopilotError extends Error {
@@ -432,6 +477,65 @@ export class AutopilotError extends Error {
     this.name = 'AutopilotError';
     this.status = status;
   }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function invalidApiPayload(path: string, detail: string): never {
+  throw new AutopilotError(
+    `Risposta non valida da ${path}: ${detail}. Controlla l’URL del Worker e assicurati che backend e dashboard siano aggiornati.`,
+    502,
+  );
+}
+
+function isRunSummary(value: unknown): value is RunSummary {
+  if (!isRecord(value)) return false;
+  return typeof value.id === 'string'
+    && typeof value.kind === 'string'
+    && typeof value.started_at === 'number'
+    && (value.finished_at === null || typeof value.finished_at === 'number')
+    && typeof value.status === 'string'
+    && EXECUTION_MODES.has(value.execution_mode as ExecutionMode);
+}
+
+function validateStatePayload(value: unknown): AutopilotState {
+  if (!isRecord(value)) invalidApiPayload('/agent/state', 'era atteso un oggetto JSON');
+  if (!isRecord(value.config)) invalidApiPayload('/agent/state', 'manca la configurazione Autopilot');
+  if (!EXECUTION_MODES.has(value.config.executionMode as ExecutionMode)) {
+    invalidApiPayload('/agent/state', 'la modalità di esecuzione è assente o sconosciuta');
+  }
+  if (value.lastRun !== null && !isRunSummary(value.lastRun)) {
+    invalidApiPayload('/agent/state', 'il campo lastRun non è compatibile');
+  }
+  if (!Array.isArray(value.recentRuns) || !value.recentRuns.every(isRunSummary)) {
+    invalidApiPayload('/agent/state', 'il campo recentRuns non è un elenco valido');
+  }
+  if (!Array.isArray(value.equityCurve)) invalidApiPayload('/agent/state', 'manca la curva del capitale');
+  if (!Array.isArray(value.credentials)) invalidApiPayload('/agent/state', 'manca lo stato delle credenziali');
+  for (const key of ['equityUsd', 'highWaterMarkUsd', 'drawdownPct'] as const) {
+    if (typeof value[key] !== 'number' || !Number.isFinite(value[key])) {
+      invalidApiPayload('/agent/state', `il campo ${key} non è numerico`);
+    }
+  }
+  if (typeof value.agentBindingVerified !== 'boolean' || typeof value.notificationsActive !== 'boolean') {
+    invalidApiPayload('/agent/state', 'mancano gli indicatori di collegamento Agent');
+  }
+  return value as unknown as AutopilotState;
+}
+
+function validateRunsPayload(value: unknown): { runs: RunSummary[] } {
+  if (!isRecord(value) || !Array.isArray(value.runs)) {
+    invalidApiPayload('/agent/runs', 'manca l’elenco delle esecuzioni');
+  }
+  if (!value.runs.every(isRunSummary)) invalidApiPayload('/agent/runs', 'una o più esecuzioni hanno un formato incompatibile');
+  return { runs: value.runs } as { runs: RunSummary[] };
+}
+
+function isJsonContentType(value: string | null): boolean {
+  const mediaType = String(value ?? '').split(';', 1)[0].trim().toLowerCase();
+  return mediaType === 'application/json' || mediaType.endsWith('+json');
 }
 
 async function call<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -447,12 +551,24 @@ async function call<T>(path: string, init: RequestInit = {}): Promise<T> {
     cache: 'no-store',
   });
   const text = await response.text();
-  let body: unknown = {};
-  try { body = text ? JSON.parse(text) : {}; } catch { body = { error: text }; }
+  if (!isJsonContentType(response.headers.get('content-type'))) {
+    const received = response.headers.get('content-type')?.split(';', 1)[0] || 'contenuto senza Content-Type';
+    const message = response.ok
+      ? `L’URL configurato non punta all’API Autopilot: ricevuto ${received} invece di JSON. Usa solo l’origine del Worker, senza /autopilot o /agent.`
+      : `Il server ha risposto HTTP ${response.status} con ${received} invece di JSON. Controlla l’URL del Worker.`;
+    throw new AutopilotError(message, response.ok ? 502 : response.status);
+  }
+  let body: unknown;
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    throw new AutopilotError(`Il Worker ha restituito JSON non leggibile per ${path}. Riprova o aggiorna il deployment.`, 502);
+  }
   if (!response.ok) {
-    const message = (body as { error?: string }).error ?? `HTTP ${response.status}`;
+    const message = isRecord(body) && typeof body.error === 'string' ? body.error : `HTTP ${response.status}`;
     throw new AutopilotError(message, response.status);
   }
+  if (!isRecord(body)) invalidApiPayload(path, 'era atteso un oggetto JSON');
   return body as T;
 }
 
@@ -508,8 +624,8 @@ async function streamStrategyDraft<TDraft>(
 }
 
 export const autopilot = {
-  state: () => call<AutopilotState>('/agent/state'),
-  runs: (limit = 30) => call<{ runs: RunSummary[] }>(`/agent/runs?limit=${limit}`),
+  state: async () => validateStatePayload(await call<unknown>('/agent/state')),
+  runs: async (limit = 30) => validateRunsPayload(await call<unknown>(`/agent/runs?limit=${limit}`)),
   run: (id: string) => call<RunBundle>(`/agent/runs/${encodeURIComponent(id)}`),
   improveRun: (id: string) => call<{ runId: string; status: string; error?: string; reason?: string; improvedFromRunId: string }>(`/agent/runs/${encodeURIComponent(id)}/improve`, { method: 'POST', body: '{}' }),
   retryRun: (id: string) => call<{ runId: string; status: string; error?: string; reason?: string; retriedFromRunId: string }>(`/agent/runs/${encodeURIComponent(id)}/retry`, { method: 'POST', body: '{}' }),
@@ -522,6 +638,7 @@ export const autopilot = {
       body: JSON.stringify(mode === 'live' ? { mode, confirm: 'ATTIVA ORDINI REALI' } : { mode }),
     }),
   freeze: (reason: string) => call<{ config: AutopilotConfig }>('/agent/freeze', { method: 'POST', body: JSON.stringify({ reason }) }),
+  safeStop: (reason: string) => call<{ config: AutopilotConfig }>('/agent/safe-stop', { method: 'POST', body: JSON.stringify({ reason }) }),
   unfreeze: () => call<{ config: AutopilotConfig }>('/agent/unfreeze', { method: 'POST', body: '{}' }),
   trigger: (kind: 'snapshot' | 'rebalance', mode?: ExecutionMode) =>
     call<{ runId: string; status: string; error?: string }>('/agent/trigger', {

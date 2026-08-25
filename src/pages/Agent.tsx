@@ -9,11 +9,11 @@
  */
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
-import { useSearchParams } from 'react-router';
+import { Link, useSearchParams } from 'react-router';
 import { motion } from 'framer-motion';
 import {
   Bot, BrainCircuit, Clock3, Copy, Download, EllipsisVertical, OctagonX, Pencil, Play, Plus, Power,
-  Scale, Trash2, Zap, Info,
+  Scale, Trash2, Zap, Info, Radar,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { Toaster } from '@/components/ui/sonner';
@@ -317,7 +317,7 @@ export default function Agent() {
               className="flex items-center gap-1.5 rounded-lg border border-loss bg-loss/15 px-3 py-2 text-body-strong text-loss transition-colors hover:bg-loss/25"
             >
               <Power className="h-4 w-4" aria-hidden />
-              Disattiva kill switch
+              Disattiva stop locale
             </button>
           ) : (
             <button
@@ -326,13 +326,34 @@ export default function Agent() {
               className="flex items-center gap-1.5 rounded-lg border border-loss/60 px-3 py-2 text-body-strong text-loss transition-all hover:bg-loss/10 hover:shadow-[0_0_12px_#F4556B33]"
             >
               <OctagonX className="h-4 w-4" aria-hidden />
-              Interrompi tutto
+              Interrompi Agent locale
             </button>
           )}
         </div>
       </div>
 
       {/* ── ROW 0: banner di sicurezza ──────────────────────────────── */}
+      <motion.section {...stagger(0)} className="col-span-12 rounded-xl border border-agent/30 bg-agent/5 p-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex min-w-0 items-start gap-3">
+            <Radar className="mt-0.5 size-5 shrink-0 text-agent" aria-hidden />
+            <div>
+              <p className="text-sm font-semibold text-text-0">Questa pagina è locale al browser</p>
+              <p className="mt-0.5 text-xs leading-relaxed text-text-1">
+                Regole, gruppi e portafogli mostrati qui non sono l’Autopilot server-side. La strategia che continua a PC spento,
+                il capitale reale e l’arresto remoto si gestiscono nella pagina Autopilot.
+              </p>
+            </div>
+          </div>
+          <Link
+            to="/autopilot"
+            className="inline-flex shrink-0 items-center gap-2 rounded-lg bg-agent px-3 py-2 text-sm font-semibold text-bg-0 transition-opacity hover:opacity-90"
+          >
+            <Radar className="size-4" aria-hidden /> Apri Autopilot
+          </Link>
+        </div>
+      </motion.section>
+
       {realExecutionActive && masterEnabled && (
         <RiskBanner
           variant="danger"
@@ -346,7 +367,7 @@ export default function Agent() {
           variant="danger"
           dismissible={false}
           className="col-span-12"
-          message="KILL SWITCH attivo — tutte le regole sono interrotte. Le posizioni aperte non verranno chiuse automaticamente."
+          message="KILL SWITCH locale attivo — tutte le regole di questo browser sono interrotte. L’Autopilot server-side non viene arrestato e le posizioni aperte non vengono chiuse automaticamente."
         />
       )}
       {!killEngaged && autoExecute && masterEnabled && (
@@ -562,7 +583,7 @@ export default function Agent() {
         onOpenChange={setKillOpen}
         onEngage={() => {
           agent.engageKillSwitch();
-          toast.error('KILL SWITCH attivato — tutte le regole interrotte');
+          toast.error('KILL SWITCH locale attivato — regole del browser interrotte');
         }}
       />
 

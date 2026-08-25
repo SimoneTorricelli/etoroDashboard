@@ -8,7 +8,7 @@
  */
 import { runPipeline } from './pipeline.js';
 import {
-  equityHistory, getRunBundle, listRuns, loadConfig, saveConfig, audit,
+  equityHistory, getRunBundle, listRuns, loadConfig, mutateSafetyConfig, saveConfig, audit,
 } from './db.js';
 import { sanitizeConfigPatch } from './api.js';
 
@@ -252,11 +252,11 @@ async function callTool(env, name, args) {
     case 'autopilot_freeze': {
       const reason = String(args?.reason ?? 'freeze richiesto via MCP').slice(0, 300);
       await audit(db, null, 'warn', 'mcp', `Freeze via MCP: ${reason}`);
-      return toolText(await saveConfig(db, { frozen: true, frozenReason: reason }));
+      return toolText(await mutateSafetyConfig(db, { executionMode: 'shadow', frozen: true, frozenReason: reason }));
     }
     case 'autopilot_unfreeze': {
       await audit(db, null, 'warn', 'mcp', 'Unfreeze via MCP');
-      return toolText(await saveConfig(db, { frozen: false, frozenReason: '' }));
+      return toolText(await mutateSafetyConfig(db, { executionMode: 'shadow', frozen: false, frozenReason: '' }));
     }
     default:
       throw new Error(`tool sconosciuto: ${name}`);

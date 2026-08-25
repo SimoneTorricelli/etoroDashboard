@@ -171,8 +171,8 @@ export default {
   },
 
   /**
-   * Cron orario. Il tipo di run è deciso sull'ora locale Europe/Rome, così il
-   * passaggio ora legale/solare non sposta il ribilanciamento.
+   * Cron ogni 15 minuti. Il tipo di run è deciso sull'ora locale Europe/Rome,
+   * così il passaggio ora legale/solare non sposta il ribilanciamento.
    */
   async scheduled(event, env, ctx) {
     ctx.waitUntil((async () => {
@@ -181,6 +181,7 @@ export default {
       const config = await loadConfig(env.DB);
       const parts = romeParts(new Date(event.scheduledTime));
       const kind = decideKind(config, parts);
+      if (kind === null) return;
       if (kind === 'heartbeat' && config.frozen) return;
       await runPipeline({ env, kind });
     })());

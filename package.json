@@ -8,6 +8,7 @@
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview",
+    "test:autopilot-api": "node --test test/autopilot-api.test.mjs",
     "test:worker": "node worker/selftest.mjs",
     "db:migrate": "wrangler d1 execute torino --remote --file=worker/schema.sql",
     "db:migrate:local": "wrangler d1 execute torino --local --file=worker/schema.sql",

@@ -12,17 +12,17 @@ import { buildShortlist, renderShortlistPrompt } from './screening.js';
 import { askBrain } from './brain.js';
 import { exposureGroupFor, uniqueExposureCount } from './exposure.js';
 import { validateProposal } from './validator.js';
-import { executePlan, reconcile, deterministicId } from './executor.js';
+import { executePlan, reconcile } from './executor.js';
 import { describeLedger } from './churn.js';
 import { classifyAnomaly, decideWatcherAction, detectAnomalies } from './watcher.js';
 import { notify } from './notify.js';
 import { PROFILES, describeProfile } from './profiles.js';
 import { hasVerifiedAgentBinding, resolveCredentials, missingRequired, saveCredentials } from './vault.js';
 import {
-  audit, cacheUniverse, countOpportunisticThisWeek, countOrdersToday, equityHistory,
+  acquirePipelineLock, audit, cacheUniverse, countOpportunisticThisWeek, countOrdersToday, equityHistory,
   finishRun, getRunBundle, listWatcherEvents, loadConfig, loadLedger, loadUniverseCache, recordEquity,
-  recordLedgerTrade, saveConfig, saveFeatures, saveProposal, saveSnapshot, saveValidation,
-  saveWatcherEvent, startRun, syncLedger, upsertOrder,
+  mutateSafetyConfig, recordLedgerTrade, releasePipelineLock, renewPipelineLock, saveConfig, saveFeatures,
+  saveProposal, saveSnapshot, saveValidation, saveWatcherEvent, startRun, syncLedger,
 } from './db.js';
 
 const KV_CANDLES_BUNDLE = 'candles:v2:bundle';
@@ -194,16 +194,32 @@ export function romeParts(date = new Date()) {
     minute: Number(parts.minute),
     day: Number(parts.day),
     dateKey: `${parts.year}-${parts.month}-${parts.day}`,
+    // Durante il ritorno all'ora solare le 02:xx locali esistono due volte.
+    // Contrassegniamo la seconda occorrenza per evitare due run automatiche.
+    fold: (() => {
+      const previous = Object.fromEntries(formatter.formatToParts(new Date(date.getTime() - 60 * 60 * 1000)).map((part) => [part.type, part.value]));
+      return previous.year === parts.year
+        && previous.month === parts.month
+        && previous.day === parts.day
+        && previous.hour === parts.hour
+        && previous.minute === parts.minute ? 1 : 0;
+    })(),
   };
 }
 
 /** Decide che tipo di run eseguire in base a cadenza e ora locale italiana. */
 export function decideKind(config, parts) {
-  if (parts.hour === config.rebalanceHour) {
+  // Il cron scatta ogni quarto d'ora. La seconda occorrenza di un orario
+  // duplicato dal ritorno all'ora solare non deve generare una seconda run.
+  if (parts.fold === 1) return null;
+  if (parts.hour === config.rebalanceHour && parts.minute === config.rebalanceMinute) {
     if (config.cadence === 'daily' && parts.weekday <= 5) return 'rebalance';
     if (config.cadence === 'weekly' && parts.weekday === config.rebalanceWeekday) return 'rebalance';
     if (config.cadence === 'monthly' && parts.day === config.rebalanceDayOfMonth) return 'rebalance';
   }
+  // Snapshot e heartbeat restano orari: i tick :15, :30 e :45 che non
+  // corrispondono a un ribilanciamento non devono avviare la pipeline.
+  if (parts.minute !== 0) return null;
   if ((config.snapshotHours ?? []).includes(parts.hour)) return 'snapshot';
   return 'heartbeat';
 }
@@ -418,7 +434,7 @@ export async function loadCandles(client, env, universe, options = {}) {
  * Scan orario. Il gate deterministico fa sì che l'AI venga interpellata solo
  * per anomalie reali: nella stragrande maggioranza delle ore non costa nulla.
  */
-async function runWatcher({ env, db, config, credentials, client, snapshot, features, universe, candles, external, runId, mode }) {
+export async function runWatcher({ env, db, config, credentials, snapshot, features, universe, candles, external, runId }) {
   const anomalies = detectAnomalies({ universe, candles, features, config });
   if (!anomalies.length) return { anomalies: 0, escalated: 0, actions: [] };
 
@@ -437,7 +453,7 @@ async function runWatcher({ env, db, config, credentials, client, snapshot, feat
     const verdict = await classifyAnomaly({ config, credentials, env, anomaly, news: external.news });
     escalated += 1;
 
-    let decision = decideWatcherAction({
+    const decision = decideWatcherAction({
       anomaly, verdict, config, ledger, budgetUsd,
       opportunisticThisWeek: opportunisticThisWeek + actions.filter((item) => item.action === 'buy').length,
       equityUsd: snapshot.equityUsd,
@@ -447,35 +463,10 @@ async function runWatcher({ env, db, config, credentials, client, snapshot, feat
       ordersToday: ordersToday + actions.filter((item) => item.executed).length,
     });
 
-    let executed = false;
-    if (decision.action === 'buy' && mode === 'live' && !config.frozen) {
-      const id = await deterministicId(runId, `watch-${anomaly.symbol}`, anomaly.symbol, 'buy');
-      try {
-        const executionScale = Number(snapshot.executionScale) > 0 ? Number(snapshot.executionScale) : 1;
-        const executionAmountUsd = roundMoney(decision.amountUsd * executionScale);
-        const eligibility = await client.eligibility([anomaly.instrumentId]);
-        const eligible = eligibility.get(anomaly.instrumentId);
-        if (!eligible?.allowOpenPosition) {
-          decision = { action: 'noop', reason: `${anomaly.symbol}: mercato chiuso o strumento non negoziabile` };
-          await audit(db, runId, 'warn', 'watcher', decision.reason);
-        } else if (executionAmountUsd + 0.005 < eligible.minPositionUsd) {
-          decision = { action: 'noop', reason: `${anomaly.symbol}: importo sotto il minimo reale equivalente di ${roundMoney(eligible.minPositionUsd / executionScale)} USD` };
-          await audit(db, runId, 'warn', 'watcher', decision.reason);
-        } else {
-          const response = await client.openOrder({ instrumentId: anomaly.instrumentId, amountUsd: executionAmountUsd, requestId: id });
-          await upsertOrder(db, {
-            id, runId, seq: 900, symbol: anomaly.symbol, instrumentId: anomaly.instrumentId,
-            side: 'buy', amountUsd: decision.amountUsd, mode, state: 'sent',
-            etoroOrderId: String(response?.orderId ?? '') || null,
-            message: `opportunistico: ${decision.reason}`.slice(0, 500),
-          });
-          await recordLedgerTrade(db, anomaly.symbol, 'buy', { opportunistic: true, averagingDown: anomaly.held });
-          executed = true;
-        }
-      } catch (error) {
-        await audit(db, runId, 'error', 'watcher', `Ordine opportunistico fallito su ${anomaly.symbol}`, { message: error.message });
-      }
-    }
+    // Il Watcher resta deliberatamente propositivo: finché non passa dallo
+    // stesso executor idempotente e dalla riconciliazione del rebalance, non
+    // possiede alcun percorso capace di chiamare openOrder/closeOrder.
+    const executed = false;
 
     await saveWatcherEvent(db, {
       symbol: anomaly.symbol,
@@ -497,7 +488,7 @@ async function runWatcher({ env, db, config, credentials, client, snapshot, feat
         `Watcher · ${anomaly.symbol} ${anomaly.metrics.dayChangePct}%`, [
           `Classificazione: ${verdict?.classification} (confidence ${verdict?.confidence?.toFixed(2)})`,
           verdict?.rationale ?? '',
-          executed ? `Acquisto opportunistico eseguito: ${decision.amountUsd} USD` : `Azione proposta: ${decision.action}${mode === 'live' ? '' : ' (modalità non live: nessun ordine)'}`,
+          `Azione proposta: ${decision.action} (Watcher solo propositivo: nessun ordine automatico)`,
         ]);
     }
   }
@@ -505,10 +496,120 @@ async function runWatcher({ env, db, config, credentials, client, snapshot, feat
   return { anomalies: anomalies.length, escalated, actions };
 }
 
+/**
+ * Chiusura fail-safe di qualunque esito ambiguo dopo l'ingresso nel live.
+ * Ogni effetto è tentato indipendentemente: un webhook guasto non può impedire
+ * né il freeze atomico né la chiusura della run come `frozen`.
+ */
+export async function freezeLiveRun({ db, runId, credentials = {}, equityUsd = null, reason, stage = 'live-fail-safe', data = null }) {
+  const safeReason = String(reason || 'esito live ambiguo: verifica manuale richiesta').slice(0, 300);
+  const failures = [];
+  let config = null;
+
+  // Un solo retry immediato copre un errore D1 transitorio senza trasformare
+  // il fail-safe in un loop o prolungare in modo imprevedibile la run.
+  for (let attempt = 1; attempt <= 2 && !config; attempt += 1) {
+    try {
+      config = await mutateSafetyConfig(db, {
+        executionMode: 'shadow',
+        frozen: true,
+        frozenReason: safeReason,
+      });
+    } catch (error) {
+      failures.push(`freeze D1 tentativo ${attempt}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  try {
+    await audit(db, runId, 'error', stage, `Autopilot congelato: ${safeReason}`, {
+      ...data,
+      safetyPersisted: Boolean(config),
+      failures,
+    });
+  } catch (error) {
+    failures.push(`audit: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  try {
+    await notify(credentials, 'critical', 'Autopilot congelato: verifica eToro', [
+      safeReason,
+      'La modalità è stata riportata in shadow. Controlla manualmente ordini e posizioni prima di riattivare.',
+    ]);
+  } catch (error) {
+    failures.push(`notifica: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  try {
+    await finishRun(db, runId, 'frozen', equityUsd, safeReason);
+  } catch (error) {
+    failures.push(`finishRun: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  if (failures.length) {
+    console.error(JSON.stringify({ message: 'fail-safe live completato con errori', runId, failures }));
+  }
+  return { config, safetyPersisted: Boolean(config), failures, reason: safeReason };
+}
+
 // ---------------------------------------------------------------- pipeline
 
-export async function runPipeline({ env, kind, modeOverride, improveFromRunId = '', retryFromRunId = '' }) {
+function createRunId(kind) {
+  return `${new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}-${kind}-${crypto.randomUUID().slice(0, 8)}`;
+}
+
+/**
+ * Unico ingresso alla pipeline. Cron, API e MCP competono sulla stessa riga
+ * D1; chi trova un lease valido torna busy senza creare una nuova run.
+ */
+export async function runPipeline(args) {
+  const { env, kind } = args;
   const db = env.DB;
+  const runId = createRunId(kind);
+  let lock;
+  try {
+    lock = await acquirePipelineLock(db, runId);
+  } catch (error) {
+    const message = `lock pipeline non disponibile: ${error instanceof Error ? error.message : String(error)}`;
+    console.error(JSON.stringify({ message, kind }));
+    return { runId: null, status: 'blocked', busy: true, reason: 'lock-unavailable', error: message };
+  }
+
+  if (!lock.acquired) {
+    const message = `Pipeline già occupata dalla run ${lock.ownerId ?? 'sconosciuta'}`;
+    try {
+      await audit(db, null, 'warn', 'lock', message, { leaseUntil: lock.leaseUntil, requestedKind: kind });
+    } catch { /* il lock resta la fonte autorevole anche se l'audit non riesce */ }
+    return {
+      runId: null,
+      status: 'blocked',
+      busy: true,
+      reason: 'busy',
+      error: message,
+      activeRunId: lock.ownerId,
+      leaseUntil: lock.leaseUntil,
+    };
+  }
+
+  try {
+    return await runPipelineWithLock({ ...args, runId });
+  } finally {
+    try {
+      await releasePipelineLock(db, runId);
+    } catch (error) {
+      console.error(JSON.stringify({
+        message: 'rilascio lock pipeline fallito',
+        runId,
+        error: error instanceof Error ? error.message : String(error),
+      }));
+    }
+  }
+}
+
+async function runPipelineWithLock({ env, kind, modeOverride, improveFromRunId = '', retryFromRunId = '', runId }) {
+  const db = env.DB;
+  const renewLease = async (stage) => {
+    if (!await renewPipelineLock(db, runId)) {
+      throw new Error(`lease pipeline perso prima della fase ${stage}`);
+    }
+  };
   const config = await loadConfig(db);
   if (config.strategySpec?.diversification) {
     const preferredByPolicy = Number(config.strategySpec.diversification.preferredPositions) || 0;
@@ -528,8 +629,6 @@ export async function runPipeline({ env, kind, modeOverride, improveFromRunId = 
     ],
     maxHoldings: config.strategySpec.diversification?.maxPositions ?? baseProfile.maxHoldings,
   } : baseProfile;
-  const runId = `${new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}-${kind}-${crypto.randomUUID().slice(0, 8)}`;
-
   await startRun(db, runId, kind, mode);
   await audit(db, runId, 'info', 'start', `Run ${kind} avviata in modalità ${mode} · profilo ${profile.label}`);
   const sourceRunId = improveFromRunId || retryFromRunId;
@@ -560,6 +659,7 @@ export async function runPipeline({ env, kind, modeOverride, improveFromRunId = 
 
   let equityUsd = null;
   let credentials = {};
+  let livePhaseEntered = false;
   try {
     const resolved = await resolveCredentials(db, env);
     credentials = resolved.values;
@@ -635,11 +735,12 @@ export async function runPipeline({ env, kind, modeOverride, improveFromRunId = 
     await audit(db, runId, 'info', 'snapshot', `Capitale reale eToro: equity ${snapshot.equityUsd} USD, cash ${snapshot.cashUsd} USD, ${snapshot.positions.length} posizioni`, {
       hwm, drawdown, source: snapshot.source, mirrorId: snapshot.mirrorId,
     });
+    await renewLease('analisi');
 
     // --- 2. Circuit breaker ------------------------------------------------
     if (drawdown > config.drawdownStopPct && !config.frozen) {
       const reason = `drawdown ${(drawdown * 100).toFixed(1)}% oltre la soglia ${(config.drawdownStopPct * 100).toFixed(0)}%`;
-      await saveConfig(db, { frozen: true, frozenReason: reason });
+      await mutateSafetyConfig(db, { executionMode: 'shadow', frozen: true, frozenReason: reason });
       await audit(db, runId, 'error', 'circuit-breaker', `Agente congelato: ${reason}`);
       await notify(credentials, 'critical', 'Autopilot congelato', [reason, `Capitale reale ${snapshot.equityUsd} USD · massimo storico reale ${hwm} USD`]);
       await finishRun(db, runId, 'frozen', equityUsd, reason);
@@ -696,7 +797,7 @@ export async function runPipeline({ env, kind, modeOverride, improveFromRunId = 
 
     // --- 4. Watcher (gira su heartbeat e snapshot) -------------------------
     if (kind !== 'rebalance' && config.watcherEnabled) {
-      const result = await runWatcher({ env, db, config, credentials, client, snapshot, features, universe, candles, external, runId, mode });
+      const result = await runWatcher({ env, db, config, credentials, snapshot, features, universe, candles, external, runId });
       await finishRun(db, runId, 'ok', equityUsd);
       return { runId, status: 'ok', kind, equityUsd, watcher: result };
     }
@@ -730,6 +831,8 @@ export async function runPipeline({ env, kind, modeOverride, improveFromRunId = 
     }
 
     // --- 6. Cervello -------------------------------------------------------
+
+    await renewLease('cervello');
 
     const shortlistWithWeights = screening.shortlist.map((item) => ({
       ...item,
@@ -790,6 +893,8 @@ export async function runPipeline({ env, kind, modeOverride, improveFromRunId = 
     }
 
     // --- 8. Esecuzione -----------------------------------------------------
+    await renewLease('esecuzione');
+    if (mode === 'live') livePhaseEntered = true;
     const execution = await executePlan({ db, client, runId, plan: validation.plan, mode, config });
     if (mode === 'live') {
       for (const record of execution.results) {
@@ -801,18 +906,70 @@ export async function runPipeline({ env, kind, modeOverride, improveFromRunId = 
     await audit(db, runId, 'info', 'executor', `Esecuzione in modalità ${mode}: ${execution.results.length} ordini`,
       execution.results.map((item) => ({ symbol: item.symbol, side: item.side, amount: item.amountUsd, state: item.state })));
 
+    let liveFailSafeReason = null;
+    if (mode === 'live') {
+      const failedOrders = execution.results.filter((item) => item.state === 'failed');
+      if (failedOrders.length) {
+        liveFailSafeReason = `esito ambiguo durante l'invio live (${failedOrders.map((item) => item.symbol).join(', ')})`;
+      } else if (/stato di sicurezza non leggibile|agente congelato/i.test(String(execution.error ?? ''))) {
+        liveFailSafeReason = String(execution.error);
+      }
+
+      // Eligibility negata o cambio esplicito a shadow prima di qualunque POST
+      // sono esiti noti e possono chiudere blocked. Un errore safety/read resta
+      // invece ambiguo e congela anche se nessuna richiesta è stata tentata.
+      if (execution.blocked && !execution.executed) {
+        const reason = execution.error
+          || execution.eligibility?.issues?.join(' · ')
+          || 'esecuzione live bloccata prima dell’invio';
+        if (liveFailSafeReason) {
+          const safety = await freezeLiveRun({
+            db, runId, credentials, equityUsd, reason: liveFailSafeReason,
+            stage: 'executor-fail-safe', data: { execution },
+          });
+          return { runId, status: 'frozen', reason: safety.reason, safety, mode, plan: validation.plan, execution };
+        }
+        await audit(db, runId, 'warn', 'executor', `Run live bloccata senza invii: ${reason}`);
+        await finishRun(db, runId, 'blocked', equityUsd, reason);
+        return { runId, status: 'blocked', reason, mode, plan: validation.plan, execution };
+      }
+    }
+
     // --- 9. Riconciliazione ------------------------------------------------
     let reconciliation = null;
     if (mode === 'live' && execution.executed) {
+      await renewLease('riconciliazione');
       reconciliation = await reconcile({ client, plan: validation.plan, config, portfolioUserKey });
       await audit(db, runId, reconciliation.ok ? 'info' : 'error', 'reconcile', `Divergenza massima ${(reconciliation.worstDivergence * 100).toFixed(2)}%`, reconciliation.rows);
       if (!reconciliation.ok) {
-        await saveConfig(db, { frozen: true, frozenReason: `riconciliazione fuori tolleranza (${(reconciliation.worstDivergence * 100).toFixed(2)}%)` });
-        await notify(credentials, 'critical', 'Autopilot congelato dopo riconciliazione', [
-          `Divergenza ${(reconciliation.worstDivergence * 100).toFixed(2)}%`,
-          'Verifica manualmente le posizioni su eToro.',
-        ]);
+        liveFailSafeReason = `riconciliazione fuori tolleranza (${(reconciliation.worstDivergence * 100).toFixed(2)}%)`;
       }
+    }
+
+    if (mode === 'live' && liveFailSafeReason) {
+      const safety = await freezeLiveRun({
+        db, runId, credentials, equityUsd, reason: liveFailSafeReason,
+        stage: 'reconcile-fail-safe', data: { execution, reconciliation },
+      });
+      return {
+        runId,
+        status: 'frozen',
+        reason: safety.reason,
+        safety,
+        mode,
+        plan: validation.plan,
+        execution,
+        reconciliation,
+      };
+    }
+
+    // Un safe-stop può arrivare dopo uno o più invii. In quel caso si tenta la
+    // riconciliazione, ma la run non deve mai risultare ok.
+    if (mode === 'live' && execution.blocked) {
+      const reason = execution.error || 'esecuzione live interrotta da un controllo di sicurezza';
+      await audit(db, runId, 'warn', 'executor', `Run live interrotta: ${reason}`);
+      await finishRun(db, runId, 'blocked', equityUsd, reason);
+      return { runId, status: 'blocked', reason, mode, plan: validation.plan, execution, reconciliation };
     }
 
     await notify(credentials, 'info', `Autopilot ${mode} · ${validation.plan.orders.length} ordini`, [
@@ -824,6 +981,18 @@ export async function runPipeline({ env, kind, modeOverride, improveFromRunId = 
     return { runId, status: 'ok', mode, plan: validation.plan, execution, reconciliation, screening: dynamic ? screening.shortlist.length : null };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    if (mode === 'live' && livePhaseEntered) {
+      const safety = await freezeLiveRun({
+        db,
+        runId,
+        credentials,
+        equityUsd,
+        reason: `errore ambiguo dopo ingresso nella fase live: ${message}`,
+        stage: 'pipeline-live-fail-safe',
+        data: { error: message },
+      });
+      return { runId, status: 'frozen', reason: safety.reason, safety, error: message };
+    }
     await audit(db, runId, 'error', 'pipeline', message);
     await finishRun(db, runId, 'error', equityUsd, message);
     await notify(credentials, 'warn', 'Autopilot: run fallita', [message]);

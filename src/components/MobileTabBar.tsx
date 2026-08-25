@@ -1,6 +1,6 @@
 /**
  * MobileTabBar — bottom tab bar <768px con 5 voci (design.md):
- * Panoramica, Mercati, Portfolio, Agent, Altro (→ Autopilot/FX/Impostazioni).
+ * Panoramica, Portfolio, Agent, Autopilot, Altro (→ Mercati/FX/Impostazioni).
  */
 import { useState } from 'react';
 import { NavLink, useLocation, useNavigate } from 'react-router';
@@ -9,13 +9,13 @@ import { cn } from '@/lib/utils';
 
 const TABS = [
   { to: '/', label: 'Panoramica', icon: LayoutDashboard },
-  { to: '/mercati', label: 'Mercati', icon: CandlestickChart },
   { to: '/portfolio', label: 'Portfolio', icon: Wallet },
   { to: '/agent', label: 'Agent', icon: Bot },
+  { to: '/autopilot', label: 'Autopilot', icon: Radar },
 ];
 
 const MORE = [
-  { to: '/autopilot', label: 'Autopilot', icon: Radar },
+  { to: '/mercati', label: 'Mercati', icon: CandlestickChart },
   { to: '/fx', label: 'EUR/USD', icon: Repeat },
   { to: '/impostazioni', label: 'Impostazioni', icon: Settings },
 ];

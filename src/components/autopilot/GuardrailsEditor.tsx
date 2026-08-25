@@ -189,9 +189,20 @@ export function GuardrailsEditor({ config, onSaved }: Props) {
               </Field>
             )}
 
-            <Field label="Ora (Europe/Rome)" help="Il cron si sveglia ogni ora e agisce in questa fascia. L’ora legale è gestita in automatico.">
+            <Field label="Ora (Europe/Rome)" help="L’ora locale del ribilanciamento. L’ora legale è gestita in automatico.">
               <Input type="number" min={0} max={23} value={draft.rebalanceHour}
                 onChange={(event) => set('rebalanceHour', Number(event.target.value))} />
+            </Field>
+
+            <Field label="Minuto" help="Il Worker controlla la pianificazione ogni 15 minuti.">
+              <Select value={String(draft.rebalanceMinute)} onValueChange={(value) => set('rebalanceMinute', Number(value))}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  {[0, 15, 30, 45].map((minute) => (
+                    <SelectItem key={minute} value={String(minute)}>:{String(minute).padStart(2, '0')}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </Field>
 
             <Field label="Budget strategico (EUR)" help="È il budget scelto durante l’onboarding per progettare la strategia. Durante le run, importi, grafici e ordini usano invece il capitale reale letto direttamente dal mirror eToro.">
@@ -297,8 +308,8 @@ export function GuardrailsEditor({ config, onSaved }: Props) {
           </div>
           <p className="text-xs leading-relaxed text-text-1">
             Ogni ora cerca anomalie con un calcolo gratuito. Solo davanti a un movimento fuori scala chiede all'AI se sia un
-            deterioramento strutturale o un eccesso tecnico, e in quest'ultimo caso può comprare — ma mai durante il crollo,
-            solo dopo la stabilizzazione, e solo entro il budget dedicato.
+            deterioramento strutturale o un eccesso tecnico. Dopo la stabilizzazione può proporre un acquisto entro il budget,
+            ma non invia ordini automatici, neppure in modalità live.
           </p>
           {draft.watcherEnabled && (
             <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
@@ -310,11 +321,11 @@ export function GuardrailsEditor({ config, onSaved }: Props) {
                 <Input type="number" min={1} max={80} value={pct(draft.watcherSpikePct)}
                   onChange={(event) => set('watcherSpikePct', fromPct(event.target.value))} />
               </Field>
-              <Field label="Budget opportunistico (%)" help="Quota di portafoglio riservata a queste operazioni. Tienila piccola: è la parte più speculativa.">
+              <Field label="Budget proposto (%)" help="Quota massima associata a una singola proposta opportunistica; il Watcher non esegue direttamente l'ordine.">
                 <Input type="number" min={0} max={50} value={pct(draft.opportunisticBudgetPct)}
                   onChange={(event) => set('opportunisticBudgetPct', fromPct(event.target.value))} />
               </Field>
-              <Field label="Operazioni per settimana" help="Tetto settimanale. Impedisce che un mercato in caduta svuoti la cassa in tre giorni.">
+              <Field label="Proposte per settimana" help="Tetto settimanale alle proposte opportunistiche, per limitare rumore e ripetizioni.">
                 <Input type="number" min={0} max={10} value={draft.maxOpportunisticPerWeek}
                   onChange={(event) => set('maxOpportunisticPerWeek', Number(event.target.value))} />
               </Field>

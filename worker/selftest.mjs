@@ -12,7 +12,9 @@ import {
   askBrain, extractJson, extractJsonResult, findNormalizedProposal, normalizeProposal, prioritizeAlternativeProvider,
   prioritizeUntriedPlan, selectDiverseAttemptPlan,
 } from './lib/brain.js';
-import { DEFAULT_CONFIG } from './lib/db.js';
+import {
+  acquirePipelineLock, DEFAULT_CONFIG, mutateSafetyConfig, releasePipelineLock, renewPipelineLock,
+} from './lib/db.js';
 import { PROFILES, applyProfile, describeProfile, listProfiles } from './lib/profiles.js';
 import { checkChurnRules, filterMarginalSubstitutions, isWorthTheCost } from './lib/churn.js';
 import { buildShortlist, scoreInstrument } from './lib/screening.js';
@@ -22,17 +24,154 @@ import {
   buildAttemptPlan, callModel, extractModelText, listFreeModels, prioritizeReviewPlan,
   llmErrorDebug, safeModelOutputPreview, supportsNativeJson,
 } from './lib/llm.js';
-import { buildCandleRefreshQueue, buildFailedProposalRetryContext, scaleAgentSnapshotToReal, shortlistDeploymentCapacity } from './lib/pipeline.js';
+import {
+  buildCandleRefreshQueue, buildFailedProposalRetryContext, decideKind, romeParts,
+  freezeLiveRun, runPipeline, runWatcher, scaleAgentSnapshotToReal, shortlistDeploymentCapacity,
+} from './lib/pipeline.js';
 import { buildStrategyActivationNotification } from './lib/notify.js';
 import { EtoroClient } from './lib/etoro.js';
 import { serveStaticAsset } from './index.js';
-import { applyGuidedGuardrailsWithChanges, validateReviewArithmetic } from './lib/api.js';
+import {
+  applyGuidedGuardrailsWithChanges, handleAgentApi, sanitizeConfigPatch, validateReviewArithmetic,
+} from './lib/api.js';
 import { buildSafeStrategySpec, createDefaultOnboardingAnswers } from './lib/strategy.js';
 
 const DAY = 24 * 60 * 60 * 1000;
 
 const tests = [];
 const test = (name, fn) => tests.push([name, fn]);
+
+function createSafetyDb(initialConfig = {}, { safetyReads = [], pipelineLock = null } = {}) {
+  const state = {
+    config: { ...DEFAULT_CONFIG, ...initialConfig },
+    configReads: 0,
+    mutationQueries: [],
+    orders: new Map(),
+    audits: [],
+    pipelineLock: pipelineLock ? { ...pipelineLock } : null,
+    runStarts: 0,
+    finishedRuns: [],
+  };
+  const db = {
+    state,
+    prepare(sql) {
+      return {
+        args: [],
+        bind(...args) { this.args = args; return this; },
+        async first() {
+          if (sql.startsWith('INSERT INTO pipeline_lock')) {
+            const [lockKey, ownerId, acquiredAt, leaseUntil] = this.args;
+            const current = state.pipelineLock;
+            if (!current || current.lease_until <= acquiredAt || current.owner_id === ownerId) {
+              state.pipelineLock = {
+                lock_key: lockKey,
+                owner_id: ownerId,
+                acquired_at: acquiredAt,
+                lease_until: leaseUntil,
+              };
+              return { ...state.pipelineLock };
+            }
+            return null;
+          }
+          if (sql.startsWith('SELECT owner_id, acquired_at, lease_until FROM pipeline_lock')) {
+            return state.pipelineLock ? { ...state.pipelineLock } : null;
+          }
+          if (sql.startsWith('UPDATE pipeline_lock')) {
+            const [leaseUntil, lockKey, ownerId, renewedAt] = this.args;
+            if (state.pipelineLock?.lock_key === lockKey
+              && state.pipelineLock.owner_id === ownerId
+              && state.pipelineLock.lease_until > renewedAt) {
+              state.pipelineLock.lease_until = leaseUntil;
+              return { owner_id: ownerId, lease_until: leaseUntil };
+            }
+            return null;
+          }
+          if (sql.startsWith('DELETE FROM pipeline_lock')) {
+            const [lockKey, ownerId] = this.args;
+            if (state.pipelineLock?.lock_key === lockKey && state.pipelineLock.owner_id === ownerId) {
+              state.pipelineLock = null;
+              return { owner_id: ownerId };
+            }
+            return null;
+          }
+          if (sql.includes('json_patch') && sql.includes('RETURNING value')) {
+            const patch = JSON.parse(this.args[2]);
+            state.config = { ...state.config, ...patch };
+            state.mutationQueries.push({ sql, args: this.args });
+            return { value: JSON.stringify(state.config) };
+          }
+          if (sql.startsWith('SELECT value FROM config')) {
+            const planned = safetyReads[state.configReads];
+            state.configReads += 1;
+            if (planned instanceof Error) throw planned;
+            if (planned) state.config = { ...state.config, ...planned };
+            return { value: JSON.stringify(state.config) };
+          }
+          if (sql.startsWith('SELECT * FROM orders WHERE id = ?')) {
+            return state.orders.get(this.args[0]) ?? null;
+          }
+          throw new Error(`first() non gestito nel fake D1: ${sql.slice(0, 80)}`);
+        },
+        async run() {
+          if (sql.startsWith('INSERT INTO orders')) {
+            const [
+              id, runId, seq, createdAt, updatedAt, symbol, instrumentId, side,
+              amountUsd, positionId, mode, orderState, etoroOrderId, positionIds,
+              filledUsd, message,
+            ] = this.args;
+            const previous = state.orders.get(id) ?? {};
+            state.orders.set(id, {
+              ...previous,
+              id,
+              run_id: runId,
+              runId,
+              seq,
+              created_at: previous.created_at ?? createdAt,
+              updated_at: updatedAt,
+              symbol,
+              instrument_id: instrumentId,
+              instrumentId,
+              side,
+              amount_usd: amountUsd,
+              amountUsd,
+              position_id: positionId,
+              positionId,
+              mode,
+              state: orderState,
+              etoro_order_id: etoroOrderId,
+              etoroOrderId,
+              position_ids: positionIds,
+              filled_usd: filledUsd,
+              filledUsd,
+              message,
+            });
+            return { success: true, meta: { changes: 1 }, results: [] };
+          }
+          if (sql.startsWith('INSERT INTO audit')) {
+            state.audits.push(this.args);
+            return { success: true, meta: { changes: 1 }, results: [] };
+          }
+          if (sql.startsWith('INSERT INTO runs')) {
+            state.runStarts += 1;
+            return { success: true, meta: { changes: 1 }, results: [] };
+          }
+          if (sql.startsWith('UPDATE runs SET finished_at')) {
+            state.finishedRuns.push({
+              finishedAt: this.args[0],
+              status: this.args[1],
+              equityUsd: this.args[2],
+              error: this.args[3],
+              runId: this.args[4],
+            });
+            return { success: true, meta: { changes: 1 }, results: [] };
+          }
+          throw new Error(`run() non gestito nel fake D1: ${sql.slice(0, 80)}`);
+        },
+      };
+    },
+  };
+  return db;
+}
 
 function syntheticSeries(start, days, drift, noiseSeed = 1) {
   const rows = [];
@@ -79,6 +218,75 @@ const external = {
   fundamentals: [],
   diagnostics: [],
 };
+
+test('scheduler: il rebalance scatta soltanto al quarto d’ora configurato', () => {
+  const weekly = {
+    ...DEFAULT_CONFIG,
+    cadence: 'weekly',
+    rebalanceWeekday: 1,
+    rebalanceHour: 9,
+    rebalanceMinute: 30,
+    snapshotHours: [8, 9],
+  };
+  assert.equal(decideKind(weekly, { weekday: 1, day: 24, hour: 9, minute: 30, fold: 0 }), 'rebalance');
+  assert.equal(decideKind(weekly, { weekday: 1, day: 24, hour: 9, minute: 15, fold: 0 }), null);
+  assert.equal(decideKind(weekly, { weekday: 1, day: 24, hour: 9, minute: 45, fold: 0 }), null);
+  assert.equal(decideKind(weekly, { weekday: 2, day: 25, hour: 9, minute: 30, fold: 0 }), null);
+});
+
+test('scheduler: snapshot e heartbeat partono soltanto al minuto zero', () => {
+  const scheduled = { ...DEFAULT_CONFIG, rebalanceHour: 9, rebalanceMinute: 30, snapshotHours: [8] };
+  assert.equal(decideKind(scheduled, { weekday: 2, day: 25, hour: 8, minute: 0, fold: 0 }), 'snapshot');
+  assert.equal(decideKind(scheduled, { weekday: 2, day: 25, hour: 8, minute: 15, fold: 0 }), null);
+  assert.equal(decideKind(scheduled, { weekday: 2, day: 25, hour: 10, minute: 0, fold: 0 }), 'heartbeat');
+  assert.equal(decideKind(scheduled, { weekday: 2, day: 25, hour: 10, minute: 45, fold: 0 }), null);
+});
+
+test('scheduler: Europe/Rome segue ora legale e sopprime il secondo orario duplicato', () => {
+  const beforeSpring = romeParts(new Date('2026-03-29T00:30:00.000Z'));
+  const afterSpring = romeParts(new Date('2026-03-29T01:30:00.000Z'));
+  assert.deepEqual(
+    [beforeSpring.dateKey, beforeSpring.hour, beforeSpring.minute],
+    ['2026-03-29', 1, 30],
+  );
+  assert.deepEqual(
+    [afterSpring.dateKey, afterSpring.hour, afterSpring.minute],
+    ['2026-03-29', 3, 30],
+  );
+
+  const firstAutumn = romeParts(new Date('2026-10-25T00:30:00.000Z'));
+  const secondAutumn = romeParts(new Date('2026-10-25T01:30:00.000Z'));
+  assert.deepEqual(
+    [firstAutumn.dateKey, firstAutumn.hour, firstAutumn.minute, firstAutumn.fold],
+    ['2026-10-25', 2, 30, 0],
+  );
+  assert.deepEqual(
+    [secondAutumn.dateKey, secondAutumn.hour, secondAutumn.minute, secondAutumn.fold],
+    ['2026-10-25', 2, 30, 1],
+  );
+  const sundayAtTwoThirty = {
+    ...DEFAULT_CONFIG,
+    cadence: 'weekly',
+    rebalanceWeekday: 7,
+    rebalanceHour: 2,
+    rebalanceMinute: 30,
+  };
+  assert.equal(decideKind(sundayAtTwoThirty, firstAutumn), 'rebalance');
+  assert.equal(decideKind(sundayAtTwoThirty, secondAutumn), null);
+});
+
+test('config: rebalanceMinute accetta soltanto i quarti d’ora del cron', () => {
+  for (const minute of [0, 15, 30, 45]) {
+    const result = sanitizeConfigPatch({ rebalanceMinute: minute });
+    assert.equal(result.patch.rebalanceMinute, minute);
+    assert.deepEqual(result.rejected, []);
+  }
+  for (const minute of [-1, 1, 14, 31, 59, 15.5, 'non valido']) {
+    const result = sanitizeConfigPatch({ rebalanceMinute: minute });
+    assert.equal(result.patch.rebalanceMinute, undefined);
+    assert.ok(result.rejected.some((item) => item.startsWith('rebalanceMinute:')));
+  }
+});
 
 const features = buildFeatures({ snapshot, universe, candles, external, config: DEFAULT_CONFIG, equityHistory: [] });
 const config = { ...DEFAULT_CONFIG, whitelist: [...universe.values()] };
@@ -1176,6 +1384,294 @@ test('reconcile: confronta gli ordini scalati, non il target teorico', async () 
   assert.equal(result.rows[0].expectedWeight, 0.3);
   assert.equal(result.rows[0].actualWeight, 0.3);
   assert.equal(result.ok, true);
+});
+
+test('pipeline lock: acquire, renew e release rispettano owner e lease', async () => {
+  const db = createSafetyDb();
+  const first = await acquirePipelineLock(db, 'run-a', { now: 1_000, leaseMs: 2_000 });
+  assert.equal(first.acquired, true);
+  assert.equal(first.leaseUntil, 3_000);
+
+  const busy = await acquirePipelineLock(db, 'run-b', { now: 1_500, leaseMs: 2_000 });
+  assert.equal(busy.acquired, false);
+  assert.equal(busy.ownerId, 'run-a');
+  assert.equal(await releasePipelineLock(db, 'run-b'), false, 'un owner concorrente non può rilasciare il lease');
+  assert.equal(await renewPipelineLock(db, 'run-a', { now: 2_000, leaseMs: 3_000 }), true);
+  assert.equal(db.state.pipelineLock.lease_until, 5_000);
+  assert.equal(await releasePipelineLock(db, 'run-a'), true);
+  assert.equal(db.state.pipelineLock, null);
+});
+
+test('pipeline lock: un lease scaduto può essere acquisito senza che il vecchio owner lo cancelli', async () => {
+  const db = createSafetyDb();
+  await acquirePipelineLock(db, 'run-old', { now: 1_000, leaseMs: 1_000 });
+  const takeover = await acquirePipelineLock(db, 'run-new', { now: 2_000, leaseMs: 1_000 });
+  assert.equal(takeover.acquired, true);
+  assert.equal(takeover.ownerId, 'run-new');
+  assert.equal(await releasePipelineLock(db, 'run-old'), false);
+  assert.equal(db.state.pipelineLock.owner_id, 'run-new');
+});
+
+test('pipeline: una seconda richiesta torna busy senza creare una run', async () => {
+  const db = createSafetyDb({}, {
+    pipelineLock: {
+      lock_key: 'global',
+      owner_id: 'cron-attivo',
+      acquired_at: Date.now() - 1_000,
+      lease_until: Date.now() + 60_000,
+    },
+  });
+  const result = await runPipeline({ env: { DB: db }, kind: 'rebalance' });
+  assert.equal(result.status, 'blocked');
+  assert.equal(result.busy, true);
+  assert.equal(result.reason, 'busy');
+  assert.equal(result.activeRunId, 'cron-attivo');
+  assert.equal(db.state.runStarts, 0);
+  assert.equal(db.state.configReads, 0);
+});
+
+test('live fail-safe: congela in shadow e chiude la run frozen', async () => {
+  const db = createSafetyDb({ executionMode: 'live', frozen: false });
+  const result = await freezeLiveRun({
+    db,
+    runId: 'live-ambiguo',
+    credentials: {},
+    equityUsd: 1_234,
+    reason: 'riconciliazione fuori tolleranza (8.00%)',
+    stage: 'reconcile-fail-safe',
+    data: { worstDivergence: 0.08 },
+  });
+  assert.equal(result.safetyPersisted, true);
+  assert.equal(db.state.config.executionMode, 'shadow');
+  assert.equal(db.state.config.frozen, true);
+  assert.match(db.state.config.frozenReason, /riconciliazione fuori tolleranza/);
+  assert.equal(db.state.finishedRuns.at(-1).status, 'frozen');
+  assert.equal(db.state.finishedRuns.at(-1).runId, 'live-ambiguo');
+  assert.ok(db.state.audits.some((args) => args[3] === 'reconcile-fail-safe'));
+});
+
+test('watcher: il percorso propositivo non contiene chiamate dirette agli ordini', () => {
+  const source = runWatcher.toString();
+  assert.doesNotMatch(source, /client\.(?:openOrder|closeOrder)\s*\(/);
+});
+
+test('safety config: safe-stop aggiorna i tre campi in una sola query atomica', async () => {
+  const db = createSafetyDb({
+    executionMode: 'live',
+    frozen: false,
+    frozenReason: '',
+    strategyName: 'Strategia da preservare',
+  });
+  const config = await mutateSafetyConfig(db, {
+    executionMode: 'shadow',
+    frozen: true,
+    frozenReason: 'stop remoto di test',
+  });
+  assert.equal(config.executionMode, 'shadow');
+  assert.equal(config.frozen, true);
+  assert.equal(config.frozenReason, 'stop remoto di test');
+  assert.equal(config.strategyName, 'Strategia da preservare');
+  assert.equal(db.state.mutationQueries.length, 1);
+  assert.match(db.state.mutationQueries[0].sql, /json_patch/);
+  assert.equal(db.state.configReads, 0, 'nessun read-modify-write separato');
+});
+
+test('control API: safe-stop congela e torna in shadow atomicamente', async () => {
+  const db = createSafetyDb({ executionMode: 'live', frozen: false });
+  const request = new Request('https://example.test/agent/safe-stop', {
+    method: 'POST',
+    headers: { authorization: 'Bearer control-test', 'content-type': 'application/json' },
+    body: JSON.stringify({ reason: 'telefono offline' }),
+  });
+  const response = await handleAgentApi(request, { DB: db, CONTROL_TOKEN: 'control-test' }, null, '/agent/safe-stop');
+  const body = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(body.config.executionMode, 'shadow');
+  assert.equal(body.config.frozen, true);
+  assert.equal(body.config.frozenReason, 'telefono offline');
+  assert.equal(db.state.mutationQueries.length, 1);
+});
+
+test('control API: freeze forza shadow oltre a congelare', async () => {
+  const db = createSafetyDb({ executionMode: 'live', frozen: false });
+  const request = new Request('https://example.test/agent/freeze', {
+    method: 'POST',
+    headers: { authorization: 'Bearer control-test', 'content-type': 'application/json' },
+    body: JSON.stringify({ reason: 'stop dal telefono' }),
+  });
+  const response = await handleAgentApi(request, { DB: db, CONTROL_TOKEN: 'control-test' }, null, '/agent/freeze');
+  const body = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(body.config.executionMode, 'shadow');
+  assert.equal(body.config.frozen, true);
+  assert.equal(body.config.frozenReason, 'stop dal telefono');
+  assert.equal(db.state.mutationQueries.length, 1);
+});
+
+test('control API: unfreeze resta in shadow e non riattiva il live', async () => {
+  const db = createSafetyDb({ executionMode: 'live', frozen: true, frozenReason: 'stop dal telefono' });
+  const request = new Request('https://example.test/agent/unfreeze', {
+    method: 'POST',
+    headers: { authorization: 'Bearer control-test', 'content-type': 'application/json' },
+    body: '{}',
+  });
+  const response = await handleAgentApi(request, { DB: db, CONTROL_TOKEN: 'control-test' }, null, '/agent/unfreeze');
+  const body = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(body.config.executionMode, 'shadow');
+  assert.equal(body.config.frozen, false);
+  assert.equal(body.config.frozenReason, '');
+  assert.equal(db.state.mutationQueries.length, 1);
+});
+
+test('control API: il live viene rifiutato quando il freeze è attivo', async () => {
+  const db = createSafetyDb({ executionMode: 'shadow', frozen: true, frozenReason: 'verifica manuale' });
+  const request = new Request('https://example.test/agent/mode', {
+    method: 'POST',
+    headers: { authorization: 'Bearer control-test', 'content-type': 'application/json' },
+    body: JSON.stringify({ mode: 'live', confirm: 'ATTIVA ORDINI REALI' }),
+  });
+  const response = await handleAgentApi(request, { DB: db, CONTROL_TOKEN: 'control-test' }, null, '/agent/mode');
+  const body = await response.json();
+  assert.equal(response.status, 409);
+  assert.match(body.error, /congelato/i);
+  assert.equal(db.state.mutationQueries.length, 0);
+});
+
+function liveExecutorPlan() {
+  return {
+    executionScale: 1,
+    orders: [
+      { seq: 1, symbol: 'AAA', instrumentId: 101, side: 'buy', amountUsd: 20 },
+      { seq: 2, symbol: 'BBB', instrumentId: 102, side: 'buy', amountUsd: 20 },
+      { seq: 3, symbol: 'CCC', instrumentId: 103, side: 'buy', amountUsd: 20 },
+    ],
+  };
+}
+
+function liveExecutorClient(onSend, onEligibility = () => {}) {
+  return {
+    eligibility: async (ids) => {
+      onEligibility(ids);
+      return new Map(ids.map((id) => [id, { allowOpenPosition: true, minPositionUsd: 1 }]));
+    },
+    openOrder: async ({ instrumentId }) => {
+      onSend(instrumentId);
+      return { orderId: `order-${instrumentId}` };
+    },
+    lookupOrder: async () => ({ state: 'filled', filledUsd: 20, positionIds: [1], label: 'Filled' }),
+  };
+}
+
+test('executor live: un cambio a shadow interrompe gli invii successivi', async () => {
+  const db = createSafetyDb({}, {
+    safetyReads: [
+      { executionMode: 'live', frozen: false, frozenReason: '' },
+      { executionMode: 'live', frozen: false, frozenReason: '' },
+      { executionMode: 'shadow', frozen: false, frozenReason: '' },
+    ],
+  });
+  const sent = [];
+  const result = await executePlan({
+    db,
+    client: liveExecutorClient((instrumentId) => sent.push(instrumentId)),
+    runId: 'safe-mode-change',
+    plan: liveExecutorPlan(),
+    mode: 'live',
+    config: DEFAULT_CONFIG,
+  });
+  assert.deepEqual(sent, [101]);
+  assert.deepEqual(result.results.map((item) => item.state), ['filled', 'skipped', 'skipped']);
+  assert.match(result.results[1].message, /modalità corrente shadow/);
+  assert.equal(db.state.configReads, 3, 'controlla prima dell’eligibility e subito prima di ciascun invio');
+});
+
+test('executor live: freeze prima del primo ordine blocca l’intero piano', async () => {
+  const db = createSafetyDb({}, {
+    safetyReads: [{ executionMode: 'live', frozen: true, frozenReason: 'safe-stop mobile' }],
+  });
+  const sent = [];
+  let eligibilityCalls = 0;
+  const result = await executePlan({
+    db,
+    client: liveExecutorClient((instrumentId) => sent.push(instrumentId), () => { eligibilityCalls += 1; }),
+    runId: 'safe-frozen',
+    plan: liveExecutorPlan(),
+    mode: 'live',
+    config: DEFAULT_CONFIG,
+  });
+  assert.deepEqual(sent, []);
+  assert.equal(eligibilityCalls, 0, 'il freeze blocca anche il pre-check remoto');
+  assert.ok(result.results.every((item) => item.state === 'skipped'));
+  assert.ok(result.results.every((item) => /safe-stop mobile/.test(item.message)));
+});
+
+test('executor live: freeze dopo intent converte current e remaining in skipped senza duplicati', async () => {
+  const db = createSafetyDb({}, {
+    safetyReads: [
+      { executionMode: 'live', frozen: false, frozenReason: '' },
+      { executionMode: 'live', frozen: true, frozenReason: 'race safe-stop' },
+    ],
+  });
+  const sent = [];
+  const result = await executePlan({
+    db,
+    client: liveExecutorClient((instrumentId) => sent.push(instrumentId)),
+    runId: 'safe-after-intent',
+    plan: liveExecutorPlan(),
+    mode: 'live',
+    config: DEFAULT_CONFIG,
+  });
+  assert.deepEqual(sent, []);
+  assert.equal(result.executed, false);
+  assert.equal(result.results.length, 3);
+  assert.equal(new Set(result.results.map((item) => item.id)).size, 3);
+  assert.ok(result.results.every((item) => item.state === 'skipped'));
+  assert.ok([...db.state.orders.values()].every((item) => item.state === 'skipped'));
+  assert.ok(result.results.every((item) => /race safe-stop/.test(item.message)));
+  assert.equal(db.state.configReads, 2);
+});
+
+test('executor live: read D1 fallito dopo intent converte il piano in skipped', async () => {
+  const db = createSafetyDb({}, {
+    safetyReads: [
+      { executionMode: 'live', frozen: false, frozenReason: '' },
+      new Error('D1 perso dopo intent'),
+    ],
+  });
+  const sent = [];
+  const result = await executePlan({
+    db,
+    client: liveExecutorClient((instrumentId) => sent.push(instrumentId)),
+    runId: 'safe-read-after-intent',
+    plan: liveExecutorPlan(),
+    mode: 'live',
+    config: DEFAULT_CONFIG,
+  });
+  assert.deepEqual(sent, []);
+  assert.equal(result.executed, false);
+  assert.equal(result.results.length, 3);
+  assert.ok(result.results.every((item) => item.state === 'skipped'));
+  assert.ok(result.results.every((item) => /D1 perso dopo intent/.test(item.message)));
+});
+
+test('executor live: errore di lettura D1 fallisce chiuso senza chiamare eToro', async () => {
+  const db = createSafetyDb({}, { safetyReads: [new Error('D1 temporaneamente indisponibile')] });
+  const sent = [];
+  let eligibilityCalls = 0;
+  const result = await executePlan({
+    db,
+    client: liveExecutorClient((instrumentId) => sent.push(instrumentId), () => { eligibilityCalls += 1; }),
+    runId: 'safe-read-error',
+    plan: liveExecutorPlan(),
+    mode: 'live',
+    config: DEFAULT_CONFIG,
+  });
+  assert.deepEqual(sent, []);
+  assert.equal(eligibilityCalls, 0, 'un read fallito non raggiunge eToro');
+  assert.ok(result.results.every((item) => item.state === 'skipped'));
+  assert.ok(result.results.every((item) => /stato di sicurezza non leggibile/.test(item.message)));
 });
 
 test('executor: qualunque modalità non esatta fallisce senza ordini', async () => {

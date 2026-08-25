@@ -5,7 +5,7 @@
  * un retry della stessa run non può duplicare una posizione, perché l'id è già
  * presente in D1 con stato diverso da `intent`.
  */
-import { upsertOrder, getOrder, audit } from './db.js';
+import { upsertOrder, getOrder, audit, loadConfig } from './db.js';
 
 const round = (value, digits = 2) => Math.round(value * 10 ** digits) / 10 ** digits;
 
@@ -48,10 +48,64 @@ async function checkEligibility(client, orders, executionScale) {
 }
 
 /**
+ * Ultimo cancello prima della rete eToro. Una run può essere partita in live e
+ * ricevere nel frattempo un freeze/safe-stop da un altro dispositivo: per
+ * questo la configurazione viene riletta prima di ogni singolo invio.
+ */
+async function liveSafetyBlock(db) {
+  try {
+    const current = await loadConfig(db);
+    if (current.frozen) {
+      return `agente congelato: ${current.frozenReason || 'freeze attivo'}`;
+    }
+    if (current.executionMode !== 'live') {
+      return `modalità corrente ${String(current.executionMode)}: il live è stato disattivato`;
+    }
+    return null;
+  } catch (error) {
+    return `stato di sicurezza non leggibile: ${error instanceof Error ? error.message : String(error)}`;
+  }
+}
+
+async function skipRemainingForSafety({ db, runId, plan, fromSeq, mode, message, results }) {
+  for (const remaining of plan.orders.filter((item) => item.seq >= fromSeq)) {
+    const id = await deterministicId(runId, remaining.seq, remaining.symbol, remaining.side);
+    const skipped = {
+      id,
+      runId,
+      seq: remaining.seq,
+      symbol: remaining.symbol,
+      instrumentId: remaining.instrumentId,
+      side: remaining.side,
+      amountUsd: remaining.amountUsd,
+      positionId: remaining.positionId,
+      mode,
+      state: 'skipped',
+      message: `non inviato: ${message}`.slice(0, 500),
+    };
+    // Se proprio D1 non è leggibile, l'ordine deve comunque restare bloccato:
+    // la persistenza è best-effort, il risultato in memoria conserva l'esito.
+    try { await upsertOrder(db, skipped); } catch { /* fail closed: nessuna chiamata eToro */ }
+    const existingIndex = results.findIndex((item) => item.id === id);
+    if (existingIndex >= 0) results[existingIndex] = skipped;
+    else results.push(skipped);
+  }
+}
+
+async function stopLivePlanForSafety({ db, runId, plan, fromSeq, mode, message, results }) {
+  try {
+    await audit(db, runId, 'error', 'executor', `Invio live interrotto: ${message}`);
+  } catch { /* il blocco non dipende dall'audit */ }
+  await skipRemainingForSafety({ db, runId, plan, fromSeq, mode, message, results });
+}
+
+/**
  * @param {'shadow'|'dry-run'|'live'} mode
  */
 export async function executePlan({ db, client, runId, plan, mode, config }) {
   const results = [];
+  let liveRequestAttempted = false;
+  let liveSafetyError = null;
   const executionScale = Number(plan.executionScale) > 0 ? Number(plan.executionScale) : 1;
 
   // Fail closed: solo il valore esatto "live" può raggiungere gli endpoint
@@ -71,6 +125,26 @@ export async function executePlan({ db, client, runId, plan, mode, config }) {
       results.push(record);
     }
     return { mode, executed: false, results, eligibility: null };
+  }
+
+  // Il pre-check di ammissibilità interroga eToro. In live verifichiamo lo
+  // stato prima ancora di quella chiamata: un freeze già attivo non deve
+  // avviare alcuna parte dell'esecuzione remota.
+  if (mode === 'live') {
+    const safetyBlock = await liveSafetyBlock(db);
+    if (safetyBlock) {
+      liveSafetyError = safetyBlock;
+      await stopLivePlanForSafety({
+        db,
+        runId,
+        plan,
+        fromSeq: plan.orders[0]?.seq ?? Number.POSITIVE_INFINITY,
+        mode,
+        message: safetyBlock,
+        results,
+      });
+      return { mode, executed: false, results, eligibility: null, blocked: true, error: safetyBlock };
+    }
   }
 
   const eligibility = await checkEligibility(client, plan.orders, executionScale).catch((error) => ({
@@ -113,7 +187,25 @@ export async function executePlan({ db, client, runId, plan, mode, config }) {
 
     await upsertOrder(db, { ...base, state: 'intent', message: 'in invio' });
 
+    // Ultimo gate, deliberatamente dopo l'intent e subito prima della POST
+    // eToro. Se lo stop arriva durante il ciclo, l'intent corrente e tutti gli
+    // ordini seguenti vengono convertiti in skipped prima di uscire.
+    const safetyBlock = await liveSafetyBlock(db);
+    if (safetyBlock) {
+      await stopLivePlanForSafety({
+        db,
+        runId,
+        plan,
+        fromSeq: order.seq,
+        mode,
+        message: safetyBlock,
+        results,
+      });
+      break;
+    }
+
     try {
+      liveRequestAttempted = true;
       const response = order.side === 'buy'
         ? await client.openOrder({ instrumentId: order.instrumentId, amountUsd: executionAmountUsd, requestId: id })
         : await client.closeOrder({ positionId: order.positionId, amountUsd: order.fullExit ? null : executionAmountUsd, requestId: id });
@@ -139,8 +231,15 @@ export async function executePlan({ db, client, runId, plan, mode, config }) {
     }
   }
 
-  if (mode === 'live') await verifyOrders({ db, client, results, executionScale });
-  return { mode, executed: mode === 'live', results, eligibility };
+  if (mode === 'live' && liveRequestAttempted) await verifyOrders({ db, client, results, executionScale });
+  return {
+    mode,
+    executed: mode === 'live' && liveRequestAttempted,
+    results,
+    eligibility,
+    blocked: Boolean(liveSafetyError),
+    error: liveSafetyError,
+  };
 }
 
 /** Due letture ravvicinate dello stato ordine: sufficienti senza rischiare 429. */

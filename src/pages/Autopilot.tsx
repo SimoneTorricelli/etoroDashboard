@@ -4,7 +4,7 @@
  * La pagina non esegue logica di trading: legge e comanda il Worker, unico
  * titolare di credenziali ed esecuzione. Chiudere il browser non ferma l'agente.
  */
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { motion } from 'framer-motion';
 import { toast, Toaster } from 'sonner';
 import {
@@ -194,17 +194,23 @@ const PREVIEW_COLLABORATION: StrategyCollaboration = {
 };
 
 export default function Autopilot() {
-  const [token, setToken] = useState(getControlToken());
-  const [baseUrl, setBase] = useState(getBaseUrl());
+  const [token, setToken] = useState(() => getControlToken());
+  const [baseUrl, setBase] = useState(() => getBaseUrl());
   const [state, setState] = useState<AutopilotState | null>(null);
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [detail, setDetail] = useState<RunBundle | null>(null);
   const [loading, setLoading] = useState(false);
+  const [safeStopping, setSafeStopping] = useState(false);
+  const [lastRefreshedAt, setLastRefreshedAt] = useState<number | null>(null);
+  const [verifiedWorkerOrigin, setVerifiedWorkerOrigin] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [confirmLive, setConfirmLive] = useState(false);
-  const [remember, setRemember] = useState(isTokenRemembered());
+  const [remember, setRemember] = useState(() => (
+    isTokenRemembered()
+    || (typeof window !== 'undefined' && window.matchMedia('(max-width: 767px)').matches)
+  ));
   const [connected, setConnected] = useState(false);
-  const [editingConnection, setEditingConnection] = useState(!getControlToken());
+  const [editingConnection, setEditingConnection] = useState(() => !getControlToken());
   const [storageWarning, setStorageWarning] = useState(false);
   const onboardingQuery = typeof window !== 'undefined'
     ? new URLSearchParams(window.location.search).get('onboarding')
@@ -218,6 +224,7 @@ export default function Autopilot() {
   const [activeTab, setActiveTab] = useState('panoramica');
   const [activatedStrategyName, setActivatedStrategyName] = useState('');
   const [reviewingSavedStrategy, setReviewingSavedStrategy] = useState(false);
+  const refreshSequence = useRef(0);
 
   const closeOnboarding = useCallback(() => {
     setOnboardingOpen(false);
@@ -241,43 +248,98 @@ export default function Autopilot() {
     setOnboardingOpen(true);
   }, []);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async ({ background = false }: { background?: boolean } = {}) => {
     if (!getControlToken()) {
       setState(null);
       setConnected(false);
+      setVerifiedWorkerOrigin(null);
       setEditingConnection(true);
       return false;
     }
-    setLoading(true);
+    const requestId = ++refreshSequence.current;
+    if (!background) setLoading(true);
     setError(null);
     try {
-      const [nextState, nextRuns] = await Promise.all([autopilot.state(), autopilot.runs(40)]);
+      // Lo stato è la fonte critica per modalità e stop remoto. Lo storico è
+      // opzionale: un suo errore non deve far sparire capitale e interruttore.
+      const runsRequest = background
+        ? Promise.resolve(null)
+        : autopilot.runs(40).then((value) => value, () => null);
+      const nextState = await autopilot.state();
+      if (requestId !== refreshSequence.current) return false;
       setState(nextState);
-      setRuns(Array.isArray(nextRuns.runs) ? nextRuns.runs : []);
+      setRuns(Array.isArray(nextState.recentRuns) ? nextState.recentRuns : []);
       setConnected(true);
+      setVerifiedWorkerOrigin(getBaseUrl());
+      setEditingConnection(false);
+      setLastRefreshedAt(Date.now());
+      // Lo storico prosegue senza trattenere refresh e comandi di emergenza.
+      void runsRequest.then((nextRuns) => {
+        if (nextRuns && requestId === refreshSequence.current) setRuns(nextRuns.runs);
+      });
       return true;
     } catch (caught) {
+      if (requestId !== refreshSequence.current) return false;
       setConnected(false);
-      setEditingConnection(true);
+      if (!background) setEditingConnection(true);
       setError(caught instanceof Error ? caught.message : String(caught));
       return false;
     } finally {
-      setLoading(false);
+      if (!background) setLoading(false);
     }
   }, []);
 
   const connect = useCallback(async () => {
-    setBaseUrl(baseUrl);
-    const persisted = setControlToken(token.trim(), remember);
-    setStorageWarning(!persisted);
-    const success = await refresh();
-    if (success) {
-      setEditingConnection(false);
-      toast.success('Autopilot connesso. Dati del Worker caricati.');
+    const previousBaseUrl = getBaseUrl();
+    const previousToken = getControlToken();
+    const previousRemember = isTokenRemembered();
+    const hadVerifiedState = Boolean(state && verifiedWorkerOrigin);
+    setConnected(false);
+    try {
+      const normalizedBaseUrl = setBaseUrl(baseUrl);
+      setBase(normalizedBaseUrl);
+      const persisted = setControlToken(token.trim(), remember);
+      setStorageWarning(!persisted);
+      const success = await refresh();
+      if (success) {
+        setEditingConnection(false);
+        toast.success('Autopilot connesso. Dati del Worker caricati.');
+      } else if (hadVerifiedState) {
+        // Non lasciare mai uno snapshot del vecchio Worker abbinato alle nuove
+        // credenziali: ripristiniamo la connessione verificata e la ricontrolliamo.
+        const restoredBaseUrl = setBaseUrl(previousBaseUrl);
+        setControlToken(previousToken, previousRemember);
+        setBase(restoredBaseUrl);
+        setToken(previousToken);
+        const restored = await refresh({ background: true });
+        if (restored) {
+          setEditingConnection(false);
+          toast.warning('Nuova connessione non valida: è stata ripristinata quella precedente.');
+        }
+      }
+    } catch (caught) {
+      setConnected(hadVerifiedState && getBaseUrl() === verifiedWorkerOrigin);
+      setEditingConnection(true);
+      setError(caught instanceof Error ? caught.message : String(caught));
     }
-  }, [baseUrl, token, remember, refresh]);
+  }, [baseUrl, token, remember, refresh, state, verifiedWorkerOrigin]);
 
   useEffect(() => { void refresh(); }, [refresh]);
+
+  const hasRemoteState = Boolean(state);
+  useEffect(() => {
+    if (!hasRemoteState || !getControlToken()) return;
+    const update = () => void refresh({ background: true });
+    const intervalId = window.setInterval(update, 30_000);
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') update();
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      window.clearInterval(intervalId);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, [hasRemoteState, refresh]);
 
   useEffect(() => {
     if (state?.config && !state.config.onboardingComplete && getControlToken()) setOnboardingOpen(true);
@@ -307,8 +369,9 @@ export default function Autopilot() {
   const guarded = async (label: string, task: () => Promise<unknown>) => {
     setLoading(true);
     try {
-      const result = await task() as { status?: string; error?: string; reason?: string; runId?: string; warming?: boolean };
+      const result = await task() as { status?: string; error?: string; reason?: string; runId?: string; warming?: boolean; busy?: boolean };
       if (result?.status === 'error') toast.error(`Run fallita: ${result.error ?? 'errore sconosciuto'}`);
+      else if (result?.status === 'blocked' && result.busy) toast.info(result.error ?? 'Un’altra run è già in corso. Nessun secondo ciclo è stato avviato.');
       else if (result?.status === 'blocked' && result.warming) toast.info(result.reason ?? 'Storici in preparazione: ripeti il ciclo fra poco.');
       else if (result?.status === 'blocked') toast.warning('Piano bloccato dai guardrail: apri il dettaglio della run.');
       else toast.success(label);
@@ -318,6 +381,29 @@ export default function Autopilot() {
       toast.error(caught instanceof Error ? caught.message : String(caught));
     } finally {
       setLoading(false);
+    }
+  };
+
+  const safeStop = async () => {
+    setSafeStopping(true);
+    try {
+      if (!verifiedWorkerOrigin || getBaseUrl() !== verifiedWorkerOrigin) {
+        throw new Error('Connessione Worker non verificata: aggiorna lo stato prima di inviare lo stop.');
+      }
+      const result = await autopilot.safeStop('arresto remoto dalla dashboard');
+      // La risposta del comando è autoritativa. Invalidiamo qualunque refresh
+      // precedente, così una risposta lenta non può ridisegnare lo stato live.
+      refreshSequence.current += 1;
+      setState((current) => current ? { ...current, config: result.config } : current);
+      setConnected(true);
+      setError(null);
+      setLastRefreshedAt(Date.now());
+      toast.success('Autopilot arrestato: modalità Shadow e freeze attivi.');
+      void refresh({ background: true });
+    } catch (caught) {
+      toast.error(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setSafeStopping(false);
     }
   };
 
@@ -381,6 +467,9 @@ export default function Autopilot() {
   const config = state?.config;
   const mode = config?.executionMode ?? 'shadow';
   const frozen = Boolean(config?.frozen);
+  const safelyStopped = frozen && mode === 'shadow';
+  const workerOrigin = getBaseUrl()
+    || (typeof window !== 'undefined' ? window.location.origin : 'stessa origine');
   const realRuns = config?.realCapitalTrackingStartedAt
     ? runs.filter((run) => run.started_at >= Number(config.realCapitalTrackingStartedAt))
     : [];
@@ -388,7 +477,7 @@ export default function Autopilot() {
   const requiredCredentials = (state?.credentials ?? []).filter((item) => item.required);
   const credentialsOk = requiredCredentials.length > 0 && requiredCredentials.every((item) => item.configured);
   const hasRun = realRuns.length > 0;
-  const showConnectionForm = editingConnection || !state || Boolean(error);
+  const showConnectionForm = editingConnection || !state;
 
   if (activeStrategyPreview) {
     const previewDraft = createStrategyOnboardingPreview(DEFAULT_STRATEGY_ONBOARDING_ANSWERS);
@@ -502,12 +591,12 @@ export default function Autopilot() {
                 <Lock className="size-4 text-agent" /> Connessione al Worker
                 {connected && state ? <Badge className="bg-gain/15 text-gain hover:bg-gain/15">Connesso</Badge> : null}
               </CardTitle>
-            <CardDescription className="text-text-1">
+              <CardDescription className="text-text-1">
                 {connected && state
-                  ? 'Connessione verificata: la dashboard qui sotto usa i dati aggiornati del Worker.'
+                  ? <>Connessione verificata con <code className="rounded bg-bg-2 px-1">{workerOrigin}</code>. Lo stato qui sotto arriva dal Worker.</>
                   : <>
                     Il <strong className="text-text-0">CONTROL_TOKEN</strong> è la password dell’agente, quella che hai generato con <code className="rounded bg-bg-2 px-1">openssl rand -base64 32</code> e
-                    caricato con <code className="rounded bg-bg-2 px-1">wrangler secret put</code>. Resta in sessionStorage e si cancella chiudendo la scheda.
+                    caricato con <code className="rounded bg-bg-2 px-1">wrangler secret put</code>. Puoi conservarla su questo dispositivo per il controllo da telefono.
                   </>}
             </CardDescription>
             </div>
@@ -523,6 +612,10 @@ export default function Autopilot() {
                 <div className="grid gap-1.5">
                   <Label htmlFor="ap-base" className="text-text-0">URL del Worker</Label>
                   <Input id="ap-base" value={baseUrl} onChange={(event) => setBase(event.target.value)} placeholder="vuoto = stessa origine del sito" />
+                  <p className="text-[11px] leading-relaxed text-text-2">
+                    Usa solo l’origine, per esempio <code>https://etorodashboard…workers.dev</code>. Se incolli <code>/autopilot</code>,
+                    il percorso viene rimosso automaticamente; sul sito pubblicato puoi lasciare il campo vuoto.
+                  </p>
                 </div>
                 <div className="grid gap-1.5">
                   <Label htmlFor="ap-token" className="text-text-0">CONTROL_TOKEN</Label>
@@ -542,8 +635,8 @@ export default function Autopilot() {
                   />
                   <span>
                     Ricorda su questo dispositivo. Consigliato su telefono, dove il browser scarica le schede in background e
-                    altrimenti dovresti reinserire il token ogni volta. Il token resta su questo dispositivo e non viene mai inviato
-                    altrove.
+                    altrimenti dovresti reinserire il token ogni volta. Il token resta su questo dispositivo ed è trasmesso soltanto
+                    all’origine del Worker mostrata sopra, per autenticare le richieste.
                   </span>
                 </label>
                 {storageWarning && (
@@ -600,6 +693,50 @@ export default function Autopilot() {
 
       {state && config && (
         <>
+          <motion.div {...stagger(3)} className="col-span-12">
+            <Alert>
+              <Radio className="size-4" />
+              <AlertTitle>Stato condiviso tra i tuoi dispositivi</AlertTitle>
+              <AlertDescription>
+                Strategia, portfolio, capitale, drawdown e modalità sono salvati nel Worker/D1: ricompaiono su ogni dispositivo
+                collegato a <code className="rounded bg-bg-2 px-1">{workerOrigin}</code> con lo stesso CONTROL_TOKEN. Le pagine
+                Panoramica, Portfolio e Agent generico restano invece locali al singolo browser.
+              </AlertDescription>
+            </Alert>
+          </motion.div>
+
+          <motion.div
+            {...stagger(3)}
+            className="sticky top-14 z-20 col-span-12 rounded-xl border border-hairline-strong bg-bg-0/95 p-3 shadow-lg backdrop-blur md:hidden"
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="truncate text-sm font-semibold text-text-0">
+                    {config.strategyName || config.activeAgentPortfolioName || 'Autopilot'}
+                  </span>
+                  <Badge className={cn(mode === 'live' ? 'bg-loss/15 text-loss' : 'bg-agent/15 text-agent')}>{mode.toUpperCase()}</Badge>
+                  {frozen ? <Badge className="bg-loss/15 text-loss">FROZEN</Badge> : null}
+                  {!connected ? <Badge className="bg-warn/15 text-warn">OFFLINE</Badge> : null}
+                </div>
+                <p className="mt-1 text-[11px] text-text-1">
+                  {fmtEur(config.lastManagedCapitalEur || null)} · drawdown {fmtPct(state.drawdownPct)} · aggiornato {fmtDate(lastRefreshedAt)}
+                </p>
+              </div>
+              <Button
+                type="button"
+                variant="destructive"
+                size="sm"
+                className="shrink-0"
+                disabled={safeStopping || safelyStopped}
+                onClick={() => void safeStop()}
+              >
+                {safeStopping ? <RefreshCw className="size-4 animate-spin" /> : <ShieldAlert className="size-4" />}
+                {safelyStopped ? 'Arrestato' : 'Arresta'}
+              </Button>
+            </div>
+          </motion.div>
+
           {/* KPI */}
           <motion.div {...stagger(3)} className="col-span-12 grid gap-4 md:grid-cols-4">
             <Card>
@@ -743,11 +880,11 @@ export default function Autopilot() {
                       </div>
                       {frozen ? (
                         <Button variant="outline" size="sm" disabled={loading} onClick={() => void guarded('Agente riattivato', () => autopilot.unfreeze())}>
-                          <Unlock className="size-4" /> Riattiva
+                          <Unlock className="size-4" /> Sblocca in Shadow
                         </Button>
                       ) : (
-                        <Button variant="destructive" size="sm" disabled={loading} onClick={() => void guarded('Agente congelato', () => autopilot.freeze('freeze manuale dalla dashboard'))}>
-                          <ShieldAlert className="size-4" /> Congela
+                        <Button variant="destructive" size="sm" disabled={safeStopping} onClick={() => void safeStop()}>
+                          {safeStopping ? <RefreshCw className="size-4 animate-spin" /> : <ShieldAlert className="size-4" />} Arresta in sicurezza
                         </Button>
                       )}
                     </div>

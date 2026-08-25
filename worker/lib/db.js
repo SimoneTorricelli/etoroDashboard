@@ -5,6 +5,7 @@
 
 const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)`,
+  `CREATE TABLE IF NOT EXISTS pipeline_lock (lock_key TEXT PRIMARY KEY, owner_id TEXT NOT NULL, acquired_at INTEGER NOT NULL, lease_until INTEGER NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, kind TEXT NOT NULL, started_at INTEGER NOT NULL, finished_at INTEGER, status TEXT NOT NULL, execution_mode TEXT NOT NULL, equity_usd REAL, error TEXT)`,
   `CREATE INDEX IF NOT EXISTS idx_runs_started ON runs (started_at DESC)`,
   `CREATE TABLE IF NOT EXISTS snapshots (run_id TEXT PRIMARY KEY, taken_at INTEGER NOT NULL, equity_usd REAL NOT NULL, cash_usd REAL NOT NULL, invested_usd REAL NOT NULL, positions_json TEXT NOT NULL)`,
@@ -113,7 +114,7 @@ export const DEFAULT_CONFIG = {
   watcherSpikePct: 0.10,
   /** Moltiplicatore di volatilità che segnala un regime anomalo. */
   watcherVolSpike: 2.0,
-  /** Quota di portafoglio riservata alle operazioni opportunistiche. */
+  /** Quota massima associata a una proposta opportunistica del Watcher. */
   opportunisticBudgetPct: 0.08,
   maxOpportunisticPerWeek: 1,
   /** Quante volte al massimo si può mediare al ribasso sullo stesso strumento. */
@@ -181,6 +182,8 @@ export const DEFAULT_CONFIG = {
 };
 
 export const CONFIG_KEY = 'autopilot';
+export const PIPELINE_LOCK_KEY = 'global';
+export const PIPELINE_LOCK_LEASE_MS = 30 * 60 * 1000;
 
 export async function migrate(db) {
   const statements = SCHEMA.map((statement) => db.prepare(statement));
@@ -189,6 +192,79 @@ export async function migrate(db) {
     return;
   }
   for (const statement of statements) await statement.run();
+}
+
+/**
+ * Prova ad acquisire il lease globale della pipeline con una singola scrittura.
+ * La clausola WHERE dell'UPSERT fa sì che un lease ancora valido non possa
+ * essere sottratto da una run concorrente; una run morta libera invece il lock
+ * automaticamente alla scadenza.
+ */
+export async function acquirePipelineLock(db, ownerId, {
+  now = Date.now(),
+  leaseMs = PIPELINE_LOCK_LEASE_MS,
+} = {}) {
+  const owner = String(ownerId ?? '').trim().slice(0, 200);
+  if (!owner) throw new TypeError('owner del lock pipeline mancante');
+  const acquiredAt = Math.trunc(Number(now));
+  const duration = Math.max(1_000, Math.trunc(Number(leaseMs)) || PIPELINE_LOCK_LEASE_MS);
+  const leaseUntil = acquiredAt + duration;
+  const row = await db.prepare(`INSERT INTO pipeline_lock (lock_key, owner_id, acquired_at, lease_until)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(lock_key) DO UPDATE SET
+      owner_id = excluded.owner_id,
+      acquired_at = excluded.acquired_at,
+      lease_until = excluded.lease_until
+    WHERE pipeline_lock.lease_until <= excluded.acquired_at
+       OR pipeline_lock.owner_id = excluded.owner_id
+    RETURNING owner_id, acquired_at, lease_until`)
+    .bind(PIPELINE_LOCK_KEY, owner, acquiredAt, leaseUntil)
+    .first();
+  if (row?.owner_id === owner) {
+    return {
+      acquired: true,
+      ownerId: owner,
+      acquiredAt: Number(row.acquired_at),
+      leaseUntil: Number(row.lease_until),
+    };
+  }
+  const current = await db.prepare('SELECT owner_id, acquired_at, lease_until FROM pipeline_lock WHERE lock_key = ?')
+    .bind(PIPELINE_LOCK_KEY)
+    .first();
+  return {
+    acquired: false,
+    ownerId: current?.owner_id ? String(current.owner_id) : null,
+    acquiredAt: Number(current?.acquired_at) || null,
+    leaseUntil: Number(current?.lease_until) || null,
+  };
+}
+
+/** Estende il lease soltanto se appartiene ancora alla run chiamante. */
+export async function renewPipelineLock(db, ownerId, {
+  now = Date.now(),
+  leaseMs = PIPELINE_LOCK_LEASE_MS,
+} = {}) {
+  const owner = String(ownerId ?? '').trim().slice(0, 200);
+  if (!owner) return false;
+  const renewedAt = Math.trunc(Number(now));
+  const duration = Math.max(1_000, Math.trunc(Number(leaseMs)) || PIPELINE_LOCK_LEASE_MS);
+  const row = await db.prepare(`UPDATE pipeline_lock
+    SET lease_until = ?
+    WHERE lock_key = ? AND owner_id = ? AND lease_until > ?
+    RETURNING owner_id, lease_until`)
+    .bind(renewedAt + duration, PIPELINE_LOCK_KEY, owner, renewedAt)
+    .first();
+  return row?.owner_id === owner;
+}
+
+/** Rilascia il lock soltanto se il lease appartiene ancora alla run chiamante. */
+export async function releasePipelineLock(db, ownerId) {
+  const owner = String(ownerId ?? '').trim().slice(0, 200);
+  if (!owner) return false;
+  const row = await db.prepare('DELETE FROM pipeline_lock WHERE lock_key = ? AND owner_id = ? RETURNING owner_id')
+    .bind(PIPELINE_LOCK_KEY, owner)
+    .first();
+  return row?.owner_id === owner;
 }
 
 function deepMerge(base, override) {
@@ -220,6 +296,53 @@ export async function saveConfig(db, patch) {
     .bind(CONFIG_KEY, JSON.stringify(next), Date.now())
     .run();
   return next;
+}
+
+/**
+ * Aggiorna esclusivamente lo stato di sicurezza con una singola istruzione SQL.
+ *
+ * `saveConfig()` deve leggere e poi riscrivere l'intero documento, quindi due
+ * richieste concorrenti potrebbero sovrascriversi. Freeze, modalità e safe-stop
+ * usano invece JSON Merge Patch direttamente in SQLite: i campi non di
+ * sicurezza restano intatti e la mutazione è atomica anche fra richieste.
+ */
+export async function mutateSafetyConfig(db, rawPatch) {
+  const patch = {};
+  if (Object.prototype.hasOwnProperty.call(rawPatch ?? {}, 'executionMode')) {
+    if (!['shadow', 'dry-run', 'live'].includes(rawPatch.executionMode)) {
+      throw new TypeError(`modalità di sicurezza non valida: ${String(rawPatch.executionMode)}`);
+    }
+    patch.executionMode = rawPatch.executionMode;
+  }
+  if (Object.prototype.hasOwnProperty.call(rawPatch ?? {}, 'frozen')) {
+    if (typeof rawPatch.frozen !== 'boolean') throw new TypeError('frozen deve essere booleano');
+    patch.frozen = rawPatch.frozen;
+  }
+  if (Object.prototype.hasOwnProperty.call(rawPatch ?? {}, 'frozenReason')) {
+    if (typeof rawPatch.frozenReason !== 'string') throw new TypeError('frozenReason deve essere una stringa');
+    patch.frozenReason = rawPatch.frozenReason.slice(0, 300);
+  }
+  if (!Object.keys(patch).length) throw new TypeError('nessuna mutazione di sicurezza valida');
+
+  const defaultsJson = JSON.stringify(DEFAULT_CONFIG);
+  const patchJson = JSON.stringify(patch);
+  const row = await db.prepare(`INSERT INTO config (key, value, updated_at)
+    VALUES (?, json_patch(json(?), json(?)), ?)
+    ON CONFLICT(key) DO UPDATE SET
+      value = json_patch(
+        CASE WHEN json_valid(config.value) THEN config.value ELSE json(?) END,
+        json(?)
+      ),
+      updated_at = excluded.updated_at
+    RETURNING value`)
+    .bind(CONFIG_KEY, defaultsJson, patchJson, Date.now(), defaultsJson, patchJson)
+    .first();
+  if (!row?.value) throw new Error('mutazione dello stato di sicurezza non confermata da D1');
+  try {
+    return deepMerge(DEFAULT_CONFIG, JSON.parse(row.value));
+  } catch {
+    throw new Error('D1 ha restituito uno stato di sicurezza non valido');
+  }
 }
 
 export async function audit(db, runId, level, stage, message, data) {
@@ -432,7 +555,7 @@ export async function listWatcherEvents(db, limit = 50) {
 
 export async function countOpportunisticThisWeek(db) {
   const since = Date.now() - 7 * 24 * 60 * 60 * 1000;
-  const row = await db.prepare("SELECT COUNT(*) AS n FROM watcher_events WHERE at > ? AND action = 'executed'").bind(since).first();
+  const row = await db.prepare("SELECT COUNT(*) AS n FROM watcher_events WHERE at > ? AND action IN ('buy', 'executed')").bind(since).first();
   return Number(row?.n ?? 0);
 }
 

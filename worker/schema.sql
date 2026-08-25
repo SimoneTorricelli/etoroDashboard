@@ -7,6 +7,16 @@ CREATE TABLE IF NOT EXISTS config (
   updated_at INTEGER NOT NULL
 );
 
+-- Lease globale: impedisce la sovrapposizione fra cron, trigger manuali e MCP.
+-- Se una run termina senza cleanup, il lock diventa nuovamente acquisibile
+-- dopo lease_until.
+CREATE TABLE IF NOT EXISTS pipeline_lock (
+  lock_key    TEXT PRIMARY KEY,
+  owner_id    TEXT NOT NULL,
+  acquired_at INTEGER NOT NULL,
+  lease_until INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS runs (
   id             TEXT PRIMARY KEY,
   kind           TEXT NOT NULL,
