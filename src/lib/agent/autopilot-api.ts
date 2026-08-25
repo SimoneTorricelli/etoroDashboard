@@ -123,6 +123,25 @@ export interface RunBundle {
   logs: Array<{ at: number; level: string; stage: string; message: string }>;
 }
 
+export interface DiagnosticCheck {
+  id: string;
+  label: string;
+  /** true = ok, false = errore, null = non applicabile. */
+  ok: boolean | null;
+  detail?: string;
+  error?: string;
+  hint?: string;
+  data?: unknown;
+}
+
+export interface DiagnosticsReport {
+  checkedAt: number;
+  ok: boolean;
+  readyForShadow: boolean;
+  readyForLive: boolean;
+  checks: DiagnosticCheck[];
+}
+
 export function getControlToken(): string {
   try { return sessionStorage.getItem(TOKEN_KEY) ?? ''; } catch { return ''; }
 }
@@ -202,5 +221,6 @@ export const autopilot = {
   saveCredentials: (patch: Partial<Record<CredentialKey, string>>) =>
     call<{ credentials: CredentialStatus[]; applied: string[]; rejected: string[] }>('/agent/credentials', { method: 'PUT', body: JSON.stringify(patch) }),
   clearCredentials: () => call<{ credentials: CredentialStatus[] }>('/agent/credentials', { method: 'DELETE' }),
-  testNotifications: () => call<{ sent: number; attempted: number }>('/agent/notify-test', { method: 'POST', body: '{}' }),
+  testNotifications: () => call<{ sent: number; attempted: number; checks: DiagnosticCheck[] }>('/agent/notify-test', { method: 'POST', body: '{}' }),
+  diagnose: () => call<DiagnosticsReport>('/agent/diagnose', { method: 'POST', body: '{}' }),
 };

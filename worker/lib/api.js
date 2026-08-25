@@ -7,6 +7,7 @@ import { runPipeline } from './pipeline.js';
 import { listFreeModels } from './brain.js';
 import { notify, notifyTest } from './notify.js';
 import { clearCredentials, describeCredentials, resolveCredentials, saveCredentials } from './vault.js';
+import { runDiagnostics } from './diagnose.js';
 import {
   audit, equityHistory, getRunBundle, listRuns, loadConfig, saveConfig, DEFAULT_CONFIG,
 } from './db.js';
@@ -227,6 +228,16 @@ export async function handleAgentApi(request, env, ctx, pathname) {
       await audit(db, null, 'warn', 'credentials', 'Vault credenziali svuotato');
       return json({ credentials: describeCredentials(await resolveCredentials(db, env)) });
     }
+  }
+
+  // POST /agent/diagnose
+  if (route === 'diagnose' && method === 'POST') {
+    const [config, resolved] = await Promise.all([loadConfig(db), resolveCredentials(db, env)]);
+    const report = await runDiagnostics(resolved, config);
+    await audit(db, null, report.ok ? 'info' : 'warn', 'diagnose',
+      `Diagnostica: ${report.checks.filter((item) => item.ok === false).length} problemi`,
+      report.checks.map(({ id, ok: state, error }) => ({ id, ok: state, error })));
+    return json(report);
   }
 
   // POST /agent/notify-test

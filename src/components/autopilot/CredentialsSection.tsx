@@ -89,7 +89,7 @@ export function CredentialsSection({ credentials, notificationsActive, onChanged
           <div key={group.title} className="space-y-3">
             <div>
               <h3 className="text-sm font-medium">{group.title}</h3>
-              <p className="text-xs text-muted-foreground">{group.description}</p>
+              <p className="text-xs text-text-1">{group.description}</p>
             </div>
             <div className="grid gap-3 sm:grid-cols-2">
               {group.keys.map((key) => {
