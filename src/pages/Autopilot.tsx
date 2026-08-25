@@ -9,7 +9,7 @@ import { motion } from 'framer-motion';
 import { toast, Toaster } from 'sonner';
 import {
   Activity, ArrowRight, Bot, Circle, CircleCheck, Clock, Eye, FlaskConical,
-  Lock, RefreshCw, ShieldAlert, Snowflake, Radio, Unlock, X, XCircle,
+  Lock, RefreshCw, ShieldAlert, Snowflake, Radio, Sparkles, Unlock, X, XCircle,
 } from 'lucide-react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -49,6 +49,24 @@ const stagger = (i: number) => ({
   animate: { opacity: 1, y: 0 },
   transition: { duration: 0.28, delay: i * 0.05, ease: [0.2, 0.8, 0.2, 1] as [number, number, number, number] },
 });
+
+/** Arrotondamento a decimi con somma visiva sempre pari a 100,0%. */
+function allocationRows(weights: Record<string, number>) {
+  const entries = Object.entries(weights).filter(([, weight]) => Number(weight) >= 0);
+  const total = entries.reduce((sum, [, weight]) => sum + Number(weight), 0);
+  if (total <= 0) return [];
+  const rows = entries.map(([symbol, weight], index) => {
+    const exact = (Number(weight) / total) * 1000;
+    return { symbol, index, units: Math.floor(exact), remainder: exact - Math.floor(exact) };
+  });
+  let remaining = 1000 - rows.reduce((sum, row) => sum + row.units, 0);
+  for (const row of [...rows].sort((a, b) => b.remainder - a.remainder || a.index - b.index)) {
+    if (remaining <= 0) break;
+    row.units += 1;
+    remaining -= 1;
+  }
+  return rows.sort((a, b) => a.index - b.index).map(({ symbol, units }) => ({ symbol, percentage: units / 10 }));
+}
 
 const MODES: Array<{ id: ExecutionMode; icon: typeof Eye; title: string; short: string; tone: string }> = [
   { id: 'shadow', icon: Eye, title: 'Shadow', short: 'Propone e basta. Nessun ordine viene costruito.', tone: 'text-text-0' },
@@ -762,6 +780,7 @@ export default function Autopilot() {
                                 <Badge variant={detail.proposal.parsed.confidence >= config.minConfidence ? 'default' : 'outline'}>
                                   affidabilità {detail.proposal.parsed.confidence.toFixed(2)} (minimo {config.minConfidence})
                                 </Badge>
+                                {detail.improvement && <Badge variant="outline">Revisione di {detail.improvement.sourceModel ?? 'un piano precedente'}</Badge>}
                               </div>
                               <p className="text-xs leading-relaxed text-text-1">
                                 L’affidabilità è la stima prudenziale del modello sulla qualità della decisione rispetto a non cambiare nulla. Non dipende dalla grandezza del capitale; sotto il minimo il piano resta visibile, ma non può produrre ordini.
@@ -770,8 +789,8 @@ export default function Autopilot() {
                               <div>
                                 <p className="mb-1 text-xs text-text-1">Allocazione proposta</p>
                                 <div className="flex flex-wrap gap-2">
-                                  {Object.entries(detail.proposal.parsed.targetWeights).map(([symbol, weight]) => (
-                                    <Badge key={symbol} variant="outline" className="tabular-nums">{symbol} {(weight * 100).toFixed(1)}%</Badge>
+                                  {allocationRows(detail.proposal.parsed.targetWeights).map(({ symbol, percentage }) => (
+                                    <Badge key={symbol} variant="outline" className="tabular-nums">{symbol} {percentage.toFixed(1)}%</Badge>
                                   ))}
                                 </div>
                               </div>
@@ -779,6 +798,26 @@ export default function Autopilot() {
                                 <p className="text-sm text-text-1">
                                   <span className="text-text-0">Rischi segnalati: </span>{detail.proposal.parsed.risks.join(' · ')}
                                 </p>
+                              )}
+                              {detail.validation && !detail.validation.ok && (
+                                <div className="rounded-xl border border-agent/25 bg-agent/5 p-4">
+                                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                                    <div>
+                                      <p className="text-sm font-medium text-text-0">Il piano si può correggere</p>
+                                      <p className="mt-1 max-w-2xl text-xs leading-relaxed text-text-1">
+                                        Una nuova revisione riceve gli errori dei guardrail, prova prima un altro provider disponibile e riparte dai dati di mercato aggiornati. È sempre un dry-run: non invia ordini reali.
+                                      </p>
+                                    </div>
+                                    <Button
+                                      type="button"
+                                      className="shrink-0 gap-2"
+                                      disabled={loading}
+                                      onClick={() => void guarded('Nuova revisione completata', () => autopilot.improveRun(detail.run!.id))}
+                                    >
+                                      <Sparkles className="size-4" /> Migliora piano
+                                    </Button>
+                                  </div>
+                                </div>
                               )}
                             </>
                           ) : (
@@ -813,6 +852,16 @@ export default function Autopilot() {
                                   <span className="text-text-1">{item.message}</span>
                                 </div>
                               ))}
+                              {detail.validation.plan?.targets && (
+                                <div className="pt-2">
+                                  <p className="mb-2 text-xs text-text-1">Allocazione dopo i guardrail deterministici</p>
+                                  <div className="flex flex-wrap gap-2">
+                                    {allocationRows(detail.validation.plan.targets).map(({ symbol, percentage }) => (
+                                      <Badge key={symbol} variant="outline" className="tabular-nums">{symbol} {percentage.toFixed(1)}%</Badge>
+                                    ))}
+                                  </div>
+                                </div>
+                              )}
                             </>
                           ) : <p className="text-sm text-text-1">Validazione non eseguita.</p>}
                         </TabsContent>

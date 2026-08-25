@@ -1,3 +1,5 @@
+import { exposureGroupFor } from './exposure.js';
+
 /**
  * Feature engine deterministico. Trasforma serie storiche e snapshot in un
  * insieme compatto di numeri: è l'unico input numerico che raggiunge l'LLM.
@@ -169,6 +171,7 @@ export function buildFeatures({ snapshot, universe, candles, external, config, e
     bySymbol.set(symbol, {
       symbol,
       class: meta.class,
+      exposureGroup: meta.exposureGroup ?? exposureGroupFor(symbol),
       instrumentId: meta.instrumentId,
       weight: round(valueUsd / equityUsd, 4),
       valueUsd: round(valueUsd, 2),

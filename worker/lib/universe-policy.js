@@ -18,6 +18,7 @@
 
 const ASSET_CLASSES = Object.freeze(['etf', 'stock', 'bond', 'commodity', 'crypto']);
 const CRYPTO_TIERS = Object.freeze(['large-cap', 'mid-cap', 'small-cap']);
+import { exposureGroupFor } from './exposure.js';
 
 const candidate = (
   symbol,
@@ -340,6 +341,7 @@ export function rankPolicyUniverse(spec, catalog = POLICY_CANDIDATE_CATALOG) {
       sector: item.sector,
       themes: [...item.themes],
       traits: [...item.traits],
+      exposureGroup: exposureGroupFor(item.symbol),
       region: item.region,
       cryptoTier: item.cryptoTier,
       meme: Boolean(item.meme),

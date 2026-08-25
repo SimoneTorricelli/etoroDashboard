@@ -7,8 +7,8 @@
  */
 import assert from 'node:assert/strict';
 import { buildFeatures, renderFeaturesPrompt, rsi, maxDrawdown, annualizedVol } from './lib/features.js';
-import { validateProposal } from './lib/validator.js';
-import { extractJson, normalizeProposal } from './lib/brain.js';
+import { collapseEquivalentTargets, validateProposal } from './lib/validator.js';
+import { extractJson, normalizeProposal, prioritizeAlternativeProvider } from './lib/brain.js';
 import { DEFAULT_CONFIG } from './lib/db.js';
 import { PROFILES, applyProfile, describeProfile, listProfiles } from './lib/profiles.js';
 import { checkChurnRules, filterMarginalSubstitutions, isWorthTheCost } from './lib/churn.js';
@@ -229,6 +229,51 @@ test('readiness: misura la capacità della shortlist entro i cap di classe', () 
     maxWeightPerClass: { stock: 0.6, etf: 0.4 },
   });
   assert.ok(Math.abs(capacity - 0.9) < 1e-9);
+});
+
+test('readiness: ticker equivalenti contano come una sola capacità di rischio', () => {
+  const capacity = shortlistDeploymentCapacity([
+    { symbol: 'GLD', class: 'commodity', maxWeight: 0.22 },
+    { symbol: 'IAU', class: 'commodity', maxWeight: 0.22 },
+    { symbol: 'BND', class: 'bond', maxWeight: 0.35 },
+    { symbol: 'AGG', class: 'bond', maxWeight: 0.35 },
+  ], {
+    maxHoldings: 20,
+    maxWeightPerClass: { commodity: 0.5, bond: 0.5 },
+  });
+  assert.equal(capacity, 0.57);
+});
+
+test('costruzione iniziale consolida le esposizioni duplicate sul ticker con score migliore', () => {
+  const violations = [];
+  const targets = collapseEquivalentTargets(
+    { GLD: 0.08, IAU: 0.07, BND: 0.06, AGG: 0.05, CASH: 0.74 },
+    {
+      portfolio: { openPositions: 0 },
+      instruments: [
+        { symbol: 'GLD' }, { symbol: 'IAU' }, { symbol: 'BND' }, { symbol: 'AGG' },
+      ],
+    },
+    new Map([['IAU', 70], ['GLD', 60], ['AGG', 55], ['BND', 50]]),
+    violations,
+  );
+  assert.equal(targets.IAU, 0.15);
+  assert.equal(targets.GLD, 0);
+  assert.equal(targets.AGG, 0.11);
+  assert.equal(targets.BND, 0);
+  assert.equal(violations.filter((item) => item.code === 'equivalent_exposure').length, 2);
+});
+
+test('revisione prova prima un provider diverso da quello del piano bloccato', () => {
+  const plan = [
+    { provider: 'openrouter', model: 'minimax/minimax-m3:free' },
+    { provider: 'openrouter', model: 'openrouter/free' },
+    { provider: 'workers-ai', model: '@cf/openai/gpt-oss-120b' },
+    { provider: 'gemini', model: 'gemini-2.5-flash' },
+  ];
+  const reordered = prioritizeAlternativeProvider(plan, 'openrouter/minimax/minimax-m3:free');
+  assert.deepEqual(reordered.slice(0, 2).map((item) => item.provider), ['workers-ai', 'gemini']);
+  assert.equal(reordered.at(-1).model, 'minimax/minimax-m3:free');
 });
 
 test('estrazione JSON tollera testo attorno e code fence', () => {

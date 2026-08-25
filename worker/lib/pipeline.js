@@ -10,6 +10,7 @@ import { collectExternalContext } from './sources.js';
 import { buildFeatures, renderFeaturesPrompt } from './features.js';
 import { buildShortlist, renderShortlistPrompt } from './screening.js';
 import { askBrain } from './brain.js';
+import { exposureGroupFor, uniqueExposureCount } from './exposure.js';
 import { validateProposal } from './validator.js';
 import { executePlan, reconcile, deterministicId } from './executor.js';
 import { describeLedger } from './churn.js';
@@ -19,7 +20,7 @@ import { PROFILES, describeProfile } from './profiles.js';
 import { hasVerifiedAgentBinding, resolveCredentials, missingRequired, saveCredentials } from './vault.js';
 import {
   audit, cacheUniverse, countOpportunisticThisWeek, countOrdersToday, equityHistory,
-  finishRun, listWatcherEvents, loadConfig, loadLedger, loadUniverseCache, recordEquity,
+  finishRun, getRunBundle, listWatcherEvents, loadConfig, loadLedger, loadUniverseCache, recordEquity,
   recordLedgerTrade, saveConfig, saveFeatures, saveProposal, saveSnapshot, saveValidation,
   saveWatcherEvent, startRun, syncLedger, upsertOrder,
 } from './db.js';
@@ -92,7 +93,14 @@ export function shortlistDeploymentCapacity(shortlist, config) {
   const classUsed = {};
   let total = 0;
   const maxPositions = Math.max(1, Number(config.maxHoldings) || shortlist.length);
-  const remaining = [...shortlist].filter((item) => (Number(item.maxWeight) || 0) > 0);
+  const bestByExposure = new Map();
+  for (const item of shortlist) {
+    if ((Number(item.maxWeight) || 0) <= 0) continue;
+    const group = exposureGroupFor(item);
+    const current = bestByExposure.get(group);
+    if (!current || Number(item.maxWeight) > Number(current.maxWeight)) bestByExposure.set(group, item);
+  }
+  const remaining = [...bestByExposure.values()];
   for (let slot = 0; slot < maxPositions && remaining.length; slot += 1) {
     remaining.sort((a, b) => {
       const roomFor = (item) => Math.min(
@@ -110,6 +118,39 @@ export function shortlistDeploymentCapacity(shortlist, config) {
     total += allocation;
   }
   return Math.min(1, total);
+}
+
+export function buildPlanRevisionContext(bundle) {
+  const proposal = bundle?.proposal?.parsed;
+  const violations = bundle?.validation?.violations ?? [];
+  if (!proposal) return '';
+  const targets = Object.entries(proposal.targetWeights ?? {})
+    .map(([symbol, weight]) => `${symbol} ${(Number(weight) * 100).toFixed(1)}%`)
+    .join(', ');
+  const riskGroups = new Map();
+  for (const [symbol, weight] of Object.entries(proposal.targetWeights ?? {})) {
+    if (symbol === 'CASH' || Number(weight) <= 0.001) continue;
+    const group = exposureGroupFor(symbol);
+    if (group.startsWith('symbol:')) continue;
+    riskGroups.set(group, [...(riskGroups.get(group) ?? []), symbol]);
+  }
+  const duplicateIssues = [...riskGroups.entries()]
+    .filter(([, symbols]) => symbols.length > 1)
+    .map(([group, symbols]) => `- Esposizione duplicata ${group}: scegli un solo ticker fra ${symbols.join(', ')}.`);
+  const issueLines = [
+    ...violations.map((item) => `- ${item.message}`),
+    ...duplicateIssues,
+  ];
+  const issues = issueLines.length
+    ? issueLines.join('\n')
+    : '- Nessun errore deterministico registrato: aumenta la solidità e spiega meglio i rischi.';
+  return [
+    `La proposta precedente (${bundle.proposal.model ?? 'modello non noto'}, confidence ${Number(proposal.confidence).toFixed(2)}) è stata bloccata.`,
+    `Allocazione precedente: ${targets}.`,
+    'Correggi esplicitamente questi esiti del validatore:',
+    issues,
+    'Genera una nuova proposta autonoma, non limitarti a parafrasare la precedente. La confidence deve restare una stima onesta: non alzarla solo per superare la soglia.',
+  ].join('\n').slice(0, 6000);
 }
 
 export function romeParts(date = new Date()) {
@@ -439,7 +480,7 @@ async function runWatcher({ env, db, config, credentials, client, snapshot, feat
 
 // ---------------------------------------------------------------- pipeline
 
-export async function runPipeline({ env, kind, modeOverride }) {
+export async function runPipeline({ env, kind, modeOverride, improveFromRunId = '' }) {
   const db = env.DB;
   const config = await loadConfig(db);
   if (config.strategySpec?.diversification) {
@@ -464,6 +505,15 @@ export async function runPipeline({ env, kind, modeOverride }) {
 
   await startRun(db, runId, kind, mode);
   await audit(db, runId, 'info', 'start', `Run ${kind} avviata in modalità ${mode} · profilo ${profile.label}`);
+  const previousBundle = improveFromRunId ? await getRunBundle(db, improveFromRunId) : null;
+  const revisionContext = buildPlanRevisionContext(previousBundle);
+  if (improveFromRunId) {
+    await audit(db, runId, 'info', 'improvement', `Revisione del piano bloccato ${improveFromRunId}`, {
+      sourceRunId: improveFromRunId,
+      sourceModel: previousBundle?.proposal?.model ?? null,
+      sourceConfidence: previousBundle?.proposal?.parsed?.confidence ?? null,
+    });
+  }
 
   if (!['shadow', 'dry-run', 'live'].includes(mode)) {
     const error = `modalità di esecuzione non valida: ${String(mode)}`;
@@ -634,9 +684,10 @@ export async function runPipeline({ env, kind, modeOverride }) {
       const preferred = Math.min(config.maxHoldings, Math.max(config.minHoldings, config.preferredHoldings));
       const capacity = shortlistDeploymentCapacity(screening.shortlist, config);
       const requiredDeployment = 1 - config.maxCashPct;
-      if (shortlistSymbols.length < preferred || capacity + 0.0001 < requiredDeployment) {
-        const reason = `Analisi rimandata: ${shortlistSymbols.length} candidati con storico, ne servono almeno ${preferred}; capacità entro i cap ${(capacity * 100).toFixed(0)}% su ${(requiredDeployment * 100).toFixed(0)}% richiesto. Cache aggiornata ${candleStats.refreshed} strumenti in questo ciclo.`;
-        await audit(db, runId, 'warn', 'readiness', reason, { candleStats, preferred, capacity, requiredDeployment });
+      const exposureCount = uniqueExposureCount(screening.shortlist);
+      if (exposureCount < preferred || capacity + 0.0001 < requiredDeployment) {
+        const reason = `Analisi rimandata: ${exposureCount} fonti di rischio con storico, ne servono almeno ${preferred}; capacità entro i cap ${(capacity * 100).toFixed(0)}% su ${(requiredDeployment * 100).toFixed(0)}% richiesto. Cache aggiornata ${candleStats.refreshed} strumenti in questo ciclo.`;
+        await audit(db, runId, 'warn', 'readiness', reason, { candleStats, preferred, exposureCount, capacity, requiredDeployment });
         await finishRun(db, runId, 'blocked', equityUsd, reason);
         return { runId, status: 'blocked', reason, warming: true, candleStats };
       }
@@ -662,6 +713,8 @@ export async function runPipeline({ env, kind, modeOverride }) {
       dynamic,
       profileDescription: describeProfile(config),
       ledgerNotes,
+      revisionContext,
+      previousModel: previousBundle?.proposal?.model ?? '',
     });
     await saveProposal(db, runId, brain);
     if (!brain.ok) {

@@ -152,7 +152,7 @@ export function buildShortlist({ universe, candles, heldSymbols, config, profile
 
 /** Riga compatta per il prompt: una per strumento, larghezza fissa. */
 export function renderShortlistPrompt(shortlist) {
-  const lines = ['CANDIDATI   classe     max% score  peso%  1m%    3m%    12m%   vol30  RSI  vsSMA200  mom    corr  stato'];
+  const lines = ['CANDIDATI   classe     max% score  peso%  1m%    3m%    12m%   vol30  RSI  vsSMA200  mom    corr  gruppo_rischio       stato'];
   for (const item of shortlist) {
     const cell = (value, width) => `${value == null ? 'n/d' : value}`.padEnd(width);
     lines.push([
@@ -169,6 +169,7 @@ export function renderShortlistPrompt(shortlist) {
       cell(item.metrics.vsSma200, 9),
       cell(item.metrics.momentum, 6),
       cell(item.metrics.avgCorrelation, 5),
+      String(item.exposureGroup ?? `symbol:${item.symbol}`).padEnd(20),
       item.held ? 'IN PORTAFOGLIO' : 'candidato',
     ].join(' '));
   }

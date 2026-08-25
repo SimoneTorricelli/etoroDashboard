@@ -37,6 +37,7 @@ Regole non negoziabili:
 - Non superare il peso massimo di ciascuno strumento né i tetti per classe.
 - Nessuna leva, nessuno short.
 - Il minimo di posizioni è solo una barriera di sicurezza, non un obiettivo. Se il portafoglio è vuoto, costruisci una diversificazione completa e mira al numero di posizioni preferite indicato nei VINCOLI; usa meno titoli solo con una motivazione quantitativa esplicita.
+- Non usare due ticker dello stesso gruppo_rischio: contano come una sola esposizione e il validatore ne manterrà soltanto uno.
 - Prima di rispondere verifica aritmeticamente che, dopo i cap per strumento e classe, la cassa resti fra minimo e massimo. Non dichiarare di rispettare un cap se il peso proposto lo supera.
 
 Disciplina di rotazione — è la parte che conta di più:
@@ -44,6 +45,7 @@ Disciplina di rotazione — è la parte che conta di più:
 - Non ruotare il portafoglio per inseguire l'ultima settimana di performance. Preferisci la stabilità quando i segnali sono deboli o contraddittori.
 - L'inazione è una scelta legittima: se l'allocazione attuale è ragionevole, riproponila quasi identica e abbassa la confidence.
 - Le righe elencate in VINCOLI TEMPORALI non sono negoziabili: quegli strumenti non possono essere venduti o riacquistati adesso.
+- Se il portafoglio è vuoto, il deployment iniziale non è turnover ricorrente. I cicli successivi ribilanciano solo oltre le bande di tolleranza: non descrivere l'intera costruzione iniziale come un costo settimanale permanente.
 
 La confidence è la tua probabilità soggettiva che questa allocazione batta il mantenimento dello status quo sull'orizzonte indicato. Considera anche copertura e qualità degli storici; sii conservativo, ma non abbassarla solo perché il capitale reale è piccolo: i pesi sono percentuali.
 rationale: massimo 700 caratteri, in italiano, spiega le scelte citando i numeri.
@@ -158,16 +160,30 @@ export async function probeModels({ config, credentials, env }) {
   return results;
 }
 
+/** In revisione prova prima un provider diverso, poi un modello diverso. */
+export function prioritizeAlternativeProvider(plan, previousModel = '') {
+  const previousProvider = String(previousModel).split('/')[0];
+  const previousSuffix = String(previousModel).slice(previousProvider.length + 1);
+  return [...plan].sort((left, right) => {
+    const rank = (entry) => {
+      if (entry.provider !== previousProvider) return 0;
+      return entry.model === previousSuffix ? 2 : 1;
+    };
+    return rank(left) - rank(right);
+  });
+}
+
 /**
  * Cascata multi-provider. Per ogni coppia provider/modello prova prima la
  * modalità JSON nativa, poi il testo libero con estrazione.
  */
-export async function askBrain({ config, credentials, env, featuresPrompt, allowedSymbols, dynamic = false, profileDescription = '', ledgerNotes = [] }) {
+export async function askBrain({ config, credentials, env, featuresPrompt, allowedSymbols, dynamic = false, profileDescription = '', ledgerNotes = [], revisionContext = '', previousModel = '' }) {
   const horizon = config.cadence === 'daily' ? 'giornaliero' : config.cadence === 'monthly' ? 'mensile' : 'settimanale';
   const userPrompt = [
     featuresPrompt,
     '',
     profileDescription ? `STRATEGIA ${profileDescription}` : '',
+    revisionContext ? `REVISIONE RICHIESTA\n${revisionContext}` : '',
     ledgerNotes.length ? `VINCOLI TEMPORALI (non aggirabili)\n${ledgerNotes.map((note) => `- ${note}`).join('\n')}` : '',
     '',
     `Orizzonte del ribilanciamento: ${horizon}.`,
@@ -180,7 +196,8 @@ export async function askBrain({ config, credentials, env, featuresPrompt, allow
     { role: 'user', content: userPrompt },
   ];
 
-  const plan = buildAttemptPlan({ config, credentials, env });
+  const basePlan = buildAttemptPlan({ config, credentials, env });
+  const plan = previousModel ? prioritizeAlternativeProvider(basePlan, previousModel) : basePlan;
   if (!plan.length) {
     return { ok: false, attempts: [], error: 'nessun provider AI disponibile: attiva Workers AI o inserisci una chiave', promptChars: userPrompt.length };
   }

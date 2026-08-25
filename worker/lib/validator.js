@@ -1,4 +1,5 @@
 import { checkChurnRules, filterMarginalSubstitutions, isWorthTheCost } from './churn.js';
+import { exposureGroupFor } from './exposure.js';
 
 /**
  * Livello deterministico con diritto di veto. Trasforma la proposta dell'LLM in
@@ -36,21 +37,60 @@ export function expandInitialDiversification(targetWeights, features, config, sc
   const proposed = new Set(Object.entries(weights)
     .filter(([symbol, weight]) => symbol !== 'CASH' && Number(weight) > 0.001 && eligibleSymbols.has(symbol))
     .map(([symbol]) => symbol));
-  if (proposed.size >= desired) return weights;
+  const proposedGroups = new Set([...proposed].map((symbol) => exposureGroupFor(bySymbol(features, symbol))));
+  if (proposedGroups.size >= desired) return weights;
 
   const added = [];
   for (const item of eligible) {
     if (proposed.has(item.symbol)) continue;
+    const group = exposureGroupFor(item);
+    if (proposedGroups.has(group)) continue;
     weights[item.symbol] = Number(weights[item.symbol]) || 0;
     proposed.add(item.symbol);
+    proposedGroups.add(group);
     added.push(item.symbol);
-    if (proposed.size >= desired) break;
+    if (proposedGroups.size >= desired) break;
   }
   if (added.length) {
     violations.push(violation(
       'diversification_completed',
-      `portafoglio iniziale completato a ${proposed.size} strumenti con i candidati meglio classificati: ${added.join(', ')}`,
+      `portafoglio iniziale completato a ${proposedGroups.size} fonti di rischio con i candidati meglio classificati: ${added.join(', ')}`,
       'clamped',
+    ));
+  }
+  return weights;
+}
+
+function bySymbol(features, symbol) {
+  return features.instruments.find((item) => item.symbol === symbol) ?? symbol;
+}
+
+/** Consolida ticker equivalenti; se già detenuti preferisce quello principale. */
+export function collapseEquivalentTargets(targetWeights, features, scores, violations) {
+  const weights = { ...targetWeights };
+  const meta = new Map(features.instruments.map((item) => [item.symbol, item]));
+  const groups = new Map();
+  for (const [symbol, weight] of Object.entries(weights)) {
+    if (symbol === 'CASH' || Number(weight) <= 0.001) continue;
+    const group = exposureGroupFor(meta.get(symbol) ?? symbol);
+    const members = groups.get(group) ?? [];
+    members.push({ symbol, weight: Number(weight) });
+    groups.set(group, members);
+  }
+  for (const [group, members] of groups) {
+    if (members.length < 2 || group.startsWith('symbol:')) continue;
+    members.sort((a, b) => Number((meta.get(b.symbol)?.weight ?? 0) > 0.001) - Number((meta.get(a.symbol)?.weight ?? 0) > 0.001)
+      || Number(meta.get(b.symbol)?.weight ?? 0) - Number(meta.get(a.symbol)?.weight ?? 0)
+      || (scores.get(b.symbol) ?? -Infinity) - (scores.get(a.symbol) ?? -Infinity)
+      || b.weight - a.weight || a.symbol.localeCompare(b.symbol));
+    const [keeper, ...duplicates] = members;
+    weights[keeper.symbol] = round(members.reduce((sum, item) => sum + item.weight, 0), 4);
+    for (const item of duplicates) weights[item.symbol] = 0;
+    violations.push(violation(
+      'equivalent_exposure',
+      `${duplicates.map((item) => item.symbol).join(', ')} esclusi: duplicano l’esposizione ${group} già rappresentata da ${keeper.symbol}`,
+      'clamped',
+      { group, kept: keeper.symbol, removed: duplicates.map((item) => item.symbol) },
     ));
   }
   return weights;
@@ -164,8 +204,9 @@ export function validateProposal({ proposal, features, config, ordersToday = 0, 
     violations.push(violation('daily_order_cap', `raggiunto il limite di ${config.maxOrdersPerDay} ordini nelle ultime 24h`));
   }
 
+  const deduplicatedTargets = collapseEquivalentTargets(proposal.targetWeights, features, scores, violations);
   const expandedTargets = expandInitialDiversification(
-    proposal.targetWeights,
+    deduplicatedTargets,
     features,
     config,
     scores,

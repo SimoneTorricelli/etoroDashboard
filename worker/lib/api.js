@@ -752,6 +752,18 @@ export async function handleAgentApi(request, env, ctx, pathname) {
     return json(bundle);
   }
 
+  // POST /agent/runs/:id/improve — nuova revisione, sempre senza ordini reali.
+  if (route.startsWith('runs/') && route.endsWith('/improve') && method === 'POST') {
+    const sourceRunId = route.slice('runs/'.length, -'/improve'.length);
+    const source = await getRunBundle(db, sourceRunId);
+    if (!source.run) return json({ error: 'run di origine non trovata' }, 404);
+    if (!source.proposal?.parsed || !source.validation || source.validation.ok) {
+      return json({ error: 'si può migliorare soltanto un piano AI bloccato dai guardrail' }, 400);
+    }
+    const result = await runPipeline({ env, kind: 'rebalance', modeOverride: 'dry-run', improveFromRunId: sourceRunId });
+    return json({ ...result, improvedFromRunId: sourceRunId });
+  }
+
   // GET|PUT /agent/config
   if (route === 'config') {
     if (method === 'GET') return json({ config: await loadConfig(db), defaults: DEFAULT_CONFIG });

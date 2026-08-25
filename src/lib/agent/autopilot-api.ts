@@ -204,6 +204,7 @@ export interface RunBundle {
   validation: { ok: boolean; violations: Array<{ code: string; message: string; severity: string }>; plan: { orders: PlanOrder[]; targets: Record<string, number>; turnoverPct: number } | null } | null;
   orders: Array<{ symbol: string; side: string; amount_usd: number; state: string; message: string | null }>;
   logs: Array<{ at: number; level: string; stage: string; message: string }>;
+  improvement: { sourceRunId: string; sourceModel: string | null; sourceConfidence: number | null } | null;
 }
 
 export interface InstrumentHit {
@@ -439,6 +440,7 @@ export const autopilot = {
   state: () => call<AutopilotState>('/agent/state'),
   runs: (limit = 30) => call<{ runs: RunSummary[] }>(`/agent/runs?limit=${limit}`),
   run: (id: string) => call<RunBundle>(`/agent/runs/${encodeURIComponent(id)}`),
+  improveRun: (id: string) => call<{ runId: string; status: string; error?: string; reason?: string; improvedFromRunId: string }>(`/agent/runs/${encodeURIComponent(id)}/improve`, { method: 'POST', body: '{}' }),
   config: () => call<{ config: AutopilotConfig; defaults: AutopilotConfig }>('/agent/config'),
   updateConfig: (patch: Partial<AutopilotConfig>) =>
     call<{ config: AutopilotConfig; applied: string[]; rejected: string[] }>('/agent/config', { method: 'PUT', body: JSON.stringify(patch) }),

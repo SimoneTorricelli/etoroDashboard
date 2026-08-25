@@ -326,6 +326,8 @@ export async function getRunBundle(db, runId) {
     db.prepare('SELECT * FROM audit WHERE run_id = ? ORDER BY at').bind(runId).all(),
   ]);
   const parse = (value, fallback = null) => { try { return value ? JSON.parse(value) : fallback; } catch { return fallback; } };
+  const parsedLogs = (logs?.results ?? []).map((row) => ({ ...row, data: parse(row.data_json, null) }));
+  const improvementLog = parsedLogs.find((row) => row.stage === 'improvement');
   return {
     run: run ?? null,
     snapshot: snapshot ? { ...snapshot, positions: parse(snapshot.positions_json, []) } : null,
@@ -333,7 +335,8 @@ export async function getRunBundle(db, runId) {
     proposal: proposal ? { ...proposal, parsed: parse(proposal.parsed_json, null), attempts: parse(proposal.attempts_json, []) } : null,
     validation: validation ? { ok: !!validation.ok, violations: parse(validation.violations_json, []), plan: parse(validation.plan_json, null) } : null,
     orders: (orders?.results ?? []).map((row) => ({ ...row, positionIds: parse(row.position_ids, []) })),
-    logs: (logs?.results ?? []).map((row) => ({ ...row, data: parse(row.data_json, null) })),
+    logs: parsedLogs,
+    improvement: improvementLog?.data ?? null,
   };
 }
 

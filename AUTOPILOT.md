@@ -35,7 +35,7 @@ come server MCP per la supervisione conversazionale.
 ```
 Cron orario (Cloudflare Workers)
    │
-   ├─ 1. COLLECTOR      eToro API + prezzi + macro + news
+   ├─ 1. COLLECTOR      mirror reale eToro + prezzi + macro + news
    ├─ 2. FEATURE ENGINE calcolo deterministico, nessuna AI
    ├─ 3. SCREENING      pool → shortlist (solo in modalità dinamica)
    ├─ 4. BRAIN          LLM: propone un'allocazione target
@@ -51,6 +51,12 @@ Cron orario (Cloudflare Workers)
 desiderata, in JSON. Il codice deterministico la trasforma in ordini e ha
 diritto di veto assoluto. Questo separa nettamente ciò che può sbagliare (il
 giudizio) da ciò che non deve sbagliare (i limiti di rischio).
+
+L'Agent Portfolio usa internamente una base tecnica normalizzata, ma questa non
+è capitale dell'utente. Autopilot collega l'Agent al relativo `mirrorId`, legge
+il capitale reale dal P&L del proprietario e usa esclusivamente quello per
+dashboard, feature, guardrail, ordini e performance. La scala tecnica resta
+interna all'executor e viene applicata soltanto al momento dell'invio a eToro.
 
 ### Perché Cloudflare
 
@@ -123,6 +129,7 @@ Nessuno è aggirabile dal modello. Ognuno è coperto da almeno un test.
 | Cap per strumento | Peso eccedente ⇒ ridotto e rinormalizzato |
 | Cap per classe | Classe eccedente ⇒ scalata proporzionalmente |
 | Numero di posizioni | Oltre il massimo ⇒ si tengono i pesi più alti |
+| Esposizioni equivalenti | GLD/IAU, BND/AGG e altri equivalenti contano come una sola fonte di rischio; resta il ticker già principale o, in partenza, quello con score migliore |
 | Cassa min/max | Riserva protetta dagli acquisti |
 | Turnover per run | Piano scalato proporzionalmente |
 | Ordini per run / 24h | Si tengono gli scostamenti maggiori |
@@ -154,6 +161,13 @@ Nessuno è aggirabile dal modello. Ognuno è coperto da almeno un test.
 - **shadow** — il ciclo gira ma si ferma prima di costruire ordini
 - **dry-run** — ordini costruiti e validati su eToro, mai inviati
 - **live** — ordini reali; richiede il token e una conferma letterale
+
+Un piano bloccato espone il comando **Migliora piano**. Il Worker apre una
+nuova run sempre in `dry-run`, passa al revisore gli esiti dei guardrail e prova
+prima un provider diverso da quello precedente quando disponibile. La
+confidence non viene alterata: anche la revisione deve superare realmente la
+soglia. La proposta originale resta consultabile e la nuova run conserva il
+collegamento alla run di origine nell'audit.
 
 ---
 
@@ -204,6 +218,13 @@ coin, volatilità e concentrazione. Da queste risposte nasce una `StrategySpec`
 versionata; il catalogo genera fino a 60 candidati e lo screening decide nel
 tempo quali portare al modello. Le posizioni già aperte ma fuori policy restano
 visibili e diventano **sell-only**.
+
+Il minimo di posizioni è soltanto una barriera. Per un portafoglio iniziale il
+motore mira al numero preferito generato dalla strategia (di norma il 75% del
+massimo: 15 su 20) e completa deterministicamente una proposta AI troppo
+concentrata con i candidati meglio classificati. Se gli storici disponibili o
+i cap non consentono ancora quell'allocazione, la run aspetta il riscaldamento
+della cache prima di chiamare l'AI.
 
 Il prompt include i **vincoli temporali** dal registro posizioni, così l'AI non
 propone operazioni che verrebbero comunque bloccate.
@@ -265,6 +286,8 @@ free"`). Costruire su un catalogo che si svuota non è sostenibile.
 Il modello non riceve mai dati grezzi: il feature engine calcola tutto in codice
 e li rende come tabella a larghezza fissa invece che JSON. Risultato misurato
 dai test: **prompt sotto i 6.000 caratteri, circa 1.400 token**.
+Il capitale esatto, gli identificativi del conto e le credenziali non vengono
+passati ai provider AI: il prompt usa una fascia di capitale e pesi percentuali.
 
 ---
 
@@ -393,6 +416,8 @@ Telegram e webhook generico, entrambi opzionali e non bloccanti.
 | Token e portfolio potevano divergere | Segreto e metadata salvati separatamente | Tupla atomica con fingerprint; mismatch bloccato prima dello snapshot |
 | Modalità corrotta poteva inviare ordini | L’executor simulava solo due stringhe e trattava il resto come reale | Fail-closed: solo `live` esatto raggiunge gli endpoint di trading |
 | Riconciliazione congelava piani scalati | Confrontava il target teorico invece degli importi realmente ordinati | Peso atteso ricostruito dagli ordini del piano |
+| Capitale e performance basati sui 10.000 tecnici | Lo snapshot Agent veniva trattato come denaro dell'utente | Collegamento tramite `mirrorId`, valori reali end-to-end e nuova serie storica |
+| Proposta iniziale ferma a 3 strumenti | Il validator riduceva i cap ma non aggiungeva candidati | Target preferito, readiness degli storici e completamento deterministico della diversificazione |
 | Autopilot muto su mobile | `sessionStorage` fallisce su Safari iOS, errore ingoiato, `refresh()` usciva in silenzio | Schermata vuota senza spiegazione |
 | Autopilot invisibile su mobile | Voce solo in sidebar desktop | Pagina irraggiungibile sotto 768px |
 | Artefatti wrangler nel repo | `.gitignore` con tre righe | `.wrangler/tmp/` committato |
@@ -401,9 +426,9 @@ Telegram e webhook generico, entrambi opzionali e non bloccanti.
 
 ## 14. Test
 
-77 test complessivi, tutti senza rete reale:
+88 test complessivi, tutti senza rete reale:
 
-- 38 in `worker/selftest.mjs` per feature, guardrail, watcher, executor e
+- 49 in `worker/selftest.mjs` per feature, capitale reale, guardrail, revisione multi-provider, esposizioni equivalenti, watcher, executor e
   riconciliazione
 - 18 in `worker/strategy-selftest.mjs` per onboarding, consenso e StrategySpec
 - 11 in `worker/universe-policy-selftest.mjs` per universo dinamico e sell-only
