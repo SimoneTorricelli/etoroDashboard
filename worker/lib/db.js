@@ -483,6 +483,136 @@ export async function unfreezeSafetyConfig(db, { expectedSafetyRevision, recover
 }
 
 /**
+ * Ritrova run Live recenti che erano state congelate dopo avere persistito
+ * almeno un ordine reale. Il binding viene verificato sui dati dello snapshot
+ * salvati nell'audit della run, così una run di un altro Agent Portfolio non
+ * può essere riassociata per sola vicinanza temporale.
+ */
+export async function listDetachedLiveRecoveryRuns(db, {
+  activeAgentPortfolioId,
+  activeAgentPortfolioMirrorId = '',
+  sinceAt = Date.now() - 30 * 24 * 60 * 60 * 1000,
+  beforeAt = Date.now(),
+  limit = 5,
+} = {}) {
+  const portfolioId = String(activeAgentPortfolioId ?? '').trim();
+  const mirrorId = String(activeAgentPortfolioMirrorId ?? '').trim();
+  if (!portfolioId) return [];
+  const { results } = await db.prepare(`SELECT
+      r.id, r.started_at, r.finished_at, r.status, r.error,
+      lar.source_run_id,
+      a.decision_revision AS artifact_decision_revision,
+      a.decision_hash AS artifact_decision_hash,
+      a.binding_hash AS artifact_binding_hash,
+      COUNT(DISTINCT o.id) AS order_count,
+      MAX(o.updated_at) AS last_order_updated_at
+    FROM runs r
+    JOIN proposals p ON p.run_id = r.id AND p.parsed_json IS NOT NULL
+    JOIN validations v ON v.run_id = r.id AND v.ok = 1
+    JOIN orders o ON o.run_id = r.id
+      AND o.mode = 'live'
+      AND o.state NOT IN ('simulated', 'skipped')
+    JOIN audit snapshot_audit ON snapshot_audit.run_id = r.id
+      AND snapshot_audit.stage = 'snapshot'
+      AND json_valid(snapshot_audit.data_json)
+    LEFT JOIN live_activation_requests lar ON lar.run_id = r.id
+    LEFT JOIN decision_artifacts a ON a.source_run_id = lar.source_run_id
+    WHERE r.kind = 'rebalance'
+      AND r.execution_mode = 'live'
+      AND r.status IN ('frozen', 'error')
+      AND r.started_at >= ?
+      AND r.started_at <= ?
+      AND COALESCE(json_extract(snapshot_audit.data_json, '$.agentPortfolioId'), '') = ?
+      AND (? = '' OR COALESCE(json_extract(snapshot_audit.data_json, '$.mirrorId'), '') = ?)
+      AND EXISTS (
+        SELECT 1
+        FROM audit fail_safe
+        WHERE fail_safe.run_id = r.id
+          AND (
+            fail_safe.stage IN (
+              'reconcile-fail-safe',
+              'executor-fail-safe',
+              'pipeline-live-fail-safe',
+              'live-response-final-fence',
+              'live-recovery-barrier'
+            )
+            OR fail_safe.stage LIKE '%-cas-ambiguous'
+          )
+      )
+    GROUP BY
+      r.id, r.started_at, r.finished_at, r.status, r.error,
+      lar.source_run_id,
+      a.decision_revision, a.decision_hash, a.binding_hash
+    ORDER BY r.started_at DESC
+    LIMIT ?`)
+    .bind(
+      Math.max(0, Math.trunc(Number(sinceAt) || 0)),
+      Math.max(0, Math.trunc(Number(beforeAt) || Date.now())),
+      portfolioId,
+      mirrorId,
+      mirrorId,
+      Math.min(Math.max(Number(limit) || 5, 1), 20),
+    )
+    .all();
+  return results ?? [];
+}
+
+/**
+ * Riassocia una run storica soltanto se lo stato osservato dall'utente è
+ * ancora Shadow + Frozen, il binding è identico e nessun'altra recovery è già
+ * collegata. L'incremento dell'epoch invalida anteprime concorrenti.
+ */
+export async function attachDetachedLiveRecoveryRunIfUnchanged(db, expected, runId) {
+  const cleanRunId = String(runId ?? '').trim();
+  if (!cleanRunId) throw new TypeError('runId Live da riassociare obbligatorio');
+  const now = Date.now();
+  const reason = `recovery Live riassociata dalla cronologia: ${cleanRunId}`.slice(0, 300);
+  const row = await db.prepare(`UPDATE config
+    SET value = json_set(
+          value,
+          '$.recoveryRunIds', json_array(?),
+          '$.recoveryReason', ?,
+          '$.recoveryUpdatedAt', ?,
+          '$.safetyRevision',
+          CAST(COALESCE(json_extract(value, '$.safetyRevision'), 0) AS INTEGER) + 1
+        ),
+        updated_at = ?
+    WHERE key = ?
+      AND json_valid(value)
+      AND COALESCE(json_extract(value, '$.executionMode'), 'shadow') = 'shadow'
+      AND COALESCE(json_extract(value, '$.frozen'), 0) = 1
+      AND COALESCE(json_extract(value, '$.recoveryRequired'), 0) = 1
+      AND COALESCE(json_array_length(value, '$.recoveryRunIds'), 0) = 0
+      AND CAST(COALESCE(json_extract(value, '$.safetyRevision'), 0) AS INTEGER) = ?
+      AND CAST(COALESCE(json_extract(value, '$.decisionRevision'), 0) AS INTEGER) = ?
+      AND COALESCE(json_extract(value, '$.activeAgentPortfolioId'), '') = ?
+      AND COALESCE(json_extract(value, '$.activeAgentPortfolioMirrorId'), '') = ?
+      AND COALESCE(json_extract(value, '$.agentTokenFingerprint'), '') = ?
+      AND CAST(COALESCE(json_extract(value, '$.agentTokenVerifiedAt'), 0) AS INTEGER) = ?
+    RETURNING value`)
+    .bind(
+      cleanRunId,
+      reason,
+      now,
+      now,
+      CONFIG_KEY,
+      Math.max(0, Math.trunc(Number(expected.safetyRevision) || 0)),
+      Math.max(0, Math.trunc(Number(expected.decisionRevision) || 0)),
+      String(expected.activeAgentPortfolioId ?? ''),
+      String(expected.activeAgentPortfolioMirrorId ?? ''),
+      String(expected.agentTokenFingerprint ?? ''),
+      Math.max(0, Math.trunc(Number(expected.agentTokenVerifiedAt) || 0)),
+    )
+    .first();
+  if (!row?.value) return null;
+  try {
+    return deepMerge(DEFAULT_CONFIG, JSON.parse(row.value));
+  } catch {
+    throw new Error('D1 ha restituito uno stato di recovery riassociata non valido');
+  }
+}
+
+/**
  * Arma il Live con compare-and-swap sullo stato osservato a inizio run.
  * Un Safe stop, un freeze, un cambio strategia o un nuovo binding avvenuti
  * durante l'analisi fanno fallire l'UPDATE senza una finestra in cui inviare.
@@ -565,44 +695,6 @@ export async function armRecoveryLiveIfUnchanged(db, expected) {
     return deepMerge(DEFAULT_CONFIG, JSON.parse(row.value));
   } catch {
     throw new Error('D1 ha restituito uno stato Live di recovery non valido');
-  }
-}
-
-/** Torna in Shadow al termine della recovery one-shot, con la stessa fence. */
-export async function finishRecoveryToShadowIfUnchanged(db, expected) {
-  const row = await db.prepare(`UPDATE config
-    SET value = json_set(
-          json_patch(value, json('{"executionMode":"shadow","frozen":false,"frozenReason":"","recoveryRequired":false,"recoveryReason":"","recoveryRunIds":[],"recoveryUpdatedAt":0}')),
-          '$.safetyRevision',
-          CAST(COALESCE(json_extract(value, '$.safetyRevision'), 0) AS INTEGER) + 1
-        ),
-        updated_at = ?
-    WHERE key = ?
-      AND json_valid(value)
-      AND COALESCE(json_extract(value, '$.executionMode'), 'shadow') = 'live'
-      AND COALESCE(json_extract(value, '$.frozen'), 0) = 0
-      AND COALESCE(json_extract(value, '$.recoveryRequired'), 0) = 0
-      AND CAST(COALESCE(json_extract(value, '$.safetyRevision'), 0) AS INTEGER) = ?
-      AND CAST(COALESCE(json_extract(value, '$.decisionRevision'), 0) AS INTEGER) = ?
-      AND COALESCE(json_extract(value, '$.activeAgentPortfolioId'), '') = ?
-      AND COALESCE(json_extract(value, '$.agentTokenFingerprint'), '') = ?
-      AND CAST(COALESCE(json_extract(value, '$.agentTokenVerifiedAt'), 0) AS INTEGER) = ?
-    RETURNING value`)
-    .bind(
-      Date.now(),
-      CONFIG_KEY,
-      Math.max(0, Math.trunc(Number(expected.safetyRevision) || 0)),
-      Math.max(0, Math.trunc(Number(expected.decisionRevision) || 0)),
-      String(expected.activeAgentPortfolioId ?? ''),
-      String(expected.agentTokenFingerprint ?? ''),
-      Math.max(0, Math.trunc(Number(expected.agentTokenVerifiedAt) || 0)),
-    )
-    .first();
-  if (!row?.value) return null;
-  try {
-    return deepMerge(DEFAULT_CONFIG, JSON.parse(row.value));
-  } catch {
-    throw new Error('D1 ha restituito uno stato Shadow di recovery non valido');
   }
 }
 

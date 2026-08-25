@@ -13,8 +13,9 @@ import {
   prioritizeUntriedPlan, selectDiverseAttemptPlan,
 } from './lib/brain.js';
 import {
-  acquirePipelineLock, armLiveIfUnchanged, armRecoveryLiveIfUnchanged, DEFAULT_CONFIG, findLiveRecoveryBarrier,
-  finishRecoveryToShadowIfUnchanged, finishRunIfLiveFence, listStalePreArmActivations, mutateSafetyConfig, releasePipelineLock, renewPipelineLock,
+  acquirePipelineLock, armLiveIfUnchanged, armRecoveryLiveIfUnchanged, attachDetachedLiveRecoveryRunIfUnchanged,
+  DEFAULT_CONFIG, findLiveRecoveryBarrier, finishRunIfLiveFence, listDetachedLiveRecoveryRuns,
+  listStalePreArmActivations, mutateSafetyConfig, releasePipelineLock, renewPipelineLock,
 } from './lib/db.js';
 import { PROFILES, applyProfile, describeProfile, listProfiles } from './lib/profiles.js';
 import { checkChurnRules, filterMarginalSubstitutions, isWorthTheCost } from './lib/churn.js';
@@ -35,7 +36,7 @@ import {
 } from './lib/llm.js';
 import {
   buildCandleRefreshQueue, buildFailedProposalRetryContext, capitalTrackingResetReason, decideKind, romeParts,
-  freezeLiveRun, recoveryResidualPreview, recoverySnapshotsStable, resolveVerifiedAgentMirror, runPipeline, runWatcher, scaleAgentSnapshotToReal,
+  freezeLiveRun, recoveryFilledUsd, recoveryResidualPreview, recoverySnapshotsStable, resolveVerifiedAgentMirror, runPipeline, runWatcher, scaleAgentSnapshotToReal,
   shortlistDeploymentCapacity,
 } from './lib/pipeline.js';
 import { buildStrategyActivationNotification } from './lib/notify.js';
@@ -264,6 +265,31 @@ function createSafetyDb(initialConfig = {}, {
             state.vaultValue = value;
             state.vaultUpdatedAt = nextUpdatedAt;
             return { value, updated_at: nextUpdatedAt };
+          }
+          if (sql.startsWith('UPDATE config') && sql.includes("'$.recoveryRunIds', json_array(?)") && sql.includes('RETURNING value')) {
+            const [runId, reason, recoveryUpdatedAt,,, expectedSafetyRevision, expectedDecisionRevision,
+              portfolioId, mirrorId, fingerprint, verifiedAt] = this.args;
+            if (
+              state.config.executionMode !== 'shadow'
+              || !state.config.frozen
+              || !state.config.recoveryRequired
+              || (state.config.recoveryRunIds ?? []).length > 0
+              || Number(state.config.safetyRevision) !== Number(expectedSafetyRevision)
+              || Number(state.config.decisionRevision) !== Number(expectedDecisionRevision)
+              || String(state.config.activeAgentPortfolioId ?? '') !== String(portfolioId)
+              || String(state.config.activeAgentPortfolioMirrorId ?? '') !== String(mirrorId)
+              || String(state.config.agentTokenFingerprint ?? '') !== String(fingerprint)
+              || Number(state.config.agentTokenVerifiedAt ?? 0) !== Number(verifiedAt)
+            ) return null;
+            state.config = {
+              ...state.config,
+              recoveryRunIds: [runId],
+              recoveryReason: reason,
+              recoveryUpdatedAt,
+              safetyRevision: Number(state.config.safetyRevision ?? 0) + 1,
+            };
+            state.mutationQueries.push({ sql, args: this.args });
+            return { value: JSON.stringify(state.config) };
           }
           if (sql.startsWith('UPDATE config') && sql.includes('{"executionMode":"live","frozen":false') && sql.includes('RETURNING value')) {
             const [,, expectedSafetyRevision, expectedDecisionRevision, portfolioId, fingerprint, verifiedAt] = this.args;
@@ -2079,6 +2105,14 @@ test('recovery: il residuo nasce dalle posizioni reali e non ricompra ciò che �
   assert.equal(gld.actionable, true);
 });
 
+test('recovery: gli importi filled usano il richiesto reale e i partial vengono riscalati', () => {
+  const order = { amountUsd: 34, filledUsd: 0.05, executionScale: 20 };
+  assert.equal(recoveryFilledUsd(order, 'filled', 1), 34);
+  assert.equal(recoveryFilledUsd(order, 'partial', 200), 10);
+  assert.equal(recoveryFilledUsd(order, 'rejected', 200), 0);
+  assert.equal(recoveryFilledUsd(order, 'sent', 0), 0.05);
+});
+
 test('pipeline lock: acquire, renew e release rispettano owner e lease', async () => {
   const db = createSafetyDb();
   const first = await acquirePipelineLock(db, 'run-a', { now: 1_000, leaseMs: 2_000 });
@@ -2209,7 +2243,7 @@ test('safety config: ogni stop/unfreeze invalida una vecchia attivazione tramite
   assert.equal(armed.safetyRevision, 7);
 });
 
-test('recovery one-shot: arma solo da Shadow + Frozen e torna in Shadow con la stessa fence', async () => {
+test('recovery persistente: arma solo da Shadow + Frozen e conclude mantenendo il Live', async () => {
   const db = createSafetyDb({
     executionMode: 'shadow',
     frozen: true,
@@ -2231,11 +2265,61 @@ test('recovery one-shot: arma solo da Shadow + Frozen e torna in Shadow con la s
   assert.equal(armed.safetyRevision, 13);
   assert.equal(await armRecoveryLiveIfUnchanged(db, previewFence), null, 'la conferma non può essere riutilizzata');
 
-  const shadow = await finishRecoveryToShadowIfUnchanged(db, armed);
-  assert.equal(shadow.executionMode, 'shadow');
-  assert.equal(shadow.frozen, false);
-  assert.equal(shadow.safetyRevision, 14);
-  assert.equal(await finishRecoveryToShadowIfUnchanged(db, armed), null, 'la fence Live è single-use');
+  db.state.runs.set('recovery-live-run', 'running');
+  assert.equal(await finishRunIfLiveFence(db, 'recovery-live-run', 500, armed), true);
+  assert.equal(db.state.config.executionMode, 'live');
+  assert.equal(db.state.config.frozen, false);
+  assert.equal(db.state.config.safetyRevision, 13);
+});
+
+test('recovery scollegata: riassocia la run con CAS e invalida anteprime concorrenti', async () => {
+  const db = createSafetyDb({
+    executionMode: 'shadow',
+    frozen: true,
+    recoveryRequired: true,
+    recoveryRunIds: [],
+    safetyRevision: 8,
+    decisionRevision: 4,
+    activeAgentPortfolioId: 'portfolio-live',
+    activeAgentPortfolioMirrorId: 'mirror-live',
+    agentTokenFingerprint: 'fingerprint-live',
+    agentTokenVerifiedAt: 123,
+  });
+  const observed = { ...db.state.config };
+  const attached = await attachDetachedLiveRecoveryRunIfUnchanged(db, observed, 'live-frozen-1');
+  assert.deepEqual(attached.recoveryRunIds, ['live-frozen-1']);
+  assert.equal(attached.safetyRevision, 9);
+  assert.match(attached.recoveryReason, /live-frozen-1/);
+  assert.equal(await attachDetachedLiveRecoveryRunIfUnchanged(db, observed, 'live-frozen-1'), null);
+});
+
+test('recovery scollegata: la ricerca richiede piano, ordini Live, fail-safe e binding snapshot', async () => {
+  let captured = null;
+  const db = {
+    prepare(sql) {
+      return {
+        bind(...args) { captured = { sql, args }; return this; },
+        async all() {
+          return { results: [{ id: 'live-frozen-1', status: 'frozen', order_count: 3 }] };
+        },
+      };
+    },
+  };
+  const rows = await listDetachedLiveRecoveryRuns(db, {
+    activeAgentPortfolioId: 'portfolio-live',
+    activeAgentPortfolioMirrorId: 'mirror-live',
+    sinceAt: 100,
+    beforeAt: 200,
+    limit: 7,
+  });
+  assert.equal(rows[0].id, 'live-frozen-1');
+  assert.match(captured.sql, /r\.execution_mode = 'live'/);
+  assert.match(captured.sql, /r\.status IN \('frozen', 'error'\)/);
+  assert.match(captured.sql, /o\.state NOT IN \('simulated', 'skipped'\)/);
+  assert.match(captured.sql, /fail_safe\.stage IN/);
+  assert.match(captured.sql, /agentPortfolioId/);
+  assert.match(captured.sql, /mirrorId/);
+  assert.deepEqual(captured.args, [100, 200, 'portfolio-live', 'mirror-live', 'mirror-live', 7]);
 });
 
 test('live final CAS: una run diventa ok solo con fence e binding ancora identici', async () => {
@@ -2371,7 +2455,7 @@ test('control API: preparare la recovery richiede una conferma dedicata e non ar
   assert.equal(db.state.config.frozen, true);
 });
 
-test('control API: completare il residuo richiede piano, conferma one-shot e non accetta scorciatoie', async () => {
+test('control API: completare il residuo richiede piano, conferma Live persistente e non accetta scorciatoie', async () => {
   const db = createSafetyDb({
     executionMode: 'shadow', frozen: true, recoveryRequired: true, safetyRevision: 7,
   });
@@ -2384,7 +2468,7 @@ test('control API: completare il residuo richiede piano, conferma one-shot e non
       sourceRunId: 'dry-run-22',
       safetyRevision: 7,
       confirmation: 'ESEGUI LIVE',
-      acknowledgeOneShotShadow: true,
+      acknowledgePersistentLive: true,
     }),
   });
   const response = await handleAgentApi(
@@ -2399,6 +2483,34 @@ test('control API: completare il residuo richiede piano, conferma one-shot e non
   assert.equal(db.state.config.executionMode, 'shadow');
   assert.equal(db.state.config.frozen, true);
   assert.equal(db.state.mutationQueries.length, 0);
+});
+
+test('control API: la vecchia conferma di ritorno Shadow non può lasciare Live senza consenso', async () => {
+  const db = createSafetyDb({
+    executionMode: 'shadow', frozen: true, recoveryRequired: true, safetyRevision: 7,
+  });
+  const request = new Request('https://example.test/agent/recovery/execute', {
+    method: 'POST',
+    headers: { authorization: 'Bearer control-test', 'content-type': 'application/json' },
+    body: JSON.stringify({
+      activationId: '018f4f92-9fb4-7e66-8c74-c6ea23b88e7f',
+      sourceRunId: 'dry-run-22',
+      safetyRevision: 7,
+      confirmation: 'COMPLETA PIANO',
+      acknowledgeOneShotShadow: true,
+    }),
+  });
+  const response = await handleAgentApi(
+    request,
+    { DB: db, CONTROL_TOKEN: 'control-test' },
+    null,
+    '/agent/recovery/execute',
+  );
+  const body = await response.json();
+  assert.equal(response.status, 400);
+  assert.match(body.error, /acknowledgePersistentLive/);
+  assert.equal(db.state.config.executionMode, 'shadow');
+  assert.equal(db.state.config.frozen, true);
 });
 
 test('control API: unfreeze resta in shadow e non riattiva il live', async () => {

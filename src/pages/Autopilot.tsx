@@ -497,7 +497,10 @@ export default function Autopilot() {
         setRecoveryAcknowledged(false);
         setRecoveryDialogOpen(true);
         toast.success(`Verifica completata: ${result.alreadyAcquired ?? 0} acquisti già riconosciuti`, {
-          description: 'Nessun ordine inviato. L’agente resta congelato finché non scegli e confermi il piano da completare.',
+          description: [
+            result.warnings?.[0],
+            'Nessun ordine inviato. L’agente resta congelato finché non scegli e confermi il piano da completare.',
+          ].filter(Boolean).join(' '),
           duration: 12_000,
         });
       } else {
@@ -537,13 +540,13 @@ export default function Autopilot() {
         sourceRunId: selectedRecoveryRunId,
         safetyRevision,
         confirmation: LIVE_RECOVERY_EXECUTE_CONFIRMATION,
-        acknowledgeOneShotShadow: true,
+        acknowledgePersistentLive: true,
       });
       const detailMessage = result.error ?? result.reason ?? '';
       if (result.safetyPersisted === false) {
         toast.error('ALLARME CRITICO: arresto non confermato. Verifica subito eToro e non ripetere la recovery.', { duration: Infinity });
       } else if (result.status === 'ok' && result.recoveryCompleted) {
-        toast.success('Piano completato sui dati aggiornati. Gli acquisti già presenti non sono stati ripetuti e l’Autopilot è tornato in Shadow.');
+        toast.success('Piano completato sui dati aggiornati. Gli acquisti già presenti non sono stati ripetuti e l’Autopilot resta Live.');
         setRecoveryDialogOpen(false);
         setRecoveryPreview(null);
       } else if (result.status === 'frozen') {
@@ -1510,7 +1513,7 @@ export default function Autopilot() {
           setRecoveryAcknowledged(false);
         }
       }}>
-        <AlertDialogContent className="max-h-[calc(100dvh-2rem)] overflow-y-auto sm:max-w-3xl">
+        <AlertDialogContent className="max-h-[calc(100dvh-2rem)] overflow-x-hidden overflow-y-auto sm:max-w-3xl">
           <AlertDialogHeader>
             <AlertDialogTitle className="flex items-center gap-2 text-text-0">
               <ShieldAlert className="size-5 text-warn" /> Verifica e completa il piano originale
@@ -1549,7 +1552,7 @@ export default function Autopilot() {
                     disabled={executingRecovery}
                     onClick={() => setSelectedRecoveryRunId(candidate.sourceRunId)}
                     className={cn(
-                      'rounded-xl border p-3 text-left transition-colors',
+                      'min-w-0 overflow-hidden rounded-xl border p-3 text-left transition-colors',
                       selected ? 'border-agent bg-agent/10' : 'border-hairline bg-bg-2/40 hover:border-hairline-strong',
                     )}
                   >
@@ -1576,7 +1579,23 @@ export default function Autopilot() {
                 </div>
                 <Badge variant="outline">capitale {fmtUsd(recoveryPreview?.snapshot?.equityUsd)}</Badge>
               </div>
-              <div className="max-h-72 overflow-auto">
+              <div className="grid gap-2 sm:hidden">
+                {selectedRecoveryCandidate.residualPreview.map((row) => (
+                  <div key={row.symbol} className="rounded-lg border border-hairline bg-bg-1/70 p-3">
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-sm font-medium text-text-0">{row.symbol}</span>
+                      <span className={cn('text-sm font-medium tabular-nums', row.actionable ? row.side === 'buy' ? 'text-gain' : 'text-loss' : 'text-text-2')}>
+                        {row.actionable ? `${row.side === 'buy' ? '+' : '−'}${fmtUsd(row.residualUsd)}` : 'completo'}
+                      </span>
+                    </div>
+                    <div className="mt-2 grid grid-cols-2 gap-3 text-xs text-text-1">
+                      <span>Obiettivo<strong className="mt-0.5 block font-medium tabular-nums text-text-0">{fmtPct(row.targetWeight, 1)} · {fmtUsd(row.targetUsd)}</strong></span>
+                      <span>Già presente<strong className="mt-0.5 block font-medium tabular-nums text-text-0">{fmtPct(row.actualWeight, 1)} · {fmtUsd(row.actualUsd)}</strong></span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="hidden max-h-72 overflow-auto sm:block">
                 <Table>
                   <TableHeader>
                     <TableRow><TableHead>Asset</TableHead><TableHead className="text-right">Obiettivo</TableHead><TableHead className="text-right">Già presente</TableHead><TableHead className="text-right">Da completare</TableHead></TableRow>
@@ -1600,9 +1619,9 @@ export default function Autopilot() {
 
           <Alert>
             <ShieldAlert className="size-4" />
-            <AlertTitle>Recovery one-shot</AlertTitle>
+            <AlertTitle>Recovery con Live persistente</AlertTitle>
             <AlertDescription>
-              Non viene chiesta una nuova decisione all’AI. Gli ordini già riconosciuti riducono il residuo; gli ordini ambigui bloccano tutto. Dopo una riconciliazione riuscita la modalità torna automaticamente in Shadow.
+              Non viene chiesta una nuova decisione all’AI. Gli ordini già riconosciuti riducono il residuo; gli ordini ambigui bloccano tutto. Dopo una riconciliazione riuscita la modalità resta Live per i cicli successivi.
             </AlertDescription>
           </Alert>
 
@@ -1625,14 +1644,14 @@ export default function Autopilot() {
 
           <div className="flex items-start gap-2.5 rounded-xl border border-warn/30 bg-warn/5 p-3 text-sm leading-relaxed text-text-0">
             <Checkbox
-              id="recovery-one-shot-confirmation"
+              id="recovery-persistent-live-confirmation"
               checked={recoveryAcknowledged}
               onCheckedChange={(value) => setRecoveryAcknowledged(value === true)}
               disabled={executingRecovery}
               className="mt-0.5"
             />
-            <Label htmlFor="recovery-one-shot-confirmation" className="cursor-pointer font-normal leading-relaxed">
-              Confermo il piano selezionato e capisco che verranno inviati ordini reali soltanto per il residuo ricalcolato; al termine l’Autopilot tornerà in Shadow.
+            <Label htmlFor="recovery-persistent-live-confirmation" className="cursor-pointer font-normal leading-relaxed">
+              Confermo il piano selezionato e capisco che verranno inviati ordini reali soltanto per il residuo ricalcolato; al termine l’Autopilot resterà in modalità Live.
             </Label>
           </div>
 

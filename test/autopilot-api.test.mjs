@@ -288,7 +288,7 @@ test('prepareRecovery verifica gli acquisti senza inviare un comando Live', asyn
   assert.ok(!requests[0].url.includes('activate-and-run'));
 });
 
-test('executeRecovery invia piano scelto, revision e conferma one-shot', async () => {
+test('executeRecovery invia piano scelto, revision e conferma Live persistente', async () => {
   const requests = [];
   globalThis.fetch = async (input, init = {}) => {
     requests.push({ url: String(input), init });
@@ -296,7 +296,7 @@ test('executeRecovery invia piano scelto, revision e conferma one-shot', async (
       activationId: liveActivationId,
       runId: 'recovery-run-1',
       status: 'ok',
-      mode: 'shadow',
+      mode: 'live',
       recovery: true,
       recoveryCompleted: true,
       recoverySourceRunId: 'dry-run-22',
@@ -307,24 +307,24 @@ test('executeRecovery invia piano scelto, revision e conferma one-shot', async (
     sourceRunId: 'dry-run-22',
     safetyRevision: 18,
     confirmation: 'COMPLETA PIANO',
-    acknowledgeOneShotShadow: true,
+    acknowledgePersistentLive: true,
   };
 
   const result = await autopilot.executeRecovery(payload);
 
   assert.equal(result.recoveryCompleted, true);
-  assert.equal(result.mode, 'shadow');
+  assert.equal(result.mode, 'live');
   assert.equal(requests[0].url, 'https://worker.example/agent/recovery/execute');
   assert.equal(requests[0].init.method, 'POST');
   assert.deepEqual(JSON.parse(requests[0].init.body), payload);
 });
 
-test('executeRecovery rifiuta un falso successo che non termina in Shadow', async () => {
+test('executeRecovery rifiuta un falso successo che non mantiene il Live', async () => {
   globalThis.fetch = async () => jsonResponse({
     activationId: liveActivationId,
     runId: 'recovery-run-1',
     status: 'ok',
-    mode: 'live',
+    mode: 'shadow',
     recovery: true,
     recoveryCompleted: true,
     recoverySourceRunId: 'dry-run-22',
@@ -334,8 +334,8 @@ test('executeRecovery rifiuta un falso successo che non termina in Shadow', asyn
     sourceRunId: 'dry-run-22',
     safetyRevision: 18,
     confirmation: 'COMPLETA PIANO',
-    acknowledgeOneShotShadow: true,
-  }), /deve terminare in Shadow/);
+    acknowledgePersistentLive: true,
+  }), /deve mantenere il Live attivo/);
 });
 
 test('activateLive rifiuta fail-closed payload 2xx incoerenti o malformati', async (t) => {

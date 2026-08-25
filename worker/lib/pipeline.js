@@ -19,10 +19,11 @@ import { notify } from './notify.js';
 import { PROFILES, describeProfile } from './profiles.js';
 import { hasVerifiedAgentBinding, resolveCredentials, missingRequired, saveCredentials } from './vault.js';
 import {
-  acquirePipelineLock, armLiveIfUnchanged, armRecoveryLiveIfUnchanged, audit, cacheUniverse, countOpportunisticThisWeek, countOrdersToday, equityHistory,
+  acquirePipelineLock, armLiveIfUnchanged, armRecoveryLiveIfUnchanged, attachDetachedLiveRecoveryRunIfUnchanged,
+  audit, cacheUniverse, countOpportunisticThisWeek, countOrdersToday, equityHistory,
   claimLatestDecisionArtifact, findLiveRecoveryBarrier, finishLiveActivation, finishRun, finishRunIfLiveFence,
-  finishRecoveryToShadowIfUnchanged, getLiveActivation, getRunBundle,
-  latestDryRunWithArtifact, listRecoveryPlanCandidates, listStalePreArmActivations, listWatcherEvents, loadConfig, loadLedger, loadUniverseCache,
+  getLiveActivation, getRunBundle,
+  latestDryRunWithArtifact, listDetachedLiveRecoveryRuns, listRecoveryPlanCandidates, listStalePreArmActivations, listWatcherEvents, loadConfig, loadLedger, loadUniverseCache,
   recordEquity, reserveLiveActivation,
   mutateSafetyConfig, recordLedgerTrade, releasePipelineLock, renewPipelineLock, saveConfig,
   releaseDecisionArtifactClaim, releaseDecisionArtifactClaimsByRun,
@@ -190,6 +191,22 @@ function storedOrderRecord(row, patch = {}) {
     message: row.message ?? null,
     ...patch,
   };
+}
+
+/**
+ * Gli importi restituiti dal lookup eToro appartengono al conto virtuale
+ * dell'Agent. Un ordine `filled` ha completato l'importo richiesto reale;
+ * soltanto un `partial` usa quindi il valore del lookup, riportato alla scala
+ * del mirror. Questo evita di mostrare come pochi centesimi un acquisto reale.
+ */
+export function recoveryFilledUsd(order, state, lookupFilledUsd = 0) {
+  if (state === 'filled') return roundMoney(order.amountUsd);
+  if (state === 'rejected') return 0;
+  if (state === 'partial' && Number(lookupFilledUsd) > 0) {
+    const executionScale = Math.max(0.000001, Number(order.executionScale) || 1);
+    return roundMoney(Number(lookupFilledUsd) / executionScale);
+  }
+  return roundMoney(order.filledUsd);
 }
 
 export function recoveryResidualPreview(bundle, snapshot, config) {
@@ -766,7 +783,7 @@ export async function prepareLiveRecovery({ env, expectedSafetyRevision }) {
   }
 
   try {
-    const config = await loadConfig(db);
+    let config = await loadConfig(db);
     if (!config.frozen || !config.recoveryRequired) {
       return { status: 'blocked', reason: 'non esiste una recovery Live congelata da preparare', config };
     }
@@ -779,18 +796,68 @@ export async function prepareLiveRecovery({ env, expectedSafetyRevision }) {
       return { status: 'blocked', reason: 'Agent Portfolio non verificato: impossibile controllare gli acquisti', config };
     }
     const client = buildClient(resolved, config);
-    const recoveryRunIds = [...new Set((config.recoveryRunIds ?? []).map(String).filter(Boolean))];
+    let recoveryRunIds = [...new Set((config.recoveryRunIds ?? []).map(String).filter(Boolean))];
+    const preparationWarnings = [];
     if (!recoveryRunIds.length) {
-      return { status: 'blocked', reason: 'run Live da recuperare non identificata', config };
+      const beforeAt = Math.max(0, Number(config.recoveryUpdatedAt) || Date.now());
+      const detachedRows = await listDetachedLiveRecoveryRuns(db, {
+        activeAgentPortfolioId: config.activeAgentPortfolioId,
+        activeAgentPortfolioMirrorId: config.activeAgentPortfolioMirrorId,
+        sinceAt: Math.max(0, beforeAt - 30 * 24 * 60 * 60 * 1000),
+        beforeAt,
+        limit: 10,
+      });
+      const currentDecisionContext = await buildDecisionContext(config);
+      const compatibleRows = detachedRows.filter((row) => {
+        if (!row.source_run_id) return true;
+        return Number(row.artifact_decision_revision) === Number(currentDecisionContext.decisionRevision)
+          && row.artifact_decision_hash === currentDecisionContext.decisionHash
+          && row.artifact_binding_hash === currentDecisionContext.bindingHash;
+      });
+      const recovered = compatibleRows[0] ?? null;
+      if (!recovered) {
+        return {
+          status: 'blocked',
+          reason: detachedRows.length
+            ? 'la run Live storica appartiene a una strategia o a un Agent Portfolio non più compatibile'
+            : 'run Live da recuperare non identificata nella cronologia verificabile',
+          config,
+        };
+      }
+      const attached = await attachDetachedLiveRecoveryRunIfUnchanged(db, config, recovered.id);
+      if (!attached) {
+        return {
+          status: 'blocked',
+          reason: 'lo stato di sicurezza è cambiato mentre la run Live veniva riassociata: aggiorna e riprova',
+          config: await loadConfig(db),
+        };
+      }
+      config = attached;
+      recoveryRunIds = [String(recovered.id)];
+      preparationWarnings.push(`Run Live ${recovered.id} ritrovata e riassociata dalla cronologia (${Number(recovered.order_count) || 0} ordini registrati).`);
+      try {
+        await audit(db, recovered.id, 'warn', 'live-recovery-reattach', 'Run Live riassociata dopo uno sblocco manuale', {
+          sourceRunId: recovered.source_run_id ?? null,
+          orderCount: Number(recovered.order_count) || 0,
+          lastOrderUpdatedAt: Number(recovered.last_order_updated_at) || null,
+        });
+      } catch (error) {
+        preparationWarnings.push(`Audit della riassociazione non salvato: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
     const bundles = await Promise.all(recoveryRunIds.map((runId) => getRunBundle(db, runId)));
     if (bundles.some((bundle) => !bundle.run || !bundle.validation?.plan)) {
       return { status: 'blocked', reason: 'piano originale della run Live non disponibile', config };
     }
 
-    const orders = bundles.flatMap((bundle) => bundle.orders)
-      .filter((order) => order.mode === 'live' && !['simulated', 'skipped'].includes(order.state))
-      .map((order) => storedOrderRecord(order));
+    const orders = bundles.flatMap((bundle) => {
+      const executionScale = Number(bundle.validation?.plan?.executionScale) > 0
+        ? Number(bundle.validation.plan.executionScale)
+        : 1;
+      return bundle.orders
+        .filter((order) => order.mode === 'live' && !['simulated', 'skipped'].includes(order.state))
+        .map((order) => storedOrderRecord(order, { executionScale }));
+    });
     const verifiedOrders = [];
     const unresolved = [];
     const summarizeVerifiedOrders = () => verifiedOrders.map(({
@@ -801,8 +868,14 @@ export async function prepareLiveRecovery({ env, expectedSafetyRevision }) {
       positionIds: (positionIds ?? []).map(Number).filter(Boolean),
     }));
     for (const order of orders) {
-      if (['filled', 'rejected'].includes(order.state)) {
-        verifiedOrders.push(order);
+      if (order.state === 'filled') {
+        const normalized = { ...order, filledUsd: recoveryFilledUsd(order, 'filled') };
+        if (Math.abs(normalized.filledUsd - order.filledUsd) >= 0.01) await upsertOrder(db, normalized);
+        verifiedOrders.push(normalized);
+        continue;
+      }
+      if (order.state === 'rejected') {
+        verifiedOrders.push({ ...order, filledUsd: 0 });
         continue;
       }
       try {
@@ -815,7 +888,7 @@ export async function prepareLiveRecovery({ env, expectedSafetyRevision }) {
           state,
           etoroOrderId: lookup.orderId || order.etoroOrderId,
           positionIds: lookup.positionIds ?? order.positionIds,
-          filledUsd: roundMoney(lookup.filledUsd || (state === 'filled' ? order.amountUsd : order.filledUsd)),
+          filledUsd: recoveryFilledUsd(order, state, lookup.filledUsd),
           message: lookup.error ? `${lookup.label} — ${lookup.error}` : lookup.label,
         });
         await upsertOrder(db, updated);
@@ -885,7 +958,7 @@ export async function prepareLiveRecovery({ env, expectedSafetyRevision }) {
         orderSummary: summarizeVerifiedOrders(),
       };
     }
-    const warnings = [];
+    const warnings = [...preparationWarnings];
     try {
       await audit(db, recoveryRunIds[0], 'warn', 'live-recovery-ready', 'Acquisti verificati; piani disponibili per il completamento del residuo', {
         recoveryRunIds,
@@ -999,51 +1072,25 @@ async function commitLiveRunSuccess({ db, runId, config, credentials, equityUsd,
 }
 
 /**
- * La recovery non abilita la schedulazione Live permanente: dopo il residuo
- * torna in Shadow con una CAS sullo stesso fence usato dall'esecutore.
+ * Conclude la recovery sullo stesso fence Live dell'esecutore ordinario. Una
+ * riuscita lascia il Live persistente; uno stop concorrente o una CAS ambigua
+ * continuano invece a prevalere e congelano in sicurezza.
  */
-async function completeRecoveryOneShot({ db, runId, config, credentials, equityUsd, data = null }) {
-  const shadow = await finishRecoveryToShadowIfUnchanged(db, config);
-  if (shadow) {
-    const finished = await finishRun(db, runId, 'ok', equityUsd);
-    if (!finished) throw new Error('run di recovery non terminalizzata dopo il ritorno in Shadow');
-    try {
-      await audit(db, runId, 'warn', 'live-recovery-complete', 'Residuo completato; modalità riportata automaticamente in Shadow', data ?? undefined);
-    } catch { /* Shadow è già autorevole; l'audit resta best-effort */ }
-    return { status: 'ok', mode: 'shadow', config: shadow };
-  }
-
-  const current = await loadConfig(db).catch(() => null);
-  if (current?.executionMode === 'shadow') {
-    const status = current.frozen ? 'frozen' : 'ok';
-    await finishRun(db, runId, status, equityUsd, current.frozen ? current.frozenReason : null);
-    return {
-      status,
-      mode: 'shadow',
-      config: current,
-      ...(current.frozen ? {
-        safetyPersisted: true,
-        reason: current.frozenReason || 'recovery interrotta da uno stop concorrente',
-      } : {}),
-    };
-  }
-
-  const safety = await freezeLiveRun({
+async function completeRecoveryPersistentLive({ db, runId, config, credentials, equityUsd, data = null }) {
+  const failure = await commitLiveRunSuccess({
     db,
     runId,
+    config,
     credentials,
     equityUsd,
-    reason: 'impossibile confermare il ritorno in Shadow dopo la recovery; verifica eToro',
     stage: 'live-recovery-final-fence',
     data,
   });
-  return {
-    status: safety.status,
-    mode: safety.config?.executionMode ?? null,
-    safetyPersisted: safety.safetyPersisted,
-    reason: safety.reason,
-    safety,
-  };
+  if (failure) return failure;
+  try {
+    await audit(db, runId, 'warn', 'live-recovery-complete', 'Residuo completato; modalità Live mantenuta attiva', data ?? undefined);
+  } catch { /* La run e il fence Live sono già persistiti; l'audit è best-effort. */ }
+  return { status: 'ok', mode: 'live', config };
 }
 
 // ---------------------------------------------------------------- pipeline
@@ -1110,7 +1157,6 @@ function replayLiveActivation(row, currentConfig = null) {
   if (row.response_json) {
     try {
       const parsed = JSON.parse(row.response_json);
-      if (parsed?.recovery === true) return { ...parsed, replayed: true };
       const stoppedAfterResult = currentConfig
         && (parsed.status === 'ok' || parsed.mode === 'live')
         && (
@@ -1567,7 +1613,7 @@ function compactRecoveryExecutionResult(activationId, sourceRunId, result) {
 
 /**
  * Completa una recovery usando esattamente i target del piano scelto. È
- * idempotente per activationId e torna automaticamente in Shadow.
+ * idempotente per activationId e, dopo il successo, mantiene il Live attivo.
  */
 export async function executeLiveRecovery({ env, activationId, sourceRunId, expectedSafetyRevision }) {
   const db = env.DB;
@@ -1681,7 +1727,7 @@ export async function executeLiveRecovery({ env, activationId, sourceRunId, expe
     const reservation = await reserveLiveActivation(db, activationId, runId);
     if (!reservation.created) return replayLiveActivation(reservation.row, current);
     await setLiveActivationSource(db, activationId, sourceRunId);
-    await audit(db, null, 'warn', 'live-recovery-execute', 'Completamento one-shot del piano selezionato richiesto', {
+    await audit(db, null, 'warn', 'live-recovery-execute', 'Completamento del piano selezionato con permanenza in Live richiesto', {
       activationId, runId, sourceRunId,
     });
 
@@ -1696,7 +1742,7 @@ export async function executeLiveRecovery({ env, activationId, sourceRunId, expe
         liveActivationId: activationId,
         recoverySourceRunId: sourceRunId,
         recoveryExpectedSafetyRevision: expectedSafetyRevision,
-        recoveryOneShot: true,
+        recoveryPersistentLive: true,
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -1721,6 +1767,33 @@ export async function executeLiveRecovery({ env, activationId, sourceRunId, expe
         response.persistenceWarning = 'Esito della recovery non persistito: non ripetere automaticamente l’operazione.';
       }
     }
+    if (response.status === 'ok') {
+      try {
+        const currentAfterPersistence = await loadConfig(db);
+        if (
+          currentAfterPersistence.executionMode !== 'live'
+          || currentAfterPersistence.frozen
+          || currentAfterPersistence.recoveryRequired
+        ) {
+          response = {
+            ...response,
+            historicalStatus: response.status,
+            historicalMode: response.mode,
+            status: currentAfterPersistence.frozen ? 'frozen' : 'blocked',
+            mode: currentAfterPersistence.executionMode,
+            safetyPersisted: currentAfterPersistence.frozen ? true : response.safetyPersisted,
+            reason: currentAfterPersistence.frozen
+              ? `stato corrente congelato: ${currentAfterPersistence.frozenReason || currentAfterPersistence.recoveryReason || 'stop remoto'}`
+              : `stato corrente ${currentAfterPersistence.executionMode}: il Live non è più attivo`,
+          };
+        }
+      } catch (error) {
+        response.persistenceWarning = [
+          response.persistenceWarning,
+          `Stato Live non riconfermato dopo la recovery: ${error instanceof Error ? error.message : String(error)}`,
+        ].filter(Boolean).join(' ');
+      }
+    }
     return response;
   } finally {
     try { await releasePipelineLock(db, runId); } catch { /* il lease scade comunque */ }
@@ -1730,7 +1803,7 @@ export async function executeLiveRecovery({ env, activationId, sourceRunId, expe
 async function runPipelineWithLock({
   env, kind, modeOverride, improveFromRunId = '', retryFromRunId = '', runId,
   delayedLiveArm = false, reuseLatestDryRun = false, liveActivationId = '',
-  recoverySourceRunId = '', recoveryExpectedSafetyRevision = null, recoveryOneShot = false,
+  recoverySourceRunId = '', recoveryExpectedSafetyRevision = null, recoveryPersistentLive = false,
 }) {
   const db = env.DB;
   const renewLease = async (stage) => {
@@ -1788,7 +1861,7 @@ async function runPipelineWithLock({
     return { runId, status: 'blocked', error };
   }
   if (recoveryMode && mode !== 'live') {
-    const error = 'una recovery può essere eseguita soltanto come ciclo Live one-shot';
+    const error = 'una recovery può essere eseguita soltanto come ciclo Live';
     await audit(db, runId, 'error', 'live-recovery', error);
     await finishRun(db, runId, 'blocked', null, error);
     return { runId, status: 'blocked', mode: config.executionMode, error };
@@ -2445,8 +2518,8 @@ async function runPipelineWithLock({
       }
       await audit(db, runId, 'info', 'executor', 'Nessuna azione: allocazione già entro le bande e la disciplina di rotazione');
       if (mode === 'live') {
-        const completion = recoveryMode && recoveryOneShot
-          ? await completeRecoveryOneShot({
+        const completion = recoveryMode && recoveryPersistentLive
+          ? await completeRecoveryPersistentLive({
             db, runId, config, credentials, equityUsd,
             data: { action: 'none', sourceRunId: recoverySourceRunId },
           })
@@ -2657,8 +2730,8 @@ async function runPipelineWithLock({
     }
 
     if (mode === 'live') {
-      const completion = recoveryMode && recoveryOneShot
-        ? await completeRecoveryOneShot({
+      const completion = recoveryMode && recoveryPersistentLive
+        ? await completeRecoveryPersistentLive({
           db, runId, config, credentials, equityUsd,
           data: { execution, reconciliation, sourceRunId: recoverySourceRunId },
         })

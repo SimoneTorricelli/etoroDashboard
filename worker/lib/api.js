@@ -1233,8 +1233,8 @@ export async function handleAgentApi(request, env, ctx, pathname) {
     if (body.confirmation !== LIVE_RECOVERY_EXECUTE_CONFIRMATION) {
       return json({ error: `serve confirmation = "${LIVE_RECOVERY_EXECUTE_CONFIRMATION}"` }, 400);
     }
-    if (body.acknowledgeOneShotShadow !== true) {
-      return json({ error: 'acknowledgeOneShotShadow deve essere true' }, 400);
+    if (body.acknowledgePersistentLive !== true) {
+      return json({ error: 'acknowledgePersistentLive deve essere true' }, 400);
     }
     const result = await executeLiveRecovery({
       env,

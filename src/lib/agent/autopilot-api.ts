@@ -824,7 +824,7 @@ function validateRecoveryExecutionPayload(
     invalidApiPayload(path, 'runId deve essere una stringa non vuota oppure null');
   }
   if (value.status === 'ok') {
-    if (value.mode !== 'shadow') invalidApiPayload(path, 'una recovery riuscita deve terminare in Shadow');
+    if (value.mode !== 'live') invalidApiPayload(path, 'una recovery riuscita deve mantenere il Live attivo');
     if (value.recoveryCompleted !== true) invalidApiPayload(path, 'una recovery riuscita non risulta completata');
     if (typeof value.runId !== 'string') invalidApiPayload(path, 'runId manca per la recovery riuscita');
   }
@@ -968,7 +968,7 @@ export const autopilot = {
     sourceRunId: string;
     safetyRevision: number;
     confirmation: typeof LIVE_RECOVERY_EXECUTE_CONFIRMATION;
-    acknowledgeOneShotShadow: true;
+    acknowledgePersistentLive: true;
   }) => validateRecoveryExecutionPayload(
     await call<unknown>('/agent/recovery/execute', {
       method: 'POST',
