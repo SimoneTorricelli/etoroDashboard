@@ -20,9 +20,10 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import {
-  AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
+  AlertDialog, AlertDialogCancel, AlertDialogContent,
   AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
+import { Checkbox } from '@/components/ui/checkbox';
 import { HowItWorks } from '@/components/autopilot/HowItWorks';
 import { DiagnosticsPanel } from '@/components/autopilot/DiagnosticsPanel';
 import { GuardrailsEditor } from '@/components/autopilot/GuardrailsEditor';
@@ -39,7 +40,7 @@ import {
 import { cn } from '@/lib/utils';
 import {
   autopilot, getBaseUrl, getControlToken, isTokenRemembered, setBaseUrl, setControlToken,
-  AutopilotError,
+  AutopilotError, LIVE_CONFIRMATION, LIVE_RECOVERY_CONFIRMATION,
   type AutopilotState, type ExecutionMode, type RunBundle, type RunSummary,
   type GuidedStrategyBundle, type LlmAttempt, type StrategyCollaboration, type StrategyTraceEvent,
 } from '@/lib/agent/autopilot-api';
@@ -145,7 +146,7 @@ function CopyTechnicalReportButton({ attempts, runId }: { attempts: LlmAttempt[]
 const MODES: Array<{ id: ExecutionMode; icon: typeof Eye; title: string; short: string; tone: string }> = [
   { id: 'shadow', icon: Eye, title: 'Shadow', short: 'Propone e basta. Nessun ordine viene costruito.', tone: 'text-text-0' },
   { id: 'dry-run', icon: FlaskConical, title: 'Dry-run', short: 'Costruisce gli ordini e li valida su eToro, ma non li invia.', tone: 'text-warn' },
-  { id: 'live', icon: Radio, title: 'Live', short: 'Invia ordini reali sull’Agent Portfolio, senza altra conferma.', tone: 'text-loss' },
+  { id: 'live', icon: Radio, title: 'Live', short: 'All’attivazione esegue subito un ciclo reale e resta attiva per quelli futuri.', tone: 'text-loss' },
 ];
 
 const STATUS_LABEL: Record<string, { text: string; className: string }> = {
@@ -171,6 +172,24 @@ const fmtPct = (value: number | null | undefined, digits = 1) =>
   value == null ? '—' : `${(value * 100).toFixed(digits)}%`;
 const fmtDate = (value: number | null | undefined) =>
   value ? new Date(value).toLocaleString('it-IT', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : '—';
+
+const LIVE_REUSE_REASON: Record<string, string> = {
+  missing: 'non esiste ancora un dry-run completo',
+  incomplete: 'il dry-run più recente non è completo',
+  incompatible: 'il dry-run è precedente al nuovo flusso di attivazione',
+  consumed: 'quella decisione è già stata usata per un’attivazione Live',
+  expired: 'la decisione ha superato le due ore di validità',
+  'config-changed': 'strategia o limiti sono cambiati dopo il dry-run',
+  'portfolio-changed': 'il collegamento all’Agent Portfolio è cambiato',
+  blocked: 'il dry-run più recente è stato bloccato',
+  error: 'il dry-run più recente è terminato con errore',
+  frozen: 'il dry-run più recente è stato congelato',
+  running: 'il dry-run più recente è ancora in corso',
+};
+
+function explainLiveReuseReason(reason: string) {
+  return LIVE_REUSE_REASON[reason] ?? (reason || 'la decisione non è riutilizzabile');
+}
 
 const PREVIEW_COLLABORATION: StrategyCollaboration = {
   version: 1,
@@ -205,6 +224,10 @@ export default function Autopilot() {
   const [verifiedWorkerOrigin, setVerifiedWorkerOrigin] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [confirmLive, setConfirmLive] = useState(false);
+  const [liveConfirmation, setLiveConfirmation] = useState('');
+  const [livePersistenceAcknowledged, setLivePersistenceAcknowledged] = useState(false);
+  const [liveActivationId, setLiveActivationId] = useState('');
+  const [activatingLive, setActivatingLive] = useState(false);
   const [remember, setRemember] = useState(() => (
     isTokenRemembered()
     || (typeof window !== 'undefined' && window.matchMedia('(max-width: 767px)').matches)
@@ -247,6 +270,27 @@ export default function Autopilot() {
     setReviewingSavedStrategy(true);
     setOnboardingOpen(true);
   }, []);
+
+  const openLiveConfirmation = useCallback(() => {
+    if (typeof crypto === 'undefined' || typeof crypto.randomUUID !== 'function') {
+      toast.error('Questo browser non può creare un identificatore sicuro per la run Live. Aggiornalo e riprova.');
+      return;
+    }
+    setLiveActivationId(crypto.randomUUID());
+    setLiveConfirmation('');
+    setLivePersistenceAcknowledged(false);
+    setConfirmLive(true);
+  }, []);
+
+  const setLiveDialogOpen = useCallback((open: boolean) => {
+    if (activatingLive && !open) return;
+    setConfirmLive(open);
+    if (!open) {
+      setLiveConfirmation('');
+      setLivePersistenceAcknowledged(false);
+      setLiveActivationId('');
+    }
+  }, [activatingLive]);
 
   const refresh = useCallback(async ({ background = false }: { background?: boolean } = {}) => {
     if (!getControlToken()) {
@@ -411,6 +455,64 @@ export default function Autopilot() {
     try { setDetail(await autopilot.run(id)); } catch (caught) { toast.error(caught instanceof Error ? caught.message : String(caught)); }
   };
 
+  const activateLiveNow = async () => {
+    if (!liveActivationId || liveConfirmation !== LIVE_CONFIRMATION || !livePersistenceAcknowledged) return;
+    setActivatingLive(true);
+    setLoading(true);
+    try {
+      const result = await autopilot.activateLive({
+        activationId: liveActivationId,
+        confirmation: liveConfirmation,
+        acknowledgePersistentLive: livePersistenceAcknowledged,
+      });
+      const resultMessage = result.error ?? result.reason ?? 'nessun dettaglio disponibile';
+      if (result.safetyPersisted === false) {
+        toast.error('ALLARME CRITICO: arresto di sicurezza non confermato', {
+          description: 'Il Worker non ha potuto salvare Shadow + Frozen. Non assumere che gli invii siano fermi: controlla subito ordini e posizioni su eToro e prova “Arresta in sicurezza” dalla dashboard.',
+          duration: Infinity,
+        });
+      } else if (result.status === 'frozen') {
+        toast.error(`Esecuzione fermata e Autopilot congelato in Shadow: ${resultMessage}`);
+      } else if (result.status === 'error') {
+        toast.error(result.mode === 'live'
+          ? `Run fallita, ma la modalità risulta Live: ${resultMessage}. Usa “Arresta in sicurezza” se non vuoi i cicli futuri.`
+          : `Run Live fallita prima dell’attivazione: ${resultMessage}`);
+      } else if (result.status === 'blocked') {
+        toast.warning(result.mode === 'live'
+          ? `Live è attiva, ma l’esecuzione immediata è stata bloccata: ${resultMessage}`
+          : `Live non è stata attivata: ${resultMessage}`);
+      } else if (result.action === 'none' || result.plan?.orderCount === 0) {
+        toast.success('Live attivata: il portfolio era già entro le bande, quindi questa run non ha inviato ordini.');
+      } else if (result.decisionSource === 'reused-dry-run') {
+        toast.success('Live attivata: decisione del dry-run riutilizzata e ordini reali elaborati sui dati aggiornati.');
+      } else {
+        toast.success('Live attivata: nuova analisi completata e ciclo reale eseguito.');
+      }
+      if (result.persistenceWarning) {
+        toast.warning('Esito Live non salvato per un replay affidabile', {
+          description: `${result.persistenceWarning} Controlla la run e non avviare una nuova attivazione per compensare.`,
+          duration: 20_000,
+        });
+      }
+      await refresh();
+      if (result.runId) {
+        setActiveTab('storico');
+        await openRun(result.runId);
+      }
+      setConfirmLive(false);
+      setLiveConfirmation('');
+      setLivePersistenceAcknowledged(false);
+      setLiveActivationId('');
+    } catch (caught) {
+      // Il dialog resta aperto e conserva activationId: riprovare è sicuro
+      // anche se il Worker avesse concluso la prima richiesta senza risposta.
+      toast.error(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setLoading(false);
+      setActivatingLive(false);
+    }
+  };
+
   const generateGuidedStrategy = async (answers: StrategyOnboardingAnswers): Promise<StrategyOnboardingDraft> => {
     setStrategyTrace([]);
     if (!getControlToken()) {
@@ -468,6 +570,8 @@ export default function Autopilot() {
   const mode = config?.executionMode ?? 'shadow';
   const frozen = Boolean(config?.frozen);
   const safelyStopped = frozen && mode === 'shadow';
+  const dryRunForLive = state?.liveActivation?.dryRun ?? null;
+  const willReuseDryRun = Boolean(dryRunForLive?.reusable);
   const workerOrigin = getBaseUrl()
     || (typeof window !== 'undefined' ? window.location.origin : 'stessa origine');
   const realRuns = config?.realCapitalTrackingStartedAt
@@ -823,10 +927,17 @@ export default function Autopilot() {
                         <button
                           key={item.id}
                           type="button"
-                          disabled={loading}
-                          onClick={() => (item.id === 'live' ? setConfirmLive(true) : void guarded(`Modalità ${item.title}`, () => autopilot.setMode(item.id)))}
+                          disabled={loading || active}
+                          onClick={() => {
+                            if (item.id === 'live') {
+                              openLiveConfirmation();
+                              return;
+                            }
+                            const nextMode = item.id;
+                            void guarded(`Modalità ${item.title}`, () => autopilot.setMode(nextMode));
+                          }}
                           className={cn(
-                            'rounded-lg border p-3 text-left transition',
+                            'rounded-lg border p-3 text-left transition disabled:cursor-default',
                             active ? 'border-agent bg-agent/10' : 'border-hairline bg-bg-2/40 hover:border-hairline-strong',
                           )}
                         >
@@ -875,12 +986,25 @@ export default function Autopilot() {
                       <div>
                         <p className="text-sm font-medium text-text-0">{frozen ? 'Agente congelato' : 'Interruttore di emergenza'}</p>
                         <p className="text-xs text-text-1">
-                          {frozen ? 'Nessuna run può generare ordini. Riattiva solo dopo aver verificato le posizioni su eToro.' : 'Blocca all’istante qualsiasi esecuzione, automatica o manuale.'}
+                          {frozen
+                            ? config?.recoveryRequired
+                              ? 'Recovery richiesta: verifica ordini e posizioni direttamente su eToro. Il pulsante di sblocco vale come conferma esplicita e lascia l’agente in Shadow.'
+                              : 'Nessuna nuova run può generare ordini. Verifica comunque su eToro quelli già accettati o in volo prima di riattivare.'
+                            : 'Blocca subito nuovi invii. Gli ordini già accettati o in volo potrebbero non essere annullabili e vanno verificati su eToro.'}
                         </p>
                       </div>
                       {frozen ? (
-                        <Button variant="outline" size="sm" disabled={loading} onClick={() => void guarded('Agente riattivato', () => autopilot.unfreeze())}>
-                          <Unlock className="size-4" /> Sblocca in Shadow
+                        <Button variant="outline" size="sm" disabled={loading} onClick={() => void guarded('Agente riattivato in Shadow', () => {
+                          const safetyRevision = Number(config?.safetyRevision);
+                          if (!Number.isInteger(safetyRevision) || safetyRevision < 0) {
+                            return Promise.reject(new Error('Revisione di sicurezza assente: aggiorna lo stato prima di sbloccare.'));
+                          }
+                          return autopilot.unfreeze({
+                            safetyRevision,
+                            ...(config?.recoveryRequired ? { confirmation: LIVE_RECOVERY_CONFIRMATION } : {}),
+                          });
+                        })}>
+                          <Unlock className="size-4" /> {config?.recoveryRequired ? 'Ho verificato eToro · sblocca' : 'Sblocca in Shadow'}
                         </Button>
                       ) : (
                         <Button variant="destructive" size="sm" disabled={safeStopping} onClick={() => void safeStop()}>
@@ -1226,23 +1350,103 @@ export default function Autopilot() {
         </>
       )}
 
-      <AlertDialog open={confirmLive} onOpenChange={setConfirmLive}>
-        <AlertDialogContent>
+      <AlertDialog open={confirmLive} onOpenChange={setLiveDialogOpen}>
+        <AlertDialogContent className="max-h-[calc(100dvh-2rem)] overflow-y-auto sm:max-w-xl">
           <AlertDialogHeader>
-            <AlertDialogTitle>Attivare gli ordini reali?</AlertDialogTitle>
+            <AlertDialogTitle className="flex items-center gap-2 text-loss">
+              <Radio className="size-5" /> Attivare Live ed eseguire adesso?
+            </AlertDialogTitle>
             <AlertDialogDescription>
-              In modalità live il Worker invierà ordini veri sul tuo Agent Portfolio eToro, alla cadenza configurata e senza altra conferma.
-              I guardrail restano attivi, ma il capitale allocato è a rischio. Attiva solo dopo settimane di osservazione in shadow e dry-run.
+              Questa conferma avvia subito un ciclo che può inviare ordini reali. Non è un semplice cambio di modalità.
             </AlertDialogDescription>
           </AlertDialogHeader>
+
+          {willReuseDryRun && dryRunForLive ? (
+            <div className="rounded-xl border border-gain/30 bg-gain/5 p-4">
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge className="bg-gain/15 text-gain hover:bg-gain/15">Decisione dry-run riutilizzabile</Badge>
+                {dryRunForLive.model ? <Badge variant="outline" className="max-w-full truncate">{dryRunForLive.model}</Badge> : null}
+              </div>
+              <p className="mt-2 text-sm leading-relaxed text-text-0">
+                Verrà riutilizzata soltanto la decisione AI del dry-run del {fmtDate(dryRunForLive.finishedAt)}, valida fino al {fmtDate(dryRunForLive.expiresAt)}.
+              </p>
+              <p className="mt-1 text-xs leading-relaxed text-text-1">
+                {dryRunForLive.orderCount} ordini simulati · affidabilità {fmtPct(dryRunForLive.confidence)} · turnover {fmtPct(dryRunForLive.turnoverPct)}.
+                Il Worker rileggerà comunque il portfolio, ricalcolerà importi e ordini e ripeterà tutti i controlli prima dell’invio reale.
+                Se la decisione scade o diventa incompatibile prima della conferma, rifarà automaticamente l’analisi AI.
+              </p>
+            </div>
+          ) : (
+            <div className="rounded-xl border border-agent/30 bg-agent/5 p-4">
+              <Badge variant="outline">Nuova analisi necessaria</Badge>
+              <p className="mt-2 text-sm leading-relaxed text-text-0">
+                {dryRunForLive
+                  ? `La decisione del dry-run più recente non verrà riutilizzata: ${explainLiveReuseReason(dryRunForLive.reason)}.`
+                  : 'Non c’è una decisione dry-run riutilizzabile.'}
+              </p>
+              <p className="mt-1 text-xs leading-relaxed text-text-1">
+                Il Worker farà automaticamente una nuova analisi AI sui dati aggiornati. Attiverà Live e invierà gli ordini reali soltanto se proposta, guardrail e controlli eToro risultano validi.
+              </p>
+            </div>
+          )}
+
+          <Alert variant="destructive">
+            <ShieldAlert className="size-4" />
+            <AlertTitle>La modalità resta Live</AlertTitle>
+            <AlertDescription>
+              Dopo questo ciclo anche le esecuzioni future alla cadenza configurata potranno inviare ordini reali. “Arresta in sicurezza” blocca nuovi invii da qualsiasi dispositivo, ma non può annullare ordini già accettati o in volo: in quel caso controlla eToro.
+            </AlertDescription>
+          </Alert>
+
+          <div className="grid gap-2">
+            <Label htmlFor="live-confirmation" className="text-text-0">
+              Digita manualmente <code className="rounded bg-bg-2 px-1.5 py-0.5 text-loss">{LIVE_CONFIRMATION}</code>
+            </Label>
+            <Input
+              id="live-confirmation"
+              value={liveConfirmation}
+              onChange={(event) => setLiveConfirmation(event.target.value)}
+              onPaste={(event) => event.preventDefault()}
+              autoComplete="off"
+              spellCheck={false}
+              disabled={activatingLive}
+              placeholder={LIVE_CONFIRMATION}
+              className="font-mono"
+            />
+          </div>
+
+          <div className="flex items-start gap-2.5 rounded-xl border border-loss/30 bg-loss/5 p-3 text-sm leading-relaxed text-text-0">
+            <Checkbox
+              id="live-persistence-confirmation"
+              checked={livePersistenceAcknowledged}
+              onCheckedChange={(value) => setLivePersistenceAcknowledged(value === true)}
+              disabled={activatingLive}
+              className="mt-0.5"
+            />
+            <Label htmlFor="live-persistence-confirmation" className="cursor-pointer font-normal leading-relaxed">
+              Confermo che, dopo questa esecuzione, il Worker resterà in modalità Live e potrà inviare altri ordini reali finché non lo arresterò o cambierò modalità.
+            </Label>
+          </div>
+
           <AlertDialogFooter>
-            <AlertDialogCancel>Annulla</AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-loss text-white hover:bg-loss/90"
-              onClick={() => void guarded('Modalità live attivata', () => autopilot.setMode('live'))}
+            <AlertDialogCancel disabled={activatingLive}>Annulla</AlertDialogCancel>
+            <Button
+              type="button"
+              variant="destructive"
+              className="h-auto min-h-9 whitespace-normal py-2"
+              disabled={
+                activatingLive
+                || !liveActivationId
+                || liveConfirmation !== LIVE_CONFIRMATION
+                || !livePersistenceAcknowledged
+              }
+              onClick={() => void activateLiveNow()}
             >
-              Attiva ordini reali
-            </AlertDialogAction>
+              {activatingLive ? <RefreshCw className="size-4 animate-spin" /> : <Radio className="size-4" />}
+              {activatingLive
+                ? 'Attivazione e ciclo in corso…'
+                : willReuseDryRun ? 'Usa il dry-run ed esegui Live' : 'Ricalcola ed esegui Live'}
+            </Button>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>

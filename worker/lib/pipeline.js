@@ -9,21 +9,30 @@ import { EtoroClient } from './etoro.js';
 import { collectExternalContext } from './sources.js';
 import { buildFeatures, renderFeaturesPrompt } from './features.js';
 import { buildShortlist, renderShortlistPrompt } from './screening.js';
-import { askBrain } from './brain.js';
+import { askBrain, normalizeProposal } from './brain.js';
 import { exposureGroupFor, uniqueExposureCount } from './exposure.js';
 import { validateProposal } from './validator.js';
-import { executePlan, reconcile } from './executor.js';
+import { checkPlanEligibility, executePlan, readLiveSafetyFence, reconcile } from './executor.js';
 import { describeLedger } from './churn.js';
 import { classifyAnomaly, decideWatcherAction, detectAnomalies } from './watcher.js';
 import { notify } from './notify.js';
 import { PROFILES, describeProfile } from './profiles.js';
 import { hasVerifiedAgentBinding, resolveCredentials, missingRequired, saveCredentials } from './vault.js';
 import {
-  acquirePipelineLock, audit, cacheUniverse, countOpportunisticThisWeek, countOrdersToday, equityHistory,
-  finishRun, getRunBundle, listWatcherEvents, loadConfig, loadLedger, loadUniverseCache, recordEquity,
-  mutateSafetyConfig, recordLedgerTrade, releasePipelineLock, renewPipelineLock, saveConfig, saveFeatures,
-  saveProposal, saveSnapshot, saveValidation, saveWatcherEvent, startRun, syncLedger,
+  acquirePipelineLock, armLiveIfUnchanged, audit, cacheUniverse, countOpportunisticThisWeek, countOrdersToday, equityHistory,
+  claimLatestDecisionArtifact, findLiveRecoveryBarrier, finishLiveActivation, finishRun, finishRunIfLiveFence,
+  getLiveActivation, getRunBundle,
+  latestDryRunWithArtifact, listStalePreArmActivations, listWatcherEvents, loadConfig, loadLedger, loadUniverseCache,
+  recordEquity, reserveLiveActivation,
+  mutateSafetyConfig, recordLedgerTrade, releasePipelineLock, renewPipelineLock, saveConfig,
+  releaseDecisionArtifactClaim, releaseDecisionArtifactClaimsByRun,
+  saveDecisionArtifact, saveFeatures, saveProposal, saveSnapshot, saveValidation, saveWatcherEvent,
+  setLiveActivationSource, startRun, syncLedger, updateLiveActivationStatus,
 } from './db.js';
+import {
+  LIVE_DRY_RUN_TTL_MS, buildDecisionContext, classifyDryRunForReuse, compactLiveActivationResult,
+  comparePortfolioForReuse, proposalHash,
+} from './live-plan.js';
 
 const KV_CANDLES_BUNDLE = 'candles:v2:bundle';
 const CANDLE_CACHE_MAX_AGE_MS = 12 * 60 * 60 * 1000;
@@ -514,6 +523,10 @@ export async function freezeLiveRun({ db, runId, credentials = {}, equityUsd = n
         executionMode: 'shadow',
         frozen: true,
         frozenReason: safeReason,
+        recoveryRequired: true,
+        recoveryReason: safeReason,
+        recoveryRunIds: runId ? [runId] : [],
+        recoveryUpdatedAt: Date.now(),
       });
     } catch (error) {
       failures.push(`freeze D1 tentativo ${attempt}: ${error instanceof Error ? error.message : String(error)}`);
@@ -529,24 +542,110 @@ export async function freezeLiveRun({ db, runId, credentials = {}, equityUsd = n
   } catch (error) {
     failures.push(`audit: ${error instanceof Error ? error.message : String(error)}`);
   }
+  const safetyPersisted = Boolean(config);
+  const status = safetyPersisted ? 'frozen' : 'error';
   try {
-    await notify(credentials, 'critical', 'Autopilot congelato: verifica eToro', [
+    await notify(credentials, 'critical', safetyPersisted
+      ? 'Autopilot congelato: verifica eToro'
+      : 'CRITICO: stato Autopilot non confermato', [
       safeReason,
-      'La modalità è stata riportata in shadow. Controlla manualmente ordini e posizioni prima di riattivare.',
+      safetyPersisted
+        ? 'La modalità è stata riportata in Shadow e congelata. Controlla manualmente ordini e posizioni prima di riattivare.'
+        : 'D1 non ha confermato Shadow/Frozen. Blocca o verifica subito gli ordini direttamente su eToro e non riavviare il Live.',
     ]);
   } catch (error) {
     failures.push(`notifica: ${error instanceof Error ? error.message : String(error)}`);
   }
-  try {
-    await finishRun(db, runId, 'frozen', equityUsd, safeReason);
-  } catch (error) {
-    failures.push(`finishRun: ${error instanceof Error ? error.message : String(error)}`);
+  // Se Shadow + Frozen non è confermato, run e activation devono restare non
+  // terminali: sono la barriera persistente che impedirà al prossimo cron di
+  // inviare altri ordini mentre la config potrebbe essere ancora Live.
+  if (safetyPersisted) {
+    try {
+      await finishRun(db, runId, status, equityUsd, safeReason);
+    } catch (error) {
+      failures.push(`finishRun: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   if (failures.length) {
     console.error(JSON.stringify({ message: 'fail-safe live completato con errori', runId, failures }));
   }
-  return { config, safetyPersisted: Boolean(config), failures, reason: safeReason };
+  return { config, safetyPersisted, status, failures, reason: safeReason };
+}
+
+/** Ultima verifica autoritativa prima di dichiarare una run Live riuscita. */
+async function enforceFinalLiveFence({ db, runId, config, credentials, equityUsd, stage, data = null }) {
+  const fence = await readLiveSafetyFence(db, config);
+  if (fence.ok) return null;
+
+  // Un Safe stop già persistito è autorevole: non serve riscriverlo, ma la run
+  // non può più risultare `ok/live`.
+  if (fence.current?.executionMode === 'shadow' && fence.current.frozen) {
+    await audit(db, runId, 'warn', stage, `Run interrotta dallo stato finale: ${fence.reason}`, data ?? undefined);
+    await finishRun(db, runId, 'frozen', equityUsd, fence.reason);
+    return {
+      status: 'frozen',
+      mode: 'shadow',
+      reason: fence.reason,
+      safetyPersisted: true,
+    };
+  }
+
+  const safety = await freezeLiveRun({
+    db,
+    runId,
+    credentials,
+    equityUsd,
+    reason: `controllo finale Live fallito: ${fence.reason}`,
+    stage,
+    data: { ...data, finalFence: fence.reason },
+  });
+  return {
+    status: safety.status,
+    mode: safety.config?.executionMode ?? null,
+    reason: safety.reason,
+    safetyPersisted: safety.safetyPersisted,
+    safety,
+    error: safety.safetyPersisted ? null : 'Impossibile confermare il blocco in D1: intervieni direttamente su eToro.',
+  };
+}
+
+/**
+ * Commit atomico dell'esito Live. Se la CAS non riesce, distingue uno stop già
+ * persistito da uno stato ambiguo; quest'ultimo viene congelato in modo
+ * conservativo e non può essere presentato come successo.
+ */
+async function commitLiveRunSuccess({ db, runId, config, credentials, equityUsd, stage, data = null }) {
+  if (await finishRunIfLiveFence(db, runId, equityUsd, config)) return null;
+
+  const finalFence = await enforceFinalLiveFence({
+    db,
+    runId,
+    config,
+    credentials,
+    equityUsd,
+    stage: `${stage}-cas-recheck`,
+    data,
+  });
+  if (finalFence) return finalFence;
+
+  const safety = await freezeLiveRun({
+    db,
+    runId,
+    credentials,
+    equityUsd,
+    reason: 'impossibile confermare atomicamente la conclusione della run Live; verifica manualmente ordini e posizioni su eToro',
+    stage: `${stage}-cas-ambiguous`,
+    data,
+  });
+  return {
+    status: safety.status,
+    mode: safety.config?.executionMode ?? null,
+    reason: safety.reason,
+    safetyPersisted: safety.safetyPersisted,
+    safety,
+    error: safety.safetyPersisted ? null : 'Impossibile confermare il blocco in D1: intervieni direttamente su eToro.',
+  };
 }
 
 // ---------------------------------------------------------------- pipeline
@@ -590,6 +689,11 @@ export async function runPipeline(args) {
 
   try {
     return await runPipelineWithLock({ ...args, runId });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    try { await finishRun(db, runId, 'error', null, message); } catch { /* best-effort */ }
+    try { await audit(db, runId, 'error', 'pipeline-wrapper', message); } catch { /* best-effort */ }
+    return { runId, status: 'error', mode: null, error: message };
   } finally {
     try {
       await releasePipelineLock(db, runId);
@@ -603,7 +707,452 @@ export async function runPipeline(args) {
   }
 }
 
-async function runPipelineWithLock({ env, kind, modeOverride, improveFromRunId = '', retryFromRunId = '', runId }) {
+function replayLiveActivation(row, currentConfig = null) {
+  if (!row) return null;
+  if (row.response_json) {
+    try {
+      const parsed = JSON.parse(row.response_json);
+      const stoppedAfterResult = currentConfig
+        && (parsed.status === 'ok' || parsed.mode === 'live')
+        && (
+          currentConfig.executionMode !== 'live'
+          || currentConfig.frozen
+          || currentConfig.recoveryRequired
+        );
+      if (stoppedAfterResult) {
+        return {
+          ...parsed,
+          historicalStatus: parsed.status,
+          historicalMode: parsed.mode,
+          status: currentConfig.frozen ? 'frozen' : 'blocked',
+          mode: currentConfig.executionMode,
+          safetyPersisted: currentConfig.frozen ? true : parsed.safetyPersisted,
+          reason: currentConfig.frozen
+            ? `stato corrente congelato: ${currentConfig.frozenReason || currentConfig.recoveryReason || 'stop remoto'}`
+            : `stato corrente ${currentConfig.executionMode}: il Live non è più attivo`,
+          replayed: true,
+        };
+      }
+      return { ...parsed, replayed: true };
+    } catch { /* stato corrotto: fail closed sotto */ }
+  }
+  return {
+    activationId: row.activation_id,
+    runId: row.run_id ?? null,
+    status: 'blocked',
+    mode: null,
+    busy: true,
+    reason: 'activation-in-progress',
+    error: 'Questa attivazione Live è già stata avviata. Controlla la run esistente: non verrà creato un secondo ciclo.',
+    replayed: true,
+  };
+}
+
+/**
+ * Dopo aver persistito Shadow + Frozen, chiude anche le righe lasciate
+ * `running` da un hard abort. Senza questo passo la barriera corretta
+ * diventerebbe permanente anche dopo la verifica manuale e l'unfreeze.
+ */
+async function settleLiveRecoveryBarrier(db, barrier, safety) {
+  if (!barrier || !safety?.safetyPersisted) return false;
+  const runIds = new Set([
+    barrier.activation?.run_id,
+    barrier.order?.run_id,
+  ].filter(Boolean));
+  for (const staleRunId of runIds) {
+    await finishRun(db, staleRunId, 'frozen', null, safety.reason);
+  }
+  if (barrier.activation?.activation_id) {
+    const activationId = String(barrier.activation.activation_id);
+    const response = compactLiveActivationResult(activationId, {
+      runId: barrier.activation.run_id ?? barrier.order?.run_id ?? null,
+      status: 'frozen',
+      mode: safety.config?.executionMode ?? null,
+      safetyPersisted: true,
+      reason: safety.reason,
+      decisionSource: barrier.activation.source_run_id ? 'reused-dry-run' : 'fresh-analysis',
+      reusedDryRunId: barrier.activation.source_run_id ?? null,
+    });
+    const completion = await finishLiveActivation(db, activationId, 'frozen', response, safety.reason);
+    if (!completion.written && !completion.row?.response_json) {
+      throw new Error('activation di recovery non terminalizzata e risposta autorevole assente');
+    }
+    return {
+      settled: true,
+      canonicalResponse: completion.written
+        ? response
+        : replayLiveActivation(completion.row, safety.config),
+    };
+  }
+  return { settled: true, canonicalResponse: null };
+}
+
+/**
+ * Operazione atomica usata dal pulsante Live. Il lock viene acquisito prima
+ * della prenotazione e la modalità persistente viene armata soltanto dopo che
+ * snapshot, proposta e validator hanno prodotto un piano valido.
+ */
+export async function activateLiveAndRun({ env, activationId }) {
+  const db = env.DB;
+  const previous = await getLiveActivation(db, activationId);
+  // Un risultato terminale è sempre riproducibile. Una riga non terminale,
+  // invece, può appartenere a un Worker abortito: deve passare dal lock e
+  // dalla recovery barrier, non restare `busy` per sempre.
+  if (previous?.response_json) {
+    const current = await loadConfig(db);
+    return replayLiveActivation(previous, current);
+  }
+
+  const runId = createRunId('rebalance');
+  let lock;
+  try {
+    lock = await acquirePipelineLock(db, runId);
+  } catch (error) {
+    const message = `lock pipeline non disponibile: ${error instanceof Error ? error.message : String(error)}`;
+    return { activationId, runId: null, status: 'blocked', mode: null, busy: true, reason: 'lock-unavailable', error: message };
+  }
+  if (!lock.acquired) {
+    return {
+      activationId,
+      runId: null,
+      status: 'blocked',
+      mode: null,
+      busy: true,
+      reason: 'busy',
+      error: `Pipeline già occupata dalla run ${lock.ownerId ?? 'sconosciuta'}. Il Live non è stato attivato.`,
+      activeRunId: lock.ownerId,
+      leaseUntil: lock.leaseUntil,
+    };
+  }
+
+  try {
+    const duplicate = await getLiveActivation(db, activationId);
+    const current = await loadConfig(db);
+    let resolved = null;
+    try {
+      resolved = await resolveCredentials(db, env);
+    } catch (error) {
+      console.error(JSON.stringify({
+        message: 'credenziali notifiche/recovery non leggibili',
+        activationId,
+        error: error instanceof Error ? error.message : String(error),
+      }));
+    }
+    if (duplicate) {
+      if (duplicate.response_json) return replayLiveActivation(duplicate, current);
+      const recoveryBarrier = await findLiveRecoveryBarrier(db);
+      const enteredLive = ['arming-live', 'executing-live'].includes(String(duplicate.status))
+        || recoveryBarrier?.order?.run_id === duplicate.run_id;
+      if (enteredLive) {
+        const barrier = {
+          activation: {
+            activation_id: duplicate.activation_id,
+            run_id: duplicate.run_id,
+            status: duplicate.status,
+            source_run_id: duplicate.source_run_id ?? null,
+            updated_at: duplicate.updated_at,
+          },
+          order: recoveryBarrier?.order ?? null,
+        };
+        const safety = await freezeLiveRun({
+          db,
+          runId: duplicate.run_id,
+          credentials: resolved?.values ?? {},
+          reason: 'una precedente richiesta Live si è interrotta senza esito terminale; verifica manualmente eToro',
+          stage: 'live-recovery-barrier',
+          data: barrier,
+        });
+        let settlement = null;
+        try {
+          settlement = await settleLiveRecoveryBarrier(db, barrier, safety);
+        } catch (error) {
+          safety.failures.push(`chiusura recovery: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        if (settlement?.canonicalResponse) {
+          return { ...settlement.canonicalResponse, replayed: true };
+        }
+        return {
+          activationId,
+          runId: duplicate.run_id ?? null,
+          status: safety.status,
+          mode: safety.config?.executionMode ?? null,
+          safetyPersisted: safety.safetyPersisted,
+          reason: safety.reason,
+          error: safety.safetyPersisted ? null : 'Impossibile confermare il blocco in D1: intervieni direttamente su eToro.',
+          replayed: true,
+        };
+      }
+
+      const reason = 'la precedente richiesta si è interrotta prima dell’attivazione Live; nessun ordine risulta avviato';
+      let response = compactLiveActivationResult(activationId, {
+        runId: duplicate.run_id ?? null,
+        status: 'blocked',
+        mode: current.executionMode,
+        reason,
+      });
+      try {
+        await releaseDecisionArtifactClaimsByRun(db, duplicate.run_id);
+        await finishRun(db, duplicate.run_id, 'blocked', null, reason);
+        const completion = await finishLiveActivation(db, activationId, 'blocked', response, reason);
+        if (!completion.written && completion.row?.response_json) {
+          response = replayLiveActivation(completion.row, current);
+        } else if (!completion.written) {
+          throw new Error('activation pre-Live non terminalizzata e risposta autorevole assente');
+        }
+      } catch (error) {
+        response.persistenceWarning = `Recovery non persistita: ${error instanceof Error ? error.message : String(error)}`;
+      }
+      return { ...response, replayed: true };
+    }
+
+    // Il lock appena acquisito rende autorevoli queste activation pre-arm: il
+    // precedente Worker non possiede più il lease e non può arrivare alla CAS
+    // Live. Ripuliamo run e claim anche quando il nuovo device usa un altro ID.
+    try {
+      const stalePreArm = await listStalePreArmActivations(db, { excludeActivationId: activationId });
+      for (const stale of stalePreArm) {
+        const reason = 'richiesta Live interrotta prima dell’armamento; nessun ordine risulta avviato';
+        await releaseDecisionArtifactClaimsByRun(db, stale.run_id);
+        await finishRun(db, stale.run_id, 'blocked', null, reason);
+        const staleResponse = compactLiveActivationResult(stale.activation_id, {
+          runId: stale.run_id,
+          status: 'blocked',
+          mode: current.executionMode,
+          reason,
+          decisionSource: stale.source_run_id ? 'reused-dry-run' : 'fresh-analysis',
+          reusedDryRunId: stale.source_run_id ?? null,
+        });
+        await finishLiveActivation(db, stale.activation_id, 'blocked', staleResponse, reason);
+      }
+      if (stalePreArm.length) {
+        await audit(db, null, 'warn', 'live-recovery-pre-arm', `${stalePreArm.length} richieste pre-Live interrotte sono state chiuse`);
+      }
+    } catch (error) {
+      return {
+        activationId,
+        runId: null,
+        status: 'blocked',
+        mode: current.executionMode,
+        reason: 'pre-arm-recovery-failed',
+        error: `Recovery delle richieste Live precedenti non riuscita: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+
+    if (current.frozen || current.recoveryRequired) {
+      return {
+        activationId,
+        runId: null,
+        status: 'blocked',
+        mode: current.executionMode,
+        reason: current.recoveryRequired ? 'recovery-required' : 'frozen',
+        error: current.recoveryRequired
+          ? `Recovery Live richiesta: ${current.recoveryReason || 'verifica ordini e posizioni su eToro'}. Conferma la verifica prima del Live.`
+          : `Autopilot congelato: ${current.frozenReason || 'freeze attivo'}. Riattivalo prima del Live.`,
+      };
+    }
+    if (current.executionMode === 'live') {
+      const recoveryBarrier = await findLiveRecoveryBarrier(db);
+      if (recoveryBarrier) {
+        const safety = await freezeLiveRun({
+          db,
+          runId: null,
+          credentials: resolved?.values ?? {},
+          reason: 'rilevata una precedente attivazione o un ordine Live senza esito terminale; verifica manualmente eToro',
+          stage: 'live-recovery-barrier',
+          data: recoveryBarrier,
+        });
+        try {
+          await settleLiveRecoveryBarrier(db, recoveryBarrier, safety);
+        } catch (error) {
+          safety.failures.push(`chiusura recovery: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        return {
+          activationId,
+          runId: null,
+          status: safety.status,
+          mode: safety.config?.executionMode ?? null,
+          safetyPersisted: safety.safetyPersisted,
+          reason: safety.reason,
+          error: safety.safetyPersisted ? null : 'Impossibile confermare il blocco in D1: intervieni direttamente su eToro.',
+        };
+      }
+      return {
+        activationId,
+        runId: null,
+        status: 'blocked',
+        mode: 'live',
+        reason: 'already-live',
+        error: 'La modalità Live è già attiva. Nessuna seconda run reale è stata avviata.',
+      };
+    }
+    if (!resolved) {
+      return {
+        activationId,
+        runId: null,
+        status: 'blocked',
+        mode: current.executionMode,
+        reason: 'credentials-unavailable',
+        error: 'Credenziali non leggibili: il Live non è stato attivato.',
+      };
+    }
+    if (!hasVerifiedAgentBinding(resolved, current)) {
+      return {
+        activationId,
+        runId: null,
+        status: 'blocked',
+        mode: current.executionMode,
+        reason: 'agent-not-verified',
+        error: 'Agent Portfolio non verificato: genera un nuovo token e attendi la verifica prima del Live.',
+      };
+    }
+
+    const reservation = await reserveLiveActivation(db, activationId, runId);
+    if (!reservation.created) return replayLiveActivation(reservation.row, current);
+    try {
+      await audit(db, null, 'warn', 'live-activation', 'Attivazione Live immediata richiesta', {
+        activationId,
+        runId,
+        dryRunTtlMinutes: LIVE_DRY_RUN_TTL_MS / 60000,
+      });
+    } catch (error) {
+      console.error(JSON.stringify({
+        message: 'audit richiesta Live fallito',
+        activationId,
+        runId,
+        error: error instanceof Error ? error.message : String(error),
+      }));
+    }
+
+    let result;
+    try {
+      result = await runPipelineWithLock({
+        env,
+        kind: 'rebalance',
+        modeOverride: 'live',
+        runId,
+        delayedLiveArm: true,
+        reuseLatestDryRun: true,
+        liveActivationId: activationId,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      try { await finishRun(db, runId, 'error', null, message); } catch { /* best-effort */ }
+      result = { runId, status: 'error', error: message, decisionSource: 'fresh-analysis' };
+    }
+
+    // Ultimo controllo multi-device dopo il ritorno della pipeline: un Safe
+    // stop può essere arrivato fra il final fence interno e questa risposta.
+    if (result.status === 'ok') {
+      try {
+        const authoritative = await loadConfig(db);
+        if (authoritative.executionMode !== 'live' || authoritative.frozen || authoritative.recoveryRequired) {
+          result = {
+            ...result,
+            status: authoritative.frozen ? 'frozen' : 'blocked',
+            mode: authoritative.executionMode,
+            safetyPersisted: authoritative.frozen ? true : undefined,
+            reason: authoritative.frozen
+              ? `stato finale congelato: ${authoritative.frozenReason || authoritative.recoveryReason || 'stop remoto'}`
+              : `modalità finale ${authoritative.executionMode}: il Live è stato disattivato da un altro dispositivo`,
+          };
+        }
+      } catch (error) {
+        const safety = await freezeLiveRun({
+          db,
+          runId,
+          credentials: resolved.values,
+          reason: `stato finale Live non leggibile: ${error instanceof Error ? error.message : String(error)}`,
+          stage: 'live-response-final-fence',
+        });
+        result = {
+          ...result,
+          status: safety.status,
+          mode: safety.config?.executionMode ?? null,
+          safetyPersisted: safety.safetyPersisted,
+          reason: safety.reason,
+          safety,
+          error: safety.safetyPersisted ? null : 'Impossibile confermare il blocco in D1: intervieni direttamente su eToro.',
+        };
+      }
+    }
+
+    let response = compactLiveActivationResult(activationId, result);
+    if (result.safetyPersisted === false) {
+      response.persistenceWarning = 'Shadow + Frozen non confermati: activation e run restano aperte come barriera di recovery.';
+    } else {
+      try {
+        const completion = await finishLiveActivation(
+          db,
+          activationId,
+          result.status ?? 'error',
+          response,
+          result.error ?? result.reason ?? null,
+        );
+        if (!completion.written && completion.row?.response_json) {
+          const authoritative = await loadConfig(db);
+          response = replayLiveActivation(completion.row, authoritative);
+        } else if (!completion.written) {
+          throw new Error('richiesta Live non terminalizzata e risposta autorevole assente');
+        }
+      } catch (error) {
+        console.error(JSON.stringify({
+          message: 'persistenza esito attivazione Live fallita',
+          activationId,
+          runId,
+          error: error instanceof Error ? error.message : String(error),
+        }));
+        response.persistenceWarning = 'Esito della richiesta non persistito; non ripetere automaticamente l’attivazione.';
+      }
+    }
+
+    // Linearizza la risposta utente dopo la persistenza dell'activation. Se un
+    // Safe stop ha vinto fra il fence precedente e finishLiveActivation, la
+    // run resta uno storico riuscito ma la risposta corrente non può dire Live.
+    if (response.status === 'ok') {
+      try {
+        const currentAfterPersistence = await loadConfig(db);
+        if (
+          currentAfterPersistence.executionMode !== 'live'
+          || currentAfterPersistence.frozen
+          || currentAfterPersistence.recoveryRequired
+        ) {
+          response = {
+            ...response,
+            historicalStatus: response.status,
+            historicalMode: response.mode,
+            status: currentAfterPersistence.frozen ? 'frozen' : 'blocked',
+            mode: currentAfterPersistence.executionMode,
+            safetyPersisted: currentAfterPersistence.frozen ? true : response.safetyPersisted,
+            reason: currentAfterPersistence.frozen
+              ? `stato corrente congelato: ${currentAfterPersistence.frozenReason || currentAfterPersistence.recoveryReason || 'stop remoto'}`
+              : `stato corrente ${currentAfterPersistence.executionMode}: il Live non è più attivo`,
+          };
+        }
+      } catch (error) {
+        response.persistenceWarning = [
+          response.persistenceWarning,
+          `Stato corrente non riconfermato dopo la persistenza: ${error instanceof Error ? error.message : String(error)}`,
+        ].filter(Boolean).join(' ');
+      }
+    }
+    return response;
+  } finally {
+    try {
+      await releasePipelineLock(db, runId);
+    } catch (error) {
+      console.error(JSON.stringify({
+        message: 'rilascio lock attivazione Live fallito',
+        runId,
+        error: error instanceof Error ? error.message : String(error),
+      }));
+    }
+  }
+}
+
+async function runPipelineWithLock({
+  env, kind, modeOverride, improveFromRunId = '', retryFromRunId = '', runId,
+  delayedLiveArm = false, reuseLatestDryRun = false, liveActivationId = '',
+}) {
   const db = env.DB;
   const renewLease = async (stage) => {
     if (!await renewPipelineLock(db, runId)) {
@@ -620,6 +1169,7 @@ async function runPipelineWithLock({ env, kind, modeOverride, improveFromRunId =
     );
   }
   const mode = modeOverride ?? config.executionMode;
+  let persistentMode = config.executionMode;
   const baseProfile = PROFILES[config.strategyProfile] ?? PROFILES.balanced;
   const profile = config.strategySpec ? {
     ...baseProfile,
@@ -660,7 +1210,54 @@ async function runPipelineWithLock({ env, kind, modeOverride, improveFromRunId =
   let equityUsd = null;
   let credentials = {};
   let livePhaseEntered = false;
+  let decisionSource = 'fresh-analysis';
+  let reusedDryRunId = null;
+  let reuseFallbackReason = null;
+  let pendingDryRunClaim = null;
+  const releasePendingDryRun = async () => {
+    if (!pendingDryRunClaim) return true;
+    const claimed = pendingDryRunClaim;
+    const released = await releaseDecisionArtifactClaim(db, {
+      sourceRunId: claimed.sourceRunId,
+      runId,
+    });
+    if (released) pendingDryRunClaim = null;
+    return released;
+  };
   try {
+    if (mode === 'live') {
+      const recoveryBarrier = await findLiveRecoveryBarrier(db, { excludeRunId: runId });
+      if (recoveryBarrier) {
+        try {
+          credentials = (await resolveCredentials(db, env)).values;
+        } catch { /* il freeze D1 resta prioritario anche se il vault non è leggibile */ }
+        const safety = await freezeLiveRun({
+          db,
+          runId,
+          credentials,
+          reason: 'rilevata una precedente attivazione o un ordine Live senza esito terminale; verifica manualmente eToro',
+          stage: 'live-recovery-barrier',
+          data: recoveryBarrier,
+        });
+        try {
+          await settleLiveRecoveryBarrier(db, recoveryBarrier, safety);
+        } catch (error) {
+          safety.failures.push(`chiusura recovery: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        return {
+          runId,
+          status: safety.status,
+          mode: safety.config?.executionMode ?? null,
+          safetyPersisted: safety.safetyPersisted,
+          reason: safety.reason,
+          safety,
+          error: safety.safetyPersisted ? null : 'Impossibile confermare il blocco in D1: intervieni direttamente su eToro.',
+          decisionSource,
+          reusedDryRunId,
+          reuseFallbackReason,
+        };
+      }
+    }
     const resolved = await resolveCredentials(db, env);
     credentials = resolved.values;
     const client = buildClient(resolved, config);
@@ -699,6 +1296,7 @@ async function runPipelineWithLock({ env, kind, modeOverride, improveFromRunId =
     } catch (error) {
       if (hasVerifiedAgent && !virtualSnapshot && Number(error?.status) === 401) {
         await saveCredentials(db, env, { etoroAgentToken: '' });
+        await mutateSafetyConfig(db, { executionMode: 'shadow' });
         await saveConfig(db, {
           executionMode: 'shadow',
           activeAgentPortfolioId: '',
@@ -714,7 +1312,7 @@ async function runPipelineWithLock({ env, kind, modeOverride, improveFromRunId =
           agentTokenHint: '',
           agentTokenFingerprint: '',
           agentTokenOrigin: '',
-        });
+        }, { decisionChange: true });
         await audit(db, runId, 'error', 'credentials', 'Token Agent revocato o non valido: binding rimosso e live disattivato');
       }
       throw error;
@@ -740,11 +1338,11 @@ async function runPipelineWithLock({ env, kind, modeOverride, improveFromRunId =
     // --- 2. Circuit breaker ------------------------------------------------
     if (drawdown > config.drawdownStopPct && !config.frozen) {
       const reason = `drawdown ${(drawdown * 100).toFixed(1)}% oltre la soglia ${(config.drawdownStopPct * 100).toFixed(0)}%`;
-      await mutateSafetyConfig(db, { executionMode: 'shadow', frozen: true, frozenReason: reason });
+      const frozenConfig = await mutateSafetyConfig(db, { executionMode: 'shadow', frozen: true, frozenReason: reason });
       await audit(db, runId, 'error', 'circuit-breaker', `Agente congelato: ${reason}`);
       await notify(credentials, 'critical', 'Autopilot congelato', [reason, `Capitale reale ${snapshot.equityUsd} USD · massimo storico reale ${hwm} USD`]);
       await finishRun(db, runId, 'frozen', equityUsd, reason);
-      return { runId, status: 'frozen', reason };
+      return { runId, status: 'frozen', mode: frozenConfig.executionMode, safetyPersisted: true, reason };
     }
 
     // --- 3. Universo, storici e contesto -----------------------------------
@@ -843,74 +1441,434 @@ async function runPipelineWithLock({ env, kind, modeOverride, improveFromRunId =
       : renderFeaturesPrompt(features, config);
     const ledgerNotes = describeLedger(ledger, config);
 
-    const brain = await askBrain({
+    const allowedSymbols = dynamic ? shortlistSymbols : [...universe.keys()];
+    const decisionContext = await buildDecisionContext(config);
+    const askFreshBrain = (fallbackFrom = null) => askBrain({
       config,
       credentials,
       env,
       featuresPrompt,
-      allowedSymbols: dynamic ? shortlistSymbols : [...universe.keys()],
+      allowedSymbols,
       dynamic,
       profileDescription: describeProfile(config),
       ledgerNotes,
       revisionContext,
-      previousModel: previousBundle?.proposal?.model ?? '',
-      previousAttempts: previousBundle?.proposal?.attempts ?? [],
+      previousModel: fallbackFrom?.model ?? previousBundle?.proposal?.model ?? '',
+      previousAttempts: fallbackFrom?.attempts ?? previousBundle?.proposal?.attempts ?? [],
     });
+
+    let brain = null;
+    if (mode === 'live' && reuseLatestDryRun) {
+      const candidate = await latestDryRunWithArtifact(db);
+      const classification = classifyDryRunForReuse(candidate, decisionContext);
+      if (classification.reusable) {
+        const claimedDryRunId = candidate.artifact_source_run_id;
+        const sourceBundle = await getRunBundle(db, claimedDryRunId);
+        const normalized = normalizeProposal(sourceBundle?.proposal?.parsed, allowedSymbols);
+        const [storedProposalHash, portfolioCheck] = await Promise.all([
+          proposalHash(sourceBundle?.proposal?.parsed),
+          Promise.resolve(comparePortfolioForReuse(sourceBundle, snapshot, config)),
+        ]);
+        let rejectedReason = '';
+        if (storedProposalHash !== candidate.proposal_hash) rejectedReason = 'fingerprint della proposta dry-run non coerente';
+        else if (!normalized.ok) rejectedReason = `proposta dry-run non più compatibile: ${normalized.error}`;
+        else if (!portfolioCheck.ok) rejectedReason = portfolioCheck.reason;
+
+        // Claim immediato: la validità viene fissata quando il Worker decide
+        // davvero di usare la dry-run. Se nel frattempo è scaduta/consumata,
+        // `brain` resta nullo e sotto parte automaticamente una nuova analisi.
+        if (!rejectedReason) {
+          const claimed = await claimLatestDecisionArtifact(db, {
+            runId,
+            ...decisionContext,
+          });
+          if (claimed?.source_run_id !== claimedDryRunId) {
+            rejectedReason = 'decisione dry-run scaduta o già utilizzata durante l’attivazione';
+          }
+        }
+
+        if (!rejectedReason) {
+          reusedDryRunId = claimedDryRunId;
+          pendingDryRunClaim = { sourceRunId: claimedDryRunId };
+          brain = {
+            ok: true,
+            model: sourceBundle.proposal.model,
+            attempts: sourceBundle.proposal.attempts ?? [],
+            rawText: sourceBundle.proposal.raw_text ?? '',
+            promptChars: sourceBundle.proposal.prompt_chars ?? null,
+            parsed: normalized.value,
+          };
+          decisionSource = 'reused-dry-run';
+          await audit(db, runId, 'info', 'decision-reuse', `Decisione AI riusata dalla dry-run ${reusedDryRunId}; snapshot, piano e ordini vengono ricalcolati`, {
+            sourceRunId: reusedDryRunId,
+            sourceModel: brain.model,
+            artifactExpiresAt: candidate.expires_at,
+          });
+        } else {
+          reuseFallbackReason = rejectedReason;
+          await audit(db, runId, 'warn', 'decision-reuse', `Dry-run ${claimedDryRunId} non riutilizzabile sui dati correnti: ${rejectedReason}. Avvio una nuova analisi AI.`, {
+            sourceRunId: claimedDryRunId,
+          });
+        }
+      } else {
+        reuseFallbackReason = classification.reason === 'expired'
+          ? 'la dry-run più recente è scaduta'
+          : 'nessuna dry-run valida e compatibile entro le ultime 2 ore';
+        await audit(db, runId, 'info', 'decision-reuse', `${reuseFallbackReason}; avvio una nuova analisi AI`);
+      }
+    }
+
+    if (!brain) brain = await askFreshBrain();
     await saveProposal(db, runId, brain);
     if (!brain.ok) {
       await audit(db, runId, 'error', 'brain', 'Nessuna proposta valida dai modelli', brain.attempts);
       await finishRun(db, runId, 'error', equityUsd, brain.error);
       await notify(credentials, 'warn', 'Autopilot: nessuna proposta', [brain.error ?? '']);
-      return { runId, status: 'error', error: brain.error, attempts: brain.attempts };
+      return {
+        runId,
+        status: 'error',
+        mode: persistentMode,
+        error: brain.error,
+        attempts: brain.attempts,
+        decisionSource,
+        reusedDryRunId,
+        reuseFallbackReason,
+      };
     }
-    await audit(db, runId, 'info', 'brain', `Proposta da ${brain.model} (confidence ${brain.parsed.confidence})`, { targets: brain.parsed.targetWeights });
+    await audit(db, runId, 'info', 'brain', `${decisionSource === 'reused-dry-run' ? 'Proposta riusata da' : 'Proposta da'} ${brain.model} (confidence ${brain.parsed.confidence})`, { targets: brain.parsed.targetWeights });
 
     // --- 7. Validazione ----------------------------------------------------
     const ordersToday = await countOrdersToday(db);
-    const validation = validateProposal({
-      proposal: brain.parsed,
+    const validateBrain = (proposal) => validateProposal({
+      proposal,
       features,
       config,
       ordersToday,
       ledger,
       scores,
-      completionSymbols: dynamic ? shortlistSymbols : [...universe.keys()],
+      completionSymbols: allowedSymbols,
     });
+    let validation = validateBrain(brain.parsed);
     await saveValidation(db, runId, validation);
+
+    // Una decisione ancora entro TTL può comunque non superare i guardrail
+    // sul nuovo snapshot. In quel caso il click Live mantiene la promessa:
+    // nuova analisi nello stesso ciclo, poi una seconda validazione completa.
+    if (!validation.ok && decisionSource === 'reused-dry-run') {
+      const blocking = validation.violations
+        .filter((item) => item.severity === 'blocking')
+        .map((item) => item.message)
+        .join(' · ');
+      reuseFallbackReason = blocking || 'decisione dry-run non più valida sui dati correnti';
+      await audit(db, runId, 'warn', 'decision-reuse', `Decisione dry-run non più valida: ${reuseFallbackReason}. Avvio una nuova analisi AI.`, validation.violations);
+      const reusedBrain = brain;
+      await releasePendingDryRun();
+      brain = await askFreshBrain(reusedBrain);
+      decisionSource = 'fresh-analysis';
+      reusedDryRunId = null;
+      await saveProposal(db, runId, brain);
+      if (!brain.ok) {
+        await audit(db, runId, 'error', 'brain', 'Nuova analisi AI fallita dopo il tentativo di riuso', brain.attempts);
+        await finishRun(db, runId, 'error', equityUsd, brain.error);
+        await notify(credentials, 'warn', 'Autopilot: nessuna proposta', [brain.error ?? '']);
+        return {
+          runId,
+          status: 'error',
+          mode: persistentMode,
+          error: brain.error,
+          attempts: brain.attempts,
+          decisionSource,
+          reusedDryRunId,
+          reuseFallbackReason,
+        };
+      }
+      await audit(db, runId, 'info', 'brain', `Nuova proposta da ${brain.model} (confidence ${brain.parsed.confidence})`, { targets: brain.parsed.targetWeights });
+      validation = validateBrain(brain.parsed);
+      await saveValidation(db, runId, validation);
+    }
+
     await audit(db, runId, validation.ok ? 'info' : 'warn', 'validator',
       validation.ok ? `Piano valido: ${validation.plan.orders.length} ordini, turnover ${(validation.plan.turnoverPct * 100).toFixed(1)}%` : 'Piano bloccato dai guardrail',
       validation.violations);
 
     if (!validation.ok) {
+      await releasePendingDryRun();
       await finishRun(db, runId, 'blocked', equityUsd, validation.violations.filter((item) => item.severity === 'blocking').map((item) => item.message).join(' · '));
-      return { runId, status: 'blocked', violations: validation.violations, plan: validation.plan };
+      return {
+        runId,
+        status: 'blocked',
+        mode: persistentMode,
+        violations: validation.violations,
+        plan: validation.plan,
+        decisionSource,
+        reusedDryRunId,
+        reuseFallbackReason,
+      };
+    }
+
+    // La risposta AI appartiene alla dry-run appena supera proposta e
+    // guardrail. L'eligibility eToro è volutamente separata e verrà sempre
+    // rifatta in Live: un mercato temporaneamente chiuso non deve buttare via
+    // due ore di decisione valida.
+    if (mode === 'dry-run') {
+      const createdAt = Date.now();
+      await saveDecisionArtifact(db, {
+        sourceRunId: runId,
+        createdAt,
+        expiresAt: createdAt + LIVE_DRY_RUN_TTL_MS,
+        ...decisionContext,
+        proposalHash: await proposalHash(brain.parsed),
+      });
+      await audit(db, runId, 'info', 'decision-artifact', `Decisione AI disponibile per il Live fino a ${new Date(createdAt + LIVE_DRY_RUN_TTL_MS).toISOString()}`, {
+        expiresAt: createdAt + LIVE_DRY_RUN_TTL_MS,
+      });
+    }
+
+    let precheckedLiveEligibility = null;
+    if (delayedLiveArm) {
+      await renewLease('attivazione Live');
+      const latestConfig = await loadConfig(db);
+      const latestContext = await buildDecisionContext(latestConfig);
+      const latestResolved = await resolveCredentials(db, env);
+      let armBlockReason = '';
+      if (latestConfig.frozen) {
+        armBlockReason = `Autopilot congelato: ${latestConfig.frozenReason || 'freeze attivo'}`;
+      } else if (latestConfig.recoveryRequired) {
+        armBlockReason = `Recovery Live richiesta: ${latestConfig.recoveryReason || 'verifica eToro necessaria'}`;
+      } else if (latestConfig.executionMode !== persistentMode) {
+        armBlockReason = `modalità modificata durante l’analisi (${persistentMode} → ${latestConfig.executionMode})`;
+      } else if (Number(latestConfig.safetyRevision) !== Number(config.safetyRevision)) {
+        armBlockReason = 'stato di sicurezza modificato durante l’analisi';
+      } else if (
+        latestContext.decisionRevision !== decisionContext.decisionRevision
+        || latestContext.decisionHash !== decisionContext.decisionHash
+      ) {
+        armBlockReason = 'strategia o limiti modificati durante l’analisi';
+      } else if (
+        latestContext.bindingHash !== decisionContext.bindingHash
+        || !hasVerifiedAgentBinding(latestResolved, latestConfig)
+      ) {
+        armBlockReason = 'binding del portfolio Agent modificato o non più verificato';
+      }
+
+      if (armBlockReason) {
+        await releasePendingDryRun();
+        await audit(db, runId, 'warn', 'live-activation', `Live non attivato: ${armBlockReason}`);
+        await finishRun(db, runId, 'blocked', equityUsd, armBlockReason);
+        return {
+          runId,
+          status: 'blocked',
+          mode: persistentMode,
+          reason: armBlockReason,
+          plan: validation.plan,
+          decisionSource,
+          reusedDryRunId,
+          reuseFallbackReason,
+        };
+      }
+
+      // Il click Live non deve lasciare la modalità persistente attiva quando
+      // eToro sa già che il piano non è eseguibile (mercato chiuso, strumento
+      // non negoziabile o taglio minimo). Questo pre-check è una sola lettura:
+      // la CAS di sicurezza avviene soltanto dopo il suo esito positivo.
+      if (validation.plan.orders.length) {
+        await renewLease('pre-check eToro prima del Live');
+        const executionScale = Number(validation.plan.executionScale) > 0
+          ? Number(validation.plan.executionScale)
+          : 1;
+        precheckedLiveEligibility = await checkPlanEligibility(
+          client,
+          validation.plan.orders,
+          executionScale,
+        ).catch((error) => ({
+          ok: false,
+          issues: [`pre-check ammissibilità fallito: ${error instanceof Error ? error.message : String(error)}`],
+          checks: [],
+        }));
+        if (!precheckedLiveEligibility.ok) {
+          const reason = precheckedLiveEligibility.issues.join(' · ') || 'piano non ammesso da eToro';
+          await releasePendingDryRun();
+          await audit(db, runId, 'warn', 'live-activation', `Live non attivato dal pre-check eToro: ${reason}`, precheckedLiveEligibility.checks);
+          await finishRun(db, runId, 'blocked', equityUsd, reason);
+          return {
+            runId,
+            status: 'blocked',
+            mode: persistentMode,
+            reason,
+            plan: validation.plan,
+            execution: {
+              mode: 'live',
+              executed: false,
+              results: [],
+              eligibility: precheckedLiveEligibility,
+              blocked: true,
+            },
+            decisionSource,
+            reusedDryRunId,
+            reuseFallbackReason,
+          };
+        }
+        await renewLease('armamento Live');
+      }
+
+      // Lo stato della richiesta viene scritto prima della mutazione: se D1
+      // non è disponibile, il Live non viene armato.
+      if (liveActivationId && pendingDryRunClaim) {
+        await setLiveActivationSource(db, liveActivationId, pendingDryRunClaim.sourceRunId);
+      }
+      if (liveActivationId) await updateLiveActivationStatus(db, liveActivationId, 'arming-live');
+      // Un'eccezione durante la CAS può arrivare anche dopo che D1 ha applicato
+      // l'UPDATE ma prima che il Worker ne legga la risposta: da questo punto
+      // il catch deve quindi congelare in modo conservativo.
+      livePhaseEntered = true;
+      const armed = await armLiveIfUnchanged(db, {
+        executionMode: persistentMode,
+        safetyRevision: config.safetyRevision,
+        decisionRevision: decisionContext.decisionRevision,
+        activeAgentPortfolioId: config.activeAgentPortfolioId,
+        agentTokenFingerprint: config.agentTokenFingerprint,
+        agentTokenVerifiedAt: config.agentTokenVerifiedAt,
+      });
+      if (!armed) {
+        livePhaseEntered = false;
+        await releasePendingDryRun();
+        const reason = 'stato cambiato mentre il Live veniva attivato; nessun ordine inviato';
+        await audit(db, runId, 'warn', 'live-activation', reason);
+        await finishRun(db, runId, 'blocked', equityUsd, reason);
+        return {
+          runId,
+          status: 'blocked',
+          mode: persistentMode,
+          reason,
+          plan: validation.plan,
+          decisionSource,
+          reusedDryRunId,
+          reuseFallbackReason,
+        };
+      }
+      persistentMode = 'live';
+      Object.assign(config, armed);
+      // Da qui ogni eccezione non classificata deve riportare l'agente in
+      // Shadow + Frozen, anche se nessuna POST eToro è ancora partita.
+      if (liveActivationId) await updateLiveActivationStatus(db, liveActivationId, 'executing-live');
+      try {
+        await audit(db, runId, 'warn', 'live-activation', 'Modalità Live attivata; il piano appena rivalidato passa all’esecutore');
+      } catch (error) {
+        console.error(JSON.stringify({
+          message: 'audit attivazione Live fallito',
+          runId,
+          error: error instanceof Error ? error.message : String(error),
+        }));
+      }
     }
 
     if (!validation.plan.orders.length) {
+      if (mode === 'live') {
+        const finalFence = await enforceFinalLiveFence({
+          db,
+          runId,
+          config,
+          credentials,
+          equityUsd,
+          stage: 'live-final-no-orders',
+          data: { action: 'none' },
+        });
+        if (finalFence) {
+          return {
+            runId,
+            ...finalFence,
+            action: 'none',
+            plan: validation.plan,
+            decisionSource,
+            reusedDryRunId,
+            reuseFallbackReason,
+          };
+        }
+      }
       await audit(db, runId, 'info', 'executor', 'Nessuna azione: allocazione già entro le bande e la disciplina di rotazione');
-      await finishRun(db, runId, 'ok', equityUsd);
-      return { runId, status: 'ok', action: 'none', plan: validation.plan };
+      if (mode === 'live') {
+        const commitFailure = await commitLiveRunSuccess({
+          db,
+          runId,
+          config,
+          credentials,
+          equityUsd,
+          stage: 'live-final-no-orders',
+          data: { action: 'none' },
+        });
+        if (commitFailure) {
+          return {
+            runId,
+            ...commitFailure,
+            action: 'none',
+            plan: validation.plan,
+            decisionSource,
+            reusedDryRunId,
+            reuseFallbackReason,
+          };
+        }
+      } else {
+        await finishRun(db, runId, 'ok', equityUsd);
+      }
+      return {
+        runId,
+        status: 'ok',
+        mode: persistentMode,
+        action: 'none',
+        plan: validation.plan,
+        decisionSource,
+        reusedDryRunId,
+        reuseFallbackReason,
+      };
     }
 
     // --- 8. Esecuzione -----------------------------------------------------
     await renewLease('esecuzione');
     if (mode === 'live') livePhaseEntered = true;
-    const execution = await executePlan({ db, client, runId, plan: validation.plan, mode, config });
+    const execution = await executePlan({
+      db,
+      client,
+      runId,
+      plan: validation.plan,
+      mode,
+      config,
+      eligibilityOverride: precheckedLiveEligibility,
+    });
     if (mode === 'live') {
       for (const record of execution.results) {
-        if (record.state === 'filled' || record.state === 'partial' || record.state === 'sent') {
+        if (record.state === 'filled' || record.state === 'partial') {
           await recordLedgerTrade(db, record.symbol, record.side);
         }
       }
     }
-    await audit(db, runId, 'info', 'executor', `Esecuzione in modalità ${mode}: ${execution.results.length} ordini`,
+    await audit(db, runId, execution.blocked ? 'warn' : 'info', 'executor', `Esecuzione in modalità ${mode}: ${execution.results.length} ordini`,
       execution.results.map((item) => ({ symbol: item.symbol, side: item.side, amount: item.amountUsd, state: item.state })));
+
+    if (mode === 'dry-run' && execution.blocked) {
+      const reason = execution.error
+        || execution.eligibility?.issues?.join(' · ')
+        || 'dry-run bloccata dal pre-check di ammissibilità';
+      await finishRun(db, runId, 'blocked', equityUsd, reason);
+      return {
+        runId,
+        status: 'blocked',
+        mode,
+        reason,
+        plan: validation.plan,
+        execution,
+        decisionSource,
+        reusedDryRunId,
+        reuseFallbackReason,
+      };
+    }
 
     let liveFailSafeReason = null;
     if (mode === 'live') {
-      const failedOrders = execution.results.filter((item) => item.state === 'failed');
-      if (failedOrders.length) {
-        liveFailSafeReason = `esito ambiguo durante l'invio live (${failedOrders.map((item) => item.symbol).join(', ')})`;
+      const incompleteOrders = execution.results.filter((item) => (
+        ['intent', 'sent', 'partial', 'rejected', 'failed'].includes(item.state)
+      ));
+      if (incompleteOrders.length) {
+        liveFailSafeReason = `esito live non terminale o non completato (${incompleteOrders.map((item) => `${item.symbol}:${item.state}`).join(', ')})`;
       } else if (/stato di sicurezza non leggibile|agente congelato/i.test(String(execution.error ?? ''))) {
         liveFailSafeReason = String(execution.error);
       }
@@ -927,11 +1885,25 @@ async function runPipelineWithLock({ env, kind, modeOverride, improveFromRunId =
             db, runId, credentials, equityUsd, reason: liveFailSafeReason,
             stage: 'executor-fail-safe', data: { execution },
           });
-          return { runId, status: 'frozen', reason: safety.reason, safety, mode, plan: validation.plan, execution };
+          return {
+            runId, status: safety.status, reason: safety.reason, safety,
+            mode: safety.config?.executionMode ?? null,
+            safetyPersisted: safety.safetyPersisted,
+            error: safety.safetyPersisted ? null : 'Impossibile confermare il blocco in D1: intervieni direttamente su eToro.',
+            plan: validation.plan, execution,
+            decisionSource, reusedDryRunId, reuseFallbackReason,
+          };
         }
         await audit(db, runId, 'warn', 'executor', `Run live bloccata senza invii: ${reason}`);
         await finishRun(db, runId, 'blocked', equityUsd, reason);
-        return { runId, status: 'blocked', reason, mode, plan: validation.plan, execution };
+        const authoritativeMode = await loadConfig(db)
+          .then((current) => current.executionMode)
+          .catch(() => null);
+        return {
+          runId, status: 'blocked', reason, mode: authoritativeMode,
+          plan: validation.plan, execution,
+          decisionSource, reusedDryRunId, reuseFallbackReason,
+        };
       }
     }
 
@@ -953,13 +1925,18 @@ async function runPipelineWithLock({ env, kind, modeOverride, improveFromRunId =
       });
       return {
         runId,
-        status: 'frozen',
+        status: safety.status,
         reason: safety.reason,
         safety,
-        mode,
+        mode: safety.config?.executionMode ?? null,
+        safetyPersisted: safety.safetyPersisted,
+        error: safety.safetyPersisted ? null : 'Impossibile confermare il blocco in D1: intervieni direttamente su eToro.',
         plan: validation.plan,
         execution,
         reconciliation,
+        decisionSource,
+        reusedDryRunId,
+        reuseFallbackReason,
       };
     }
 
@@ -969,7 +1946,14 @@ async function runPipelineWithLock({ env, kind, modeOverride, improveFromRunId =
       const reason = execution.error || 'esecuzione live interrotta da un controllo di sicurezza';
       await audit(db, runId, 'warn', 'executor', `Run live interrotta: ${reason}`);
       await finishRun(db, runId, 'blocked', equityUsd, reason);
-      return { runId, status: 'blocked', reason, mode, plan: validation.plan, execution, reconciliation };
+      const authoritativeMode = await loadConfig(db)
+        .then((current) => current.executionMode)
+        .catch(() => null);
+      return {
+        runId, status: 'blocked', reason, mode: authoritativeMode,
+        plan: validation.plan, execution, reconciliation,
+        decisionSource, reusedDryRunId, reuseFallbackReason,
+      };
     }
 
     await notify(credentials, 'info', `Autopilot ${mode} · ${validation.plan.orders.length} ordini`, [
@@ -977,10 +1961,72 @@ async function runPipelineWithLock({ env, kind, modeOverride, improveFromRunId =
       ...execution.results.map((item) => `${item.side === 'buy' ? '+' : '−'}${item.amountUsd} USD ${item.symbol} [${item.state}]`),
     ]);
 
-    await finishRun(db, runId, 'ok', equityUsd);
-    return { runId, status: 'ok', mode, plan: validation.plan, execution, reconciliation, screening: dynamic ? screening.shortlist.length : null };
+    if (mode === 'live') {
+      const finalFence = await enforceFinalLiveFence({
+        db,
+        runId,
+        config,
+        credentials,
+        equityUsd,
+        stage: 'live-final-fence',
+        data: { execution, reconciliation },
+      });
+      if (finalFence) {
+        return {
+          runId,
+          ...finalFence,
+          plan: validation.plan,
+          execution,
+          reconciliation,
+          decisionSource,
+          reusedDryRunId,
+          reuseFallbackReason,
+        };
+      }
+    }
+
+    if (mode === 'live') {
+      const commitFailure = await commitLiveRunSuccess({
+        db,
+        runId,
+        config,
+        credentials,
+        equityUsd,
+        stage: 'live-final-fence',
+        data: { execution, reconciliation },
+      });
+      if (commitFailure) {
+        return {
+          runId,
+          ...commitFailure,
+          plan: validation.plan,
+          execution,
+          reconciliation,
+          decisionSource,
+          reusedDryRunId,
+          reuseFallbackReason,
+        };
+      }
+    } else {
+      await finishRun(db, runId, 'ok', equityUsd);
+    }
+    return {
+      runId,
+      status: 'ok',
+      mode: persistentMode,
+      plan: validation.plan,
+      execution,
+      reconciliation,
+      screening: dynamic ? screening.shortlist.length : null,
+      decisionSource,
+      reusedDryRunId,
+      reuseFallbackReason,
+    };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    if (!livePhaseEntered) {
+      try { await releasePendingDryRun(); } catch { /* nessun effetto Live da compensare */ }
+    }
     if (mode === 'live' && livePhaseEntered) {
       const safety = await freezeLiveRun({
         db,
@@ -991,12 +2037,31 @@ async function runPipelineWithLock({ env, kind, modeOverride, improveFromRunId =
         stage: 'pipeline-live-fail-safe',
         data: { error: message },
       });
-      return { runId, status: 'frozen', reason: safety.reason, safety, error: message };
+      return {
+        runId,
+        status: safety.status,
+        mode: safety.config?.executionMode ?? null,
+        safetyPersisted: safety.safetyPersisted,
+        reason: safety.reason,
+        safety,
+        error: message,
+        decisionSource,
+        reusedDryRunId,
+        reuseFallbackReason,
+      };
     }
     await audit(db, runId, 'error', 'pipeline', message);
     await finishRun(db, runId, 'error', equityUsd, message);
     await notify(credentials, 'warn', 'Autopilot: run fallita', [message]);
-    return { runId, status: 'error', error: message };
+    return {
+      runId,
+      status: 'error',
+      mode: persistentMode,
+      error: message,
+      decisionSource,
+      reusedDryRunId,
+      reuseFallbackReason,
+    };
   }
 }
 

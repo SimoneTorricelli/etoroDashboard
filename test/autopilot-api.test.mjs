@@ -65,6 +65,52 @@ const state = {
   credentials: [],
   agentBindingVerified: true,
   notificationsActive: false,
+  liveActivation: {
+    serverNow: 10_000,
+    ttlMs: 7_200_000,
+    dryRun: {
+      runId: 'run-1',
+      status: 'ok',
+      finishedAt: 2,
+      artifactCreatedAt: 2,
+      expiresAt: 7_200_002,
+      reusable: true,
+      reason: 'fresh',
+      model: 'workers-ai/test',
+      confidence: 0.84,
+      orderCount: 2,
+      turnoverPct: 0.12,
+    },
+  },
+};
+
+const liveActivationId = '018f4f92-9fb4-7e66-8c74-c6ea23b88e7f';
+const validLiveActivationResponse = {
+  activationId: liveActivationId,
+  runId: 'live-run-1',
+  status: 'ok',
+  mode: 'live',
+  action: null,
+  reason: null,
+  error: null,
+  decisionSource: 'fresh-analysis',
+  reusedDryRunId: null,
+  reuseFallbackReason: null,
+  plan: {
+    orderCount: 1,
+    turnoverPct: 0.08,
+    confidence: 0.82,
+  },
+  execution: {
+    counts: { planned: 1, sent: 0, filled: 1, partial: 0, failed: 0, skipped: 0, simulated: 0 },
+    orders: [{
+      symbol: 'SPY',
+      side: 'buy',
+      amountUsd: 100,
+      state: 'filled',
+      message: null,
+    }],
+  },
 };
 
 function jsonResponse(body, status = 200) {
@@ -160,10 +206,170 @@ test('state e runs validi vengono accettati e usano la origin normalizzata', asy
     return String(input).includes('/agent/runs') ? jsonResponse({ runs: [run] }) : jsonResponse(state);
   };
 
-  assert.equal((await autopilot.state()).config.executionMode, 'dry-run');
+  const currentState = await autopilot.state();
+  assert.equal(currentState.config.executionMode, 'dry-run');
+  assert.equal(currentState.liveActivation.dryRun.runId, 'run-1');
+  assert.equal(currentState.liveActivation.dryRun.reusable, true);
   assert.equal((await autopilot.runs()).runs[0].id, 'run-1');
   assert.deepEqual(requested, [
     'https://worker.example/agent/state',
     'https://worker.example/agent/runs?limit=30',
   ]);
+});
+
+test('activateLive usa l\'endpoint atomico e invia conferma esplicita e activationId', async () => {
+  const requests = [];
+  globalThis.fetch = async (input, init = {}) => {
+    requests.push({ url: String(input), init });
+    return jsonResponse(validLiveActivationResponse);
+  };
+  const payload = {
+    activationId: liveActivationId,
+    confirmation: 'ESEGUI LIVE',
+    acknowledgePersistentLive: true,
+  };
+
+  const result = await autopilot.activateLive(payload);
+
+  assert.equal(result.runId, 'live-run-1');
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].url, 'https://worker.example/agent/live/activate-and-run');
+  assert.equal(requests[0].init.method, 'POST');
+  assert.deepEqual(JSON.parse(requests[0].init.body), payload);
+  assert.equal(requests[0].init.headers.authorization, 'Bearer control-test');
+  assert.equal(requests[0].init.cache, 'no-store');
+});
+
+test('unfreeze invia revision esatta e conferma esplicita dopo la verifica eToro', async () => {
+  const requests = [];
+  globalThis.fetch = async (input, init = {}) => {
+    requests.push({ url: String(input), init });
+    return jsonResponse({ config: { executionMode: 'shadow', frozen: false, safetyRevision: 18 } });
+  };
+  const payload = {
+    safetyRevision: 17,
+    confirmation: 'HO VERIFICATO GLI ORDINI SU ETORO',
+  };
+
+  const result = await autopilot.unfreeze(payload);
+
+  assert.equal(result.config.executionMode, 'shadow');
+  assert.equal(requests[0].url, 'https://worker.example/agent/unfreeze');
+  assert.equal(requests[0].init.method, 'POST');
+  assert.deepEqual(JSON.parse(requests[0].init.body), payload);
+});
+
+test('activateLive rifiuta fail-closed payload 2xx incoerenti o malformati', async (t) => {
+  const payload = {
+    activationId: liveActivationId,
+    confirmation: 'ESEGUI LIVE',
+    acknowledgePersistentLive: true,
+  };
+  const malformed = [
+    {
+      name: 'activationId diverso',
+      body: { ...validLiveActivationResponse, activationId: 'aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa' },
+      message: /activationId assente o diverso/,
+    },
+    {
+      name: 'status sconosciuto',
+      body: { ...validLiveActivationResponse, status: 'completed' },
+      message: /stato della run Live .* sconosciuto/,
+    },
+    {
+      name: 'successo senza modalità Live',
+      body: { ...validLiveActivationResponse, mode: 'dry-run' },
+      message: /run riuscita non conferma la modalità Live/,
+    },
+    {
+      name: 'modalità finale assente',
+      body: { ...validLiveActivationResponse, mode: undefined },
+      message: /modalità finale è assente o sconosciuta/,
+    },
+    {
+      name: 'successo senza runId',
+      body: { ...validLiveActivationResponse, runId: null },
+      message: /runId manca per lo stato ok/,
+    },
+    {
+      name: 'fail-safe senza conferma booleana',
+      body: {
+        ...validLiveActivationResponse,
+        status: 'frozen',
+        mode: 'shadow',
+        safetyPersisted: 'no',
+      },
+      message: /safetyPersisted deve essere booleano/,
+    },
+    {
+      name: 'fail-safe frozen senza esito di persistenza',
+      body: {
+        ...validLiveActivationResponse,
+        status: 'frozen',
+        mode: 'shadow',
+        safetyPersisted: undefined,
+      },
+      message: /fail-safe frozen deve dichiarare safetyPersisted/,
+    },
+    {
+      name: 'piano con percentuale impossibile',
+      body: {
+        ...validLiveActivationResponse,
+        plan: { ...validLiveActivationResponse.plan, turnoverPct: 1.5 },
+      },
+      message: /plan.turnoverPct non è una percentuale valida/,
+    },
+    {
+      name: 'riepilogo ordini non valido',
+      body: {
+        ...validLiveActivationResponse,
+        execution: {
+          ...validLiveActivationResponse.execution,
+          orders: [{ symbol: '', side: 'buy', amountUsd: 100, state: 'filled', message: null }],
+        },
+      },
+      message: /execution.orders contiene un ordine non valido/,
+    },
+    {
+      name: 'successo senza riepilogo di esecuzione',
+      body: { ...validLiveActivationResponse, execution: undefined },
+      message: /run riuscita non contiene il riepilogo/,
+    },
+  ];
+
+  for (const item of malformed) {
+    await t.test(item.name, async () => {
+      globalThis.fetch = async () => jsonResponse(item.body);
+      await assert.rejects(
+        autopilot.activateLive(payload),
+        (error) => error instanceof AutopilotError
+          && error.status === 502
+          && item.message.test(error.message),
+      );
+    });
+  }
+});
+
+test('activateLive conserva gli indicatori di replay, persistenza e fail-safe', async () => {
+  globalThis.fetch = async () => jsonResponse({
+    ...validLiveActivationResponse,
+    runId: null,
+    status: 'frozen',
+    mode: null,
+    safetyPersisted: false,
+    replayed: true,
+    busy: false,
+    persistenceWarning: 'Esito non persistito.',
+  });
+
+  const result = await autopilot.activateLive({
+    activationId: liveActivationId,
+    confirmation: 'ESEGUI LIVE',
+    acknowledgePersistentLive: true,
+  });
+
+  assert.equal(result.status, 'frozen');
+  assert.equal(result.safetyPersisted, false);
+  assert.equal(result.replayed, true);
+  assert.equal(result.persistenceWarning, 'Esito non persistito.');
 });

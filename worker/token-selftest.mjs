@@ -8,7 +8,8 @@ import {
   isUuidIdentifier,
 } from './lib/etoro.js';
 import {
-  credentialFingerprint, hasVerifiedAgentBinding, resolveCredentials, saveVerifiedAgentToken,
+  clearCredentials, credentialFingerprint, hasVerifiedAgentBinding, resolveCredentials, saveCredentials,
+  saveVerifiedAgentToken,
 } from './lib/vault.js';
 
 const tests = [];
@@ -17,11 +18,15 @@ const test = (name, fn) => tests.push([name, fn]);
 const TOKEN_ID = 'f9e8d7c6-b5a4-4210-8edc-ba9876543210';
 const CLIENT_ID = '3fa85f64-5717-4562-b3fc-2c963f66afa6';
 const SECRET = 'sk_live_a1b2c3d4e5f6_agent_secret';
+const API_KEY = 'api-key-binding-test';
+const USER_KEY = 'owner-user-key-binding-test';
 
 function memoryD1() {
   const rows = new Map();
+  const updatedAt = new Map();
   return {
     rows,
+    updatedAt,
     failNextBatch: false,
     prepare(sql) {
       return {
@@ -29,18 +34,65 @@ function memoryD1() {
         args: [],
         bind(...args) { this.args = args; return this; },
         async first() {
-          if (!/^SELECT value FROM config/.test(this.sql)) return null;
-          const value = rows.get(this.args[0]);
-          return value == null ? null : { value };
+          if (/^SELECT value(?:, updated_at)? FROM config/.test(this.sql)) {
+            const value = rows.get(this.args[0]);
+            return value == null ? null : { value, updated_at: updatedAt.get(this.args[0]) ?? 0 };
+          }
+          if (this.sql.startsWith('INSERT INTO config') && this.sql.includes('RETURNING value, updated_at')) {
+            const [key, value, nextUpdatedAt,,, expectedExists,, expectedValue, expectedUpdatedAt] = this.args;
+            const exists = rows.has(key);
+            if (exists !== Boolean(expectedExists)) return null;
+            if (exists && (rows.get(key) !== expectedValue || updatedAt.get(key) !== expectedUpdatedAt)) return null;
+            rows.set(key, value);
+            updatedAt.set(key, nextUpdatedAt);
+            return { value, updated_at: nextUpdatedAt };
+          }
+          return null;
+        },
+        async run() {
+          if (this.sql.startsWith('DELETE FROM config')) {
+            rows.delete(this.args[0]);
+            updatedAt.delete(this.args[0]);
+            return { success: true };
+          }
+          throw new Error(`run() non gestito: ${this.sql.slice(0, 80)}`);
         },
       };
     },
     async batch(statements) {
       if (this.failNextBatch) { this.failNextBatch = false; throw new Error('injected batch failure'); }
       const staged = new Map(rows);
-      for (const statement of statements) staged.set(statement.args[0], statement.args[1]);
+      const stagedUpdatedAt = new Map(updatedAt);
+      for (const statement of statements) {
+        const key = statement.args[0];
+        if (key !== 'autopilot') {
+          const [, value, nextUpdatedAt,,, expectedExists,, expectedValue, expectedUpdatedAt] = statement.args;
+          const exists = staged.has(key);
+          if (exists === Boolean(expectedExists)
+            && (!exists || (staged.get(key) === expectedValue && stagedUpdatedAt.get(key) === expectedUpdatedAt))) {
+            staged.set(key, value);
+            stagedUpdatedAt.set(key, nextUpdatedAt);
+          }
+          continue;
+        }
+        const requiredVaultValue = statement.args[6];
+        const requiredVaultUpdatedAt = statement.args[7];
+        if (staged.get('vault') !== requiredVaultValue || stagedUpdatedAt.get('vault') !== requiredVaultUpdatedAt) {
+          continue;
+        }
+        const fallback = JSON.parse(statement.args[1]);
+        const patch = JSON.parse(statement.args[2]);
+        const current = staged.has(key) ? JSON.parse(staged.get(key)) : fallback;
+        staged.set(key, JSON.stringify({
+          ...current,
+          ...patch,
+          decisionRevision: Number(current.decisionRevision ?? 0) + 1,
+        }));
+      }
       rows.clear();
       for (const [key, value] of staged) rows.set(key, value);
+      updatedAt.clear();
+      for (const [key, value] of stagedUpdatedAt) updatedAt.set(key, value);
     },
   };
 }
@@ -164,16 +216,25 @@ test('binding: fingerprint A con token B viene rifiutata', async () => {
 
 test('binding: salvataggi concorrenti lasciano una sola tupla atomica', async () => {
   const db = memoryD1();
-  const env = { CONTROL_TOKEN: 'vault-test-control-token' };
+  const env = {
+    CONTROL_TOKEN: 'vault-test-control-token',
+    ETORO_API_KEY: API_KEY,
+    ETORO_USER_KEY: USER_KEY,
+  };
   const currentConfig = { executionMode: 'shadow' };
-  await Promise.all([
+  const expectedVaultRevision = (await resolveCredentials(db, env)).vaultRevision;
+  const results = await Promise.allSettled([
     saveVerifiedAgentToken(db, env, {
-      token: `${SECRET}-A`, portfolioId: 'portfolio-A', verifiedAt: 101, currentConfig,
+      token: `${SECRET}-A`, etoroApiKey: API_KEY, etoroUserKey: USER_KEY,
+      portfolioId: 'portfolio-A', verifiedAt: 101, currentConfig, expectedVaultRevision,
     }),
     saveVerifiedAgentToken(db, env, {
-      token: `${SECRET}-B`, portfolioId: 'portfolio-B', verifiedAt: 202, currentConfig,
+      token: `${SECRET}-B`, etoroApiKey: API_KEY, etoroUserKey: USER_KEY,
+      portfolioId: 'portfolio-B', verifiedAt: 202, currentConfig, expectedVaultRevision,
     }),
   ]);
+  assert.equal(results.filter((result) => result.status === 'fulfilled').length, 1);
+  assert.equal(results.filter((result) => result.status === 'rejected').length, 1);
   const config = JSON.parse(db.rows.get('autopilot'));
   const resolved = await resolveCredentials(db, env);
   assert.equal(hasVerifiedAgentBinding(resolved, config), true);
@@ -183,18 +244,109 @@ test('binding: salvataggi concorrenti lasciano una sola tupla atomica', async ()
 
 test('binding: un errore batch conserva integralmente la tupla precedente', async () => {
   const db = memoryD1();
-  const env = { CONTROL_TOKEN: 'vault-test-control-token' };
+  const env = {
+    CONTROL_TOKEN: 'vault-test-control-token',
+    ETORO_API_KEY: API_KEY,
+    ETORO_USER_KEY: USER_KEY,
+  };
+  const firstVaultRevision = (await resolveCredentials(db, env)).vaultRevision;
   await saveVerifiedAgentToken(db, env, {
-    token: `${SECRET}-A`, portfolioId: 'portfolio-A', verifiedAt: 101,
-    currentConfig: { executionMode: 'shadow' },
+    token: `${SECRET}-A`, etoroApiKey: API_KEY, etoroUserKey: USER_KEY,
+    portfolioId: 'portfolio-A', verifiedAt: 101,
+    currentConfig: { executionMode: 'shadow' }, expectedVaultRevision: firstVaultRevision,
   });
   const before = new Map(db.rows);
   db.failNextBatch = true;
+  const secondVaultRevision = (await resolveCredentials(db, env)).vaultRevision;
   await assert.rejects(() => saveVerifiedAgentToken(db, env, {
-    token: `${SECRET}-B`, portfolioId: 'portfolio-B', verifiedAt: 202,
-    currentConfig: { executionMode: 'shadow' },
+    token: `${SECRET}-B`, etoroApiKey: API_KEY, etoroUserKey: USER_KEY,
+    portfolioId: 'portfolio-B', verifiedAt: 202,
+    currentConfig: { executionMode: 'shadow' }, expectedVaultRevision: secondVaultRevision,
   }), /injected batch failure/);
   assert.deepEqual(db.rows, before);
+});
+
+test('binding: ruotare API key o owner key richiede una nuova verifica', async () => {
+  const db = memoryD1();
+  const env = {
+    CONTROL_TOKEN: 'vault-test-control-token',
+    ETORO_API_KEY: API_KEY,
+    ETORO_USER_KEY: USER_KEY,
+  };
+  const expectedVaultRevision = (await resolveCredentials(db, env)).vaultRevision;
+  await saveVerifiedAgentToken(db, env, {
+    token: SECRET,
+    etoroApiKey: API_KEY,
+    etoroUserKey: USER_KEY,
+    portfolioId: 'portfolio-A',
+    verifiedAt: 303,
+    currentConfig: { executionMode: 'shadow' },
+    expectedVaultRevision,
+  });
+  const config = JSON.parse(db.rows.get('autopilot'));
+  assert.equal(hasVerifiedAgentBinding(await resolveCredentials(db, env), config), true);
+  assert.equal(hasVerifiedAgentBinding(await resolveCredentials(db, {
+    ...env,
+    ETORO_API_KEY: `${API_KEY}-rotated`,
+  }), config), false);
+  assert.equal(hasVerifiedAgentBinding(await resolveCredentials(db, {
+    ...env,
+    ETORO_USER_KEY: `${USER_KEY}-rotated`,
+  }), config), false);
+});
+
+test('binding: una rotazione concorrente non può essere sovrascritta dal token in volo', async () => {
+  const db = memoryD1();
+  const env = {
+    CONTROL_TOKEN: 'vault-test-control-token',
+    ETORO_API_KEY: API_KEY,
+    ETORO_USER_KEY: USER_KEY,
+  };
+  const expectedVaultRevision = (await resolveCredentials(db, env)).vaultRevision;
+
+  await saveCredentials(db, env, { etoroApiKey: `${API_KEY}-rotated` });
+  await assert.rejects(() => saveVerifiedAgentToken(db, env, {
+    token: SECRET,
+    etoroApiKey: API_KEY,
+    etoroUserKey: USER_KEY,
+    portfolioId: 'portfolio-old',
+    verifiedAt: 404,
+    currentConfig: { executionMode: 'shadow' },
+    expectedVaultRevision,
+  }), /credenziali eToro cambiate durante la generazione/);
+
+  const resolved = await resolveCredentials(db, env);
+  assert.equal(resolved.values.etoroApiKey, `${API_KEY}-rotated`);
+  assert.equal(resolved.agentBinding, null);
+  assert.equal(db.rows.has('autopilot'), false);
+});
+
+test('binding: DELETE su vault assente lascia un tombstone che ferma il token in volo', async () => {
+  const db = memoryD1();
+  const env = {
+    CONTROL_TOKEN: 'vault-test-control-token',
+    ETORO_API_KEY: API_KEY,
+    ETORO_USER_KEY: USER_KEY,
+  };
+  const expectedVaultRevision = (await resolveCredentials(db, env)).vaultRevision;
+  assert.equal(expectedVaultRevision.exists, false);
+
+  await clearCredentials(db, env);
+  const afterClear = await resolveCredentials(db, env);
+  assert.equal(afterClear.vaultRevision.exists, true);
+  assert.equal(afterClear.values.etoroApiKey, API_KEY, 'il tombstone lascia disponibile il fallback Worker Secret');
+
+  await assert.rejects(() => saveVerifiedAgentToken(db, env, {
+    token: SECRET,
+    etoroApiKey: API_KEY,
+    etoroUserKey: USER_KEY,
+    portfolioId: 'portfolio-before-delete',
+    verifiedAt: 505,
+    currentConfig: { executionMode: 'shadow' },
+    expectedVaultRevision,
+  }), /credenziali eToro cambiate durante la generazione/);
+  assert.equal((await resolveCredentials(db, env)).agentBinding, null);
+  assert.equal(db.rows.has('autopilot'), false);
 });
 
 let failed = 0;

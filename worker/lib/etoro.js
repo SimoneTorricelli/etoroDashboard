@@ -462,6 +462,12 @@ export class EtoroClient {
       });
     } catch (error) {
       if (amountUsd != null) throw error;
+      // Un timeout, un 5xx o un errore di rete può significare che la prima
+      // POST è stata accettata senza che ne sia arrivata la risposta. Ripetere
+      // allora la chiusura su un secondo endpoint rischierebbe un doppio
+      // effetto. Il legacy è ammesso solo quando v2 dichiara in modo definitivo
+      // che la rotta non esiste/non è supportata.
+      if (![404, 405, 501].includes(Number(error?.status))) throw error;
       // Fallback: endpoint legacy di chiusura totale.
       return this.request('v1', `trading/execution/real/market-close-orders/positions/${positionId}`, {
         method: 'POST',

@@ -17,14 +17,14 @@ const PIPELINE = [
 
 const MODES = [
   { key: 'shadow', color: 'text-text-1', title: 'Shadow — osserva e basta', text: 'Il ciclo gira tutto, ma si ferma prima di costruire gli ordini. Serve a leggere per settimane cosa avrebbe proposto l’AI, senza alcun rischio. È la modalità iniziale.' },
-  { key: 'dry-run', color: 'text-warn', title: 'Dry-run — prova generale', text: 'Gli ordini vengono costruiti davvero, con importi reali, e viene chiesto a eToro se sarebbero ammissibili (mercato aperto, taglio minimo). Ma non vengono inviati. Serve a scoprire i problemi tecnici prima che contino.' },
-  { key: 'live', color: 'text-loss', title: 'Live — soldi veri', text: 'Gli ordini partono davvero sull’Agent Portfolio, senza ulteriore conferma, alla cadenza che hai impostato. Richiede il token dell’Agent Portfolio.' },
+  { key: 'dry-run', color: 'text-warn', title: 'Dry-run — prova generale', text: 'Costruisce gli ordini con importi reali e chiede a eToro se sarebbero ammissibili, ma non li invia. Se proposta e guardrail sono validi, conserva per due ore la sola decisione AI anche se eToro è temporaneamente chiuso: snapshot, importi ed eligibility vengono sempre rifatti in Live.' },
+  { key: 'live', color: 'text-loss', title: 'Live — soldi veri', text: 'Premere Live avvia immediatamente un ciclo reale. Se l’ultimo dry-run è ancora valido riusa la sua decisione AI, ma rilegge il portfolio e ricostruisce e ricontrolla ogni ordine; altrimenti rifà automaticamente l’analisi. Dopo il ciclo la modalità resta Live per la cadenza futura.' },
 ];
 
 const ACTIONS = [
   { title: 'Snapshot', text: 'Legge il capitale reale del portfolio e aggiorna gli indicatori. Non coinvolge l’AI e non genera ordini. Alimenta la curva percentuale e il controllo sul drawdown.' },
-  { title: 'Run (ribilanciamento)', text: 'Il ciclo completo: fotografa, calcola, chiede all’AI, verifica e — secondo la modalità — esegue. È quello che parte in automatico alla cadenza configurata.' },
-  { title: 'Congela', text: 'Blocco immediato. Nessuna run potrà più generare ordini finché non riattivi. Scatta anche da solo se il drawdown supera la soglia.' },
+  { title: 'Run (ribilanciamento)', text: 'Il ciclo completo: fotografa, calcola, chiede all’AI, verifica e — secondo la modalità — esegue. Attivare Live ne avvia subito uno; i cicli successivi partono alla cadenza configurata.' },
+  { title: 'Congela', text: 'Blocca subito nuove run e nuovi invii finché non riattivi. Non può però annullare ordini già accettati o in volo, che vanno verificati su eToro. Scatta anche da solo se il drawdown supera la soglia.' },
 ];
 
 export function HowItWorks() {

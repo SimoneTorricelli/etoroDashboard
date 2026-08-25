@@ -8,9 +8,10 @@
  */
 import { runPipeline } from './pipeline.js';
 import {
-  equityHistory, getRunBundle, listRuns, loadConfig, mutateSafetyConfig, saveConfig, audit,
+  equityHistory, getRunBundle, listRuns, loadConfig, mutateSafetyConfig, saveConfig, unfreezeSafetyConfig, audit,
 } from './db.js';
 import { sanitizeConfigPatch } from './api.js';
+import { isDecisionConfigPatch, LIVE_RECOVERY_CONFIRMATION } from './live-plan.js';
 
 const PROTOCOL_VERSION = '2024-11-05';
 
@@ -76,8 +77,16 @@ const TOOLS = [
   },
   {
     name: 'autopilot_unfreeze',
-    description: 'Rimuove il freeze. Da usare solo dopo aver verificato le posizioni su eToro.',
-    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    description: 'Rimuove il freeze sull’epoch corrente. Se recoveryRequired è true serve la conferma esatta dopo aver verificato eToro.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        safetyRevision: { type: 'integer', minimum: 0 },
+        confirmation: { type: 'string', description: `Se richiesto: ${LIVE_RECOVERY_CONFIRMATION}` },
+      },
+      required: ['safetyRevision'],
+      additionalProperties: false,
+    },
   },
 ];
 
@@ -240,7 +249,7 @@ async function callTool(env, name, args) {
     case 'autopilot_update_config': {
       const { patch, rejected } = sanitizeConfigPatch(args?.patch);
       if (!Object.keys(patch).length) throw new Error(`nessuna modifica valida. Scartate: ${rejected.join('; ')}`);
-      const config = await saveConfig(db, patch);
+      const config = await saveConfig(db, patch, { decisionChange: isDecisionConfigPatch(patch) });
       await audit(db, null, 'info', 'mcp', 'Configurazione aggiornata via MCP', { patch, rejected });
       return toolText({ applied: Object.keys(patch), rejected, config });
     }
@@ -251,12 +260,34 @@ async function callTool(env, name, args) {
     }
     case 'autopilot_freeze': {
       const reason = String(args?.reason ?? 'freeze richiesto via MCP').slice(0, 300);
+      const current = await loadConfig(db);
       await audit(db, null, 'warn', 'mcp', `Freeze via MCP: ${reason}`);
-      return toolText(await mutateSafetyConfig(db, { executionMode: 'shadow', frozen: true, frozenReason: reason }));
+      return toolText(await mutateSafetyConfig(db, {
+        executionMode: 'shadow',
+        frozen: true,
+        frozenReason: reason,
+        recoveryRequired: true,
+        recoveryReason: current.recoveryReason || reason,
+        recoveryRunIds: current.recoveryRunIds ?? [],
+        recoveryUpdatedAt: Date.now(),
+      }));
     }
     case 'autopilot_unfreeze': {
-      await audit(db, null, 'warn', 'mcp', 'Unfreeze via MCP');
-      return toolText(await mutateSafetyConfig(db, { executionMode: 'shadow', frozen: false, frozenReason: '' }));
+      const current = await loadConfig(db);
+      const expectedSafetyRevision = Number(args?.safetyRevision);
+      const recoveryConfirmed = args?.confirmation === LIVE_RECOVERY_CONFIRMATION;
+      if (!Number.isInteger(expectedSafetyRevision) || expectedSafetyRevision < 0) {
+        throw new Error('safetyRevision corrente obbligatoria');
+      }
+      if (current.recoveryRequired && !recoveryConfirmed) {
+        throw new Error(`verifica eToro e conferma con "${LIVE_RECOVERY_CONFIRMATION}"`);
+      }
+      const config = await unfreezeSafetyConfig(db, { expectedSafetyRevision, recoveryConfirmed });
+      if (!config) throw new Error('stato di sicurezza cambiato: rileggi la configurazione e riprova');
+      await audit(db, null, 'warn', 'mcp', current.recoveryRequired
+        ? 'Unfreeze via MCP dopo conferma verifica eToro'
+        : 'Unfreeze via MCP');
+      return toolText(config);
     }
     default:
       throw new Error(`tool sconosciuto: ${name}`);

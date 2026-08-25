@@ -13,6 +13,9 @@ const BASE_KEY = 'torino.autopilot.base-url';
 export type ExecutionMode = 'shadow' | 'dry-run' | 'live';
 export type RunKind = 'heartbeat' | 'snapshot' | 'rebalance' | 'manual';
 
+export const LIVE_CONFIRMATION = 'ESEGUI LIVE' as const;
+export const LIVE_RECOVERY_CONFIRMATION = 'HO VERIFICATO GLI ORDINI SU ETORO' as const;
+
 const EXECUTION_MODES = new Set<ExecutionMode>(['shadow', 'dry-run', 'live']);
 
 export interface WhitelistEntry {
@@ -49,6 +52,11 @@ export interface WatcherEvent {
 
 export interface AutopilotConfig {
   executionMode: ExecutionMode;
+  safetyRevision?: number;
+  recoveryRequired?: boolean;
+  recoveryReason?: string;
+  recoveryRunIds?: string[];
+  recoveryUpdatedAt?: number;
   strategyProfile: string;
   strategySpecVersion?: number;
   strategySpec?: Record<string, unknown> | null;
@@ -146,6 +154,28 @@ export interface EquityPoint {
   cash_usd: number | null;
   hwm_usd: number | null;
 }
+
+export interface ReusableDryRunPreview {
+  runId: string;
+  status: RunSummary['status'];
+  finishedAt: number | null;
+  artifactCreatedAt: number | null;
+  expiresAt: number | null;
+  reusable: boolean;
+  reason: string;
+  model: string | null;
+  confidence: number | null;
+  orderCount: number;
+  turnoverPct: number | null;
+}
+
+export interface LiveActivationPreview {
+  serverNow: number;
+  ttlMs: number;
+  dryRun: ReusableDryRunPreview | null;
+}
+
+export type LiveActivationStatus = 'ok' | 'blocked' | 'error' | 'frozen';
 
 export type CredentialKey =
   | 'etoroApiKey' | 'etoroUserKey' | 'etoroAgentToken'
@@ -250,6 +280,43 @@ export interface AutopilotState {
   credentials: CredentialStatus[];
   agentBindingVerified: boolean;
   notificationsActive: boolean;
+  /** Assente soltanto durante un aggiornamento graduale da un Worker precedente. */
+  liveActivation?: LiveActivationPreview;
+}
+
+export interface LiveActivationResult {
+  activationId: string;
+  runId: string | null;
+  status: LiveActivationStatus;
+  mode: ExecutionMode | null;
+  busy?: boolean;
+  replayed?: boolean;
+  persistenceWarning?: string;
+  /** false = il Worker non ha potuto confermare Shadow + Frozen in D1. */
+  safetyPersisted?: boolean;
+  activeRunId?: string | null;
+  leaseUntil?: number | null;
+  action?: string | null;
+  reason?: string | null;
+  error?: string | null;
+  decisionSource?: 'reused-dry-run' | 'fresh-analysis';
+  reusedDryRunId?: string | null;
+  reuseFallbackReason?: string | null;
+  plan?: {
+    orderCount: number;
+    turnoverPct: number;
+    confidence: number;
+  } | null;
+  execution?: {
+    counts: Record<string, number>;
+    orders: Array<{
+      symbol: string;
+      side: string;
+      amountUsd: number;
+      state: string;
+      message: string | null;
+    }>;
+  };
 }
 
 export interface PlanOrder {
@@ -533,6 +600,127 @@ function validateRunsPayload(value: unknown): { runs: RunSummary[] } {
   return { runs: value.runs } as { runs: RunSummary[] };
 }
 
+const LIVE_ACTIVATION_STATUSES = new Set<LiveActivationStatus>(['ok', 'blocked', 'error', 'frozen']);
+
+function validateLiveActivationPayload(value: unknown, expectedActivationId: string): LiveActivationResult {
+  const path = '/agent/live/activate-and-run';
+  if (!isRecord(value)) invalidApiPayload(path, 'era atteso un oggetto JSON');
+  if (value.activationId !== expectedActivationId) {
+    invalidApiPayload(path, 'activationId assente o diverso dalla richiesta');
+  }
+  if (!LIVE_ACTIVATION_STATUSES.has(value.status as LiveActivationStatus)) {
+    invalidApiPayload(path, 'lo stato della run Live è assente o sconosciuto');
+  }
+  if (!(value.mode === null || EXECUTION_MODES.has(value.mode as ExecutionMode))) {
+    invalidApiPayload(path, 'la modalità finale è assente o sconosciuta');
+  }
+  if (!(value.runId === null || (typeof value.runId === 'string' && value.runId.trim()))) {
+    invalidApiPayload(path, 'runId deve essere una stringa non vuota oppure null');
+  }
+
+  const status = value.status as LiveActivationStatus;
+  if (status === 'ok' && typeof value.runId !== 'string') {
+    invalidApiPayload(path, `runId manca per lo stato ${status}`);
+  }
+  if (status === 'ok' && value.mode !== 'live') {
+    invalidApiPayload(path, 'una run riuscita non conferma la modalità Live');
+  }
+
+  for (const field of ['busy', 'replayed', 'safetyPersisted'] as const) {
+    if (field in value && typeof value[field] !== 'boolean') {
+      invalidApiPayload(path, `${field} deve essere booleano`);
+    }
+  }
+  if (value.busy === true && status !== 'blocked') {
+    invalidApiPayload(path, 'busy è compatibile soltanto con uno stato blocked');
+  }
+  if (status === 'frozen' && typeof value.safetyPersisted !== 'boolean') {
+    invalidApiPayload(path, 'un fail-safe frozen deve dichiarare safetyPersisted');
+  }
+  if (value.safetyPersisted === false && !['frozen', 'error'].includes(status)) {
+    invalidApiPayload(path, 'safetyPersisted=false è incompatibile con lo stato dichiarato');
+  }
+  if (value.safetyPersisted === true && status === 'frozen' && value.mode !== 'shadow') {
+    invalidApiPayload(path, 'il fail-safe persistito non conferma la modalità Shadow');
+  }
+
+  for (const field of ['action', 'reason', 'error', 'reusedDryRunId', 'reuseFallbackReason'] as const) {
+    if (field in value && value[field] !== null && typeof value[field] !== 'string') {
+      invalidApiPayload(path, `${field} deve essere una stringa oppure null`);
+    }
+  }
+  if (
+    'decisionSource' in value
+    && !['reused-dry-run', 'fresh-analysis'].includes(String(value.decisionSource))
+  ) {
+    invalidApiPayload(path, 'decisionSource è sconosciuto');
+  }
+  if ('persistenceWarning' in value && (typeof value.persistenceWarning !== 'string' || !value.persistenceWarning.trim())) {
+    invalidApiPayload(path, 'persistenceWarning deve essere una stringa non vuota');
+  }
+  if (
+    'activeRunId' in value
+    && value.activeRunId !== null
+    && (typeof value.activeRunId !== 'string' || !value.activeRunId.trim())
+  ) {
+    invalidApiPayload(path, 'activeRunId deve essere una stringa oppure null');
+  }
+  if (
+    'leaseUntil' in value
+    && value.leaseUntil !== null
+    && (typeof value.leaseUntil !== 'number' || !Number.isFinite(value.leaseUntil))
+  ) {
+    invalidApiPayload(path, 'leaseUntil deve essere numerico oppure null');
+  }
+
+  const plan = value.plan;
+  if (plan !== undefined && plan !== null) {
+    if (!isRecord(plan)) invalidApiPayload(path, 'plan deve essere un oggetto oppure null');
+    if (typeof plan.orderCount !== 'number' || !Number.isInteger(plan.orderCount) || plan.orderCount < 0) {
+      invalidApiPayload(path, 'plan.orderCount non è valido');
+    }
+    for (const field of ['turnoverPct', 'confidence'] as const) {
+      if (typeof plan[field] !== 'number' || !Number.isFinite(plan[field]) || plan[field] < 0 || plan[field] > 1) {
+        invalidApiPayload(path, `plan.${field} non è una percentuale valida`);
+      }
+    }
+  }
+
+  const execution = value.execution;
+  if (execution !== undefined) {
+    if (!isRecord(execution) || !isRecord(execution.counts) || !Array.isArray(execution.orders)) {
+      invalidApiPayload(path, 'execution non contiene counts e orders validi');
+    }
+    if (Object.values(execution.counts).some((count) => (
+      typeof count !== 'number' || !Number.isInteger(count) || count < 0
+    ))) {
+      invalidApiPayload(path, 'execution.counts contiene valori non validi');
+    }
+    for (const order of execution.orders) {
+      if (
+        !isRecord(order)
+        || typeof order.symbol !== 'string'
+        || !order.symbol.trim()
+        || typeof order.side !== 'string'
+        || !order.side.trim()
+        || typeof order.amountUsd !== 'number'
+        || !Number.isFinite(order.amountUsd)
+        || order.amountUsd < 0
+        || typeof order.state !== 'string'
+        || !order.state.trim()
+        || !(order.message === null || typeof order.message === 'string')
+      ) {
+        invalidApiPayload(path, 'execution.orders contiene un ordine non valido');
+      }
+    }
+  }
+  if (status === 'ok' && (plan === undefined || plan === null || execution === undefined)) {
+    invalidApiPayload(path, 'una run riuscita non contiene il riepilogo di piano ed esecuzione');
+  }
+
+  return value as unknown as LiveActivationResult;
+}
+
 function isJsonContentType(value: string | null): boolean {
   const mediaType = String(value ?? '').split(';', 1)[0].trim().toLowerCase();
   return mediaType === 'application/json' || mediaType.endsWith('+json');
@@ -632,18 +820,33 @@ export const autopilot = {
   config: () => call<{ config: AutopilotConfig; defaults: AutopilotConfig }>('/agent/config'),
   updateConfig: (patch: Partial<AutopilotConfig>) =>
     call<{ config: AutopilotConfig; applied: string[]; rejected: string[] }>('/agent/config', { method: 'PUT', body: JSON.stringify(patch) }),
-  setMode: (mode: ExecutionMode) =>
+  setMode: (mode: Exclude<ExecutionMode, 'live'>) =>
     call<{ config: AutopilotConfig }>('/agent/mode', {
       method: 'POST',
-      body: JSON.stringify(mode === 'live' ? { mode, confirm: 'ATTIVA ORDINI REALI' } : { mode }),
+      body: JSON.stringify({ mode }),
     }),
+  activateLive: async (request: {
+    activationId: string;
+    confirmation: typeof LIVE_CONFIRMATION;
+    acknowledgePersistentLive: true;
+  }) => validateLiveActivationPayload(
+    await call<unknown>('/agent/live/activate-and-run', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    }),
+    request.activationId,
+  ),
   freeze: (reason: string) => call<{ config: AutopilotConfig }>('/agent/freeze', { method: 'POST', body: JSON.stringify({ reason }) }),
   safeStop: (reason: string) => call<{ config: AutopilotConfig }>('/agent/safe-stop', { method: 'POST', body: JSON.stringify({ reason }) }),
-  unfreeze: () => call<{ config: AutopilotConfig }>('/agent/unfreeze', { method: 'POST', body: '{}' }),
-  trigger: (kind: 'snapshot' | 'rebalance', mode?: ExecutionMode) =>
+  unfreeze: (request: { safetyRevision: number; confirmation?: typeof LIVE_RECOVERY_CONFIRMATION }) =>
+    call<{ config: AutopilotConfig }>('/agent/unfreeze', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    }),
+  trigger: (kind: 'snapshot' | 'rebalance', mode?: Exclude<ExecutionMode, 'live'>) =>
     call<{ runId: string; status: string; error?: string }>('/agent/trigger', {
       method: 'POST',
-      body: JSON.stringify(mode === 'live' ? { kind, mode, confirm: 'ATTIVA ORDINI REALI' } : { kind, mode }),
+      body: JSON.stringify({ kind, mode }),
     }),
   freeModels: () => call<{ models: Array<{ id: string; name: string; contextLength: number | null; recommendedRank?: number | null; fit?: string | null; reasoning?: boolean; structuredOutput?: boolean }>; providers: LlmProvider[] }>('/agent/models'),
   credentials: () => call<{ credentials: CredentialStatus[] }>('/agent/credentials'),

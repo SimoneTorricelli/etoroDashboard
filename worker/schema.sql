@@ -84,6 +84,8 @@ CREATE TABLE IF NOT EXISTS orders (
   message        TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_orders_run ON orders (run_id);
+CREATE INDEX IF NOT EXISTS idx_orders_live_recovery
+  ON orders (mode, state, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS audit (
   id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -142,3 +144,34 @@ CREATE TABLE IF NOT EXISTS universe_cache (
   matched_as    TEXT,
   updated_at    INTEGER NOT NULL
 );
+
+-- Decisione AI riutilizzabile da una dry-run. Il claim è single-use: piano e
+-- importi vengono comunque ricostruiti nella nuova run live.
+CREATE TABLE IF NOT EXISTS decision_artifacts (
+  source_run_id       TEXT PRIMARY KEY,
+  created_at          INTEGER NOT NULL,
+  expires_at          INTEGER NOT NULL,
+  decision_revision   INTEGER NOT NULL,
+  decision_hash       TEXT NOT NULL,
+  binding_hash        TEXT NOT NULL,
+  proposal_hash       TEXT NOT NULL,
+  consumed_at         INTEGER,
+  consumed_by_run_id  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_decision_artifacts_expiry
+  ON decision_artifacts (expires_at DESC, created_at DESC);
+
+-- Idempotenza del click Live: un retry o doppio click con lo stesso ID non
+-- crea una seconda run e non può generare request-id eToro differenti.
+CREATE TABLE IF NOT EXISTS live_activation_requests (
+  activation_id  TEXT PRIMARY KEY,
+  run_id         TEXT NOT NULL UNIQUE,
+  created_at     INTEGER NOT NULL,
+  updated_at     INTEGER NOT NULL,
+  status         TEXT NOT NULL,
+  source_run_id  TEXT,
+  response_json  TEXT,
+  error          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_live_activation_recovery
+  ON live_activation_requests (status, updated_at DESC);

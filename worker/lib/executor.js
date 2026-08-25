@@ -20,7 +20,7 @@ export async function deterministicId(...parts) {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Pre-check di ammissibilità sugli acquisti: mercato aperto e taglio minimo. */
-async function checkEligibility(client, orders, executionScale) {
+export async function checkPlanEligibility(client, orders, executionScale = 1) {
   const buys = orders.filter((order) => order.side === 'buy');
   if (!buys.length) return { ok: true, issues: [], checks: [] };
   const map = await client.eligibility([...new Set(buys.map((order) => order.instrumentId))]);
@@ -52,19 +52,44 @@ async function checkEligibility(client, orders, executionScale) {
  * ricevere nel frattempo un freeze/safe-stop da un altro dispositivo: per
  * questo la configurazione viene riletta prima di ogni singolo invio.
  */
-async function liveSafetyBlock(db) {
+export async function readLiveSafetyFence(db, expected = {}) {
   try {
     const current = await loadConfig(db);
     if (current.frozen) {
-      return `agente congelato: ${current.frozenReason || 'freeze attivo'}`;
+      return { ok: false, current, reason: `agente congelato: ${current.frozenReason || 'freeze attivo'}` };
+    }
+    if (current.recoveryRequired) {
+      return { ok: false, current, reason: `recovery Live richiesta: ${current.recoveryReason || 'verifica eToro necessaria'}` };
     }
     if (current.executionMode !== 'live') {
-      return `modalità corrente ${String(current.executionMode)}: il live è stato disattivato`;
+      return { ok: false, current, reason: `modalità corrente ${String(current.executionMode)}: il live è stato disattivato` };
     }
-    return null;
+    if (Number(current.safetyRevision) !== Number(expected.safetyRevision)) {
+      return { ok: false, current, reason: 'stato di sicurezza modificato durante l’esecuzione' };
+    }
+    if (Number(current.decisionRevision) !== Number(expected.decisionRevision)) {
+      return { ok: false, current, reason: 'strategia o limiti modificati durante l’esecuzione' };
+    }
+    if (
+      String(current.activeAgentPortfolioId ?? '') !== String(expected.activeAgentPortfolioId ?? '')
+      || String(current.agentTokenFingerprint ?? '') !== String(expected.agentTokenFingerprint ?? '')
+      || Number(current.agentTokenVerifiedAt) !== Number(expected.agentTokenVerifiedAt)
+    ) {
+      return { ok: false, current, reason: 'binding del portfolio Agent modificato durante l’esecuzione' };
+    }
+    return { ok: true, current, reason: '' };
   } catch (error) {
-    return `stato di sicurezza non leggibile: ${error instanceof Error ? error.message : String(error)}`;
+    return {
+      ok: false,
+      current: null,
+      reason: `stato di sicurezza non leggibile: ${error instanceof Error ? error.message : String(error)}`,
+    };
   }
+}
+
+async function liveSafetyBlock(db, expected = {}) {
+  const fence = await readLiveSafetyFence(db, expected);
+  return fence.ok ? null : fence.reason;
 }
 
 async function skipRemainingForSafety({ db, runId, plan, fromSeq, mode, message, results }) {
@@ -102,7 +127,7 @@ async function stopLivePlanForSafety({ db, runId, plan, fromSeq, mode, message, 
 /**
  * @param {'shadow'|'dry-run'|'live'} mode
  */
-export async function executePlan({ db, client, runId, plan, mode, config }) {
+export async function executePlan({ db, client, runId, plan, mode, config, eligibilityOverride = null }) {
   const results = [];
   let liveRequestAttempted = false;
   let liveSafetyError = null;
@@ -131,7 +156,7 @@ export async function executePlan({ db, client, runId, plan, mode, config }) {
   // stato prima ancora di quella chiamata: un freeze già attivo non deve
   // avviare alcuna parte dell'esecuzione remota.
   if (mode === 'live') {
-    const safetyBlock = await liveSafetyBlock(db);
+    const safetyBlock = await liveSafetyBlock(db, config);
     if (safetyBlock) {
       liveSafetyError = safetyBlock;
       await stopLivePlanForSafety({
@@ -147,9 +172,9 @@ export async function executePlan({ db, client, runId, plan, mode, config }) {
     }
   }
 
-  const eligibility = await checkEligibility(client, plan.orders, executionScale).catch((error) => ({
+  const eligibility = eligibilityOverride ?? await checkPlanEligibility(client, plan.orders, executionScale).catch((error) => ({
     ok: false,
-    issues: [`pre-check ammissibilità fallito: ${error.message}`],
+    issues: [`pre-check ammissibilità fallito: ${error instanceof Error ? error.message : String(error)}`],
     checks: [],
   }));
 
@@ -190,8 +215,9 @@ export async function executePlan({ db, client, runId, plan, mode, config }) {
     // Ultimo gate, deliberatamente dopo l'intent e subito prima della POST
     // eToro. Se lo stop arriva durante il ciclo, l'intent corrente e tutti gli
     // ordini seguenti vengono convertiti in skipped prima di uscire.
-    const safetyBlock = await liveSafetyBlock(db);
+    const safetyBlock = await liveSafetyBlock(db, config);
     if (safetyBlock) {
+      liveSafetyError = safetyBlock;
       await stopLivePlanForSafety({
         db,
         runId,
@@ -251,13 +277,20 @@ async function verifyOrders({ db, client, results, executionScale = 1 }) {
     for (const record of pending) {
       try {
         const lookup = await client.lookupOrder({ orderId: record.etoroOrderId, referenceId: record.id });
-        record.state = lookup.state === 'pending' ? 'sent' : lookup.state;
+        const nextState = lookup.state === 'pending' ? 'sent' : lookup.state;
         const virtualFilled = lookup.filledUsd || (lookup.state === 'filled' ? record.executionAmountUsd : 0);
-        record.filledUsd = round(virtualFilled / executionScale, 2);
-        record.positionIds = lookup.positionIds;
-        record.message = lookup.error ? `${lookup.label} — ${lookup.error}` : lookup.label;
-        await upsertOrder(db, record);
+        const nextRecord = {
+          ...record,
+          state: nextState,
+          filledUsd: round(virtualFilled / executionScale, 2),
+          positionIds: lookup.positionIds,
+          message: lookup.error ? `${lookup.label} — ${lookup.error}` : lookup.label,
+        };
+        await upsertOrder(db, nextRecord);
+        Object.assign(record, nextRecord);
       } catch (error) {
+        // Mantiene `sent`: senza conferma D1 l'esito resta ambiguo e la
+        // pipeline applicherà Shadow + Frozen invece di dichiarare filled.
         record.message = `verifica non riuscita: ${error instanceof Error ? error.message : String(error)}`;
       }
     }

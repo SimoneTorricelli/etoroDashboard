@@ -13,13 +13,22 @@ import {
   prioritizeUntriedPlan, selectDiverseAttemptPlan,
 } from './lib/brain.js';
 import {
-  acquirePipelineLock, DEFAULT_CONFIG, mutateSafetyConfig, releasePipelineLock, renewPipelineLock,
+  acquirePipelineLock, armLiveIfUnchanged, DEFAULT_CONFIG, findLiveRecoveryBarrier,
+  finishRunIfLiveFence, listStalePreArmActivations, mutateSafetyConfig, releasePipelineLock, renewPipelineLock,
 } from './lib/db.js';
 import { PROFILES, applyProfile, describeProfile, listProfiles } from './lib/profiles.js';
 import { checkChurnRules, filterMarginalSubstitutions, isWorthTheCost } from './lib/churn.js';
 import { buildShortlist, scoreInstrument } from './lib/screening.js';
 import { decideWatcherAction, detectAnomalies, isStabilized, relevantHeadlines } from './lib/watcher.js';
 import { executePlan, reconcile } from './lib/executor.js';
+import {
+  LIVE_DRY_RUN_TTL_MS,
+  buildDecisionContext,
+  classifyDryRunForReuse,
+  comparePortfolioForReuse,
+  isDecisionConfigPatch,
+  LIVE_RECOVERY_CONFIRMATION,
+} from './lib/live-plan.js';
 import {
   buildAttemptPlan, callModel, extractModelText, listFreeModels, prioritizeReviewPlan,
   llmErrorDebug, safeModelOutputPreview, supportsNativeJson,
@@ -41,7 +50,153 @@ const DAY = 24 * 60 * 60 * 1000;
 const tests = [];
 const test = (name, fn) => tests.push([name, fn]);
 
-function createSafetyDb(initialConfig = {}, { safetyReads = [], pipelineLock = null } = {}) {
+test('live-plan: la dry-run scade esattamente dopo due ore', () => {
+  const now = 1_800_000_000_000;
+  const context = {
+    decisionRevision: 7,
+    decisionHash: 'decision-hash',
+    bindingHash: 'binding-hash',
+  };
+  const row = {
+    status: 'ok',
+    finished_at: now - 1,
+    artifact_source_run_id: 'dry-run-1',
+    consumed_at: null,
+    expires_at: now + 1,
+    decision_revision: 7,
+    decision_hash: 'decision-hash',
+    binding_hash: 'binding-hash',
+    validation_ok: 1,
+  };
+
+  assert.equal(LIVE_DRY_RUN_TTL_MS, 2 * 60 * 60 * 1000);
+  assert.deepEqual(classifyDryRunForReuse(row, context, now), { reusable: true, reason: 'fresh' });
+  assert.deepEqual(
+    classifyDryRunForReuse({ ...row, expires_at: now }, context, now),
+    { reusable: false, reason: 'expired' },
+  );
+});
+
+test('live-plan: modalità e orario non cambiano il fingerprint, la cadenza sì', async () => {
+  const base = {
+    ...DEFAULT_CONFIG,
+    decisionRevision: 11,
+    strategySpec: { objective: 'crescita prudente', version: 1 },
+    activeAgentPortfolioId: 'portfolio-a',
+    agentTokenFingerprint: 'fingerprint-a',
+    agentTokenVerifiedAt: 1_800_000_000_000,
+  };
+  const operationalOnly = {
+    ...base,
+    executionMode: 'live',
+    frozen: true,
+    frozenReason: 'stop manuale',
+    rebalanceWeekday: 5,
+    rebalanceDayOfMonth: 23,
+    rebalanceHour: 17,
+    rebalanceMinute: 45,
+    snapshotHours: [7, 19],
+  };
+
+  assert.deepEqual(await buildDecisionContext(operationalOnly), await buildDecisionContext(base));
+  assert.equal(isDecisionConfigPatch({ executionMode: 'live' }), false);
+  assert.equal(isDecisionConfigPatch({ rebalanceDayOfMonth: 23 }), false);
+  assert.notDeepEqual(
+    await buildDecisionContext({ ...base, cadence: 'monthly' }),
+    await buildDecisionContext(base),
+  );
+  assert.equal(isDecisionConfigPatch({ cadence: 'monthly' }), true);
+});
+
+test('live-plan: strategia, guardrail e binding invalidano la decisione', async () => {
+  const base = {
+    ...DEFAULT_CONFIG,
+    decisionRevision: 3,
+    strategySpec: { objective: 'balanced', version: 1 },
+    activeAgentPortfolioId: 'portfolio-a',
+    agentTokenFingerprint: 'fingerprint-a',
+    agentTokenVerifiedAt: 1_800_000_000_000,
+  };
+  const baseline = await buildDecisionContext(base);
+  const strategyChanged = await buildDecisionContext({
+    ...base,
+    strategySpec: { objective: 'defensive', version: 2 },
+  });
+  const guardrailChanged = await buildDecisionContext({
+    ...base,
+    maxTurnoverPct: Number(base.maxTurnoverPct) + 0.01,
+  });
+  const bindingChanged = await buildDecisionContext({
+    ...base,
+    activeAgentPortfolioId: 'portfolio-b',
+    agentTokenFingerprint: 'fingerprint-b',
+  });
+
+  assert.notEqual(strategyChanged.decisionHash, baseline.decisionHash);
+  assert.notEqual(guardrailChanged.decisionHash, baseline.decisionHash);
+  assert.notEqual(bindingChanged.bindingHash, baseline.bindingHash);
+  assert.equal(isDecisionConfigPatch({ strategySpec: strategyChanged }), true);
+  assert.equal(isDecisionConfigPatch({ maxTurnoverPct: 0.2 }), true);
+  assert.equal(isDecisionConfigPatch({ activeAgentPortfolioId: 'portfolio-b' }), true);
+});
+
+test('live-plan: riusa solo un portfolio materialmente equivalente', () => {
+  const sourceBundle = {
+    snapshot: {
+      equity_usd: 1_000,
+      cash_usd: 100,
+      positions: [
+        { instrumentId: 101, valueUsd: 500 },
+        { instrumentId: 102, valueUsd: 400 },
+      ],
+    },
+    features: { portfolio: { executionScale: 1 } },
+  };
+  const compatible = {
+    equityUsd: 1_020,
+    cashUsd: 110,
+    executionScale: 1,
+    positions: [
+      { instrument_id: 101, value_usd: 510 },
+      { instrument_id: 102, value_usd: 400 },
+    ],
+  };
+  const config = { minOrderUsd: 10, minRebalanceBandAbs: 0.03 };
+
+  assert.deepEqual(comparePortfolioForReuse(sourceBundle, compatible, config), { ok: true, reason: '' });
+  assert.match(
+    comparePortfolioForReuse(sourceBundle, { ...compatible, equityUsd: 1_051 }, config).reason,
+    /capitale variato oltre il 5%/,
+  );
+  assert.match(
+    comparePortfolioForReuse(sourceBundle, {
+      ...compatible,
+      positions: [{ instrumentId: 101, valueUsd: 510 }, { instrumentId: 103, valueUsd: 400 }],
+    }, config).reason,
+    /composizione del portfolio modificata/,
+  );
+  assert.match(
+    comparePortfolioForReuse(sourceBundle, {
+      equityUsd: 1_000,
+      cashUsd: 100,
+      executionScale: 1,
+      positions: [{ instrumentId: 101, valueUsd: 550 }, { instrumentId: 102, valueUsd: 350 }],
+    }, config).reason,
+    /peso dello strumento 101 variato oltre la tolleranza/,
+  );
+  assert.match(
+    comparePortfolioForReuse(sourceBundle, { ...compatible, equityUsd: 1_000, cashUsd: 130 }, config).reason,
+    /liquidità del portfolio modificata/,
+  );
+  assert.match(
+    comparePortfolioForReuse(sourceBundle, { ...compatible, executionScale: 1.03 }, config).reason,
+    /scala di esecuzione Agent modificata/,
+  );
+});
+
+function createSafetyDb(initialConfig = {}, {
+  safetyReads = [], pipelineLock = null, mutationFailures = 0, orderWriteFailures = [],
+} = {}) {
   const state = {
     config: { ...DEFAULT_CONFIG, ...initialConfig },
     configReads: 0,
@@ -49,8 +204,14 @@ function createSafetyDb(initialConfig = {}, { safetyReads = [], pipelineLock = n
     orders: new Map(),
     audits: [],
     pipelineLock: pipelineLock ? { ...pipelineLock } : null,
+    vaultValue: null,
+    vaultUpdatedAt: 0,
+    runs: new Map(),
     runStarts: 0,
     finishedRuns: [],
+    mutationFailures,
+    orderWrites: 0,
+    orderWriteFailures: new Set(orderWriteFailures),
   };
   const db = {
     state,
@@ -94,13 +255,74 @@ function createSafetyDb(initialConfig = {}, { safetyReads = [], pipelineLock = n
             }
             return null;
           }
-          if (sql.includes('json_patch') && sql.includes('RETURNING value')) {
-            const patch = JSON.parse(this.args[2]);
-            state.config = { ...state.config, ...patch };
+          if (sql.startsWith('INSERT INTO config') && sql.includes('RETURNING value, updated_at')) {
+            const [, value, nextUpdatedAt,,, expectedExists,, expectedValue, expectedUpdatedAt] = this.args;
+            const exists = state.vaultValue != null;
+            if (exists !== Boolean(expectedExists)) return null;
+            if (exists && (state.vaultValue !== expectedValue || state.vaultUpdatedAt !== expectedUpdatedAt)) return null;
+            state.vaultValue = value;
+            state.vaultUpdatedAt = nextUpdatedAt;
+            return { value, updated_at: nextUpdatedAt };
+          }
+          if (sql.startsWith('UPDATE config') && sql.includes('recoveryRequired":false') && sql.includes('RETURNING value')) {
+            const [,, expectedSafetyRevision, recoveryConfirmed] = this.args;
+            if (
+              !state.config.frozen
+              || Number(state.config.safetyRevision) !== Number(expectedSafetyRevision)
+              || (state.config.recoveryRequired && recoveryConfirmed !== 1)
+            ) return null;
+            state.config = {
+              ...state.config,
+              executionMode: 'shadow',
+              frozen: false,
+              frozenReason: '',
+              recoveryRequired: false,
+              recoveryReason: '',
+              recoveryRunIds: [],
+              recoveryUpdatedAt: 0,
+              safetyRevision: Number(state.config.safetyRevision ?? 0) + 1,
+            };
             state.mutationQueries.push({ sql, args: this.args });
             return { value: JSON.stringify(state.config) };
           }
-          if (sql.startsWith('SELECT value FROM config')) {
+          if (sql.startsWith('UPDATE config') && sql.includes('RETURNING value')) {
+            const [,, expectedMode, expectedSafetyRevision, expectedDecisionRevision, portfolioId, fingerprint, verifiedAt] = this.args;
+            if (
+              state.config.frozen
+              || state.config.recoveryRequired
+              || state.config.executionMode !== expectedMode
+              || Number(state.config.safetyRevision) !== Number(expectedSafetyRevision)
+              || Number(state.config.decisionRevision) !== Number(expectedDecisionRevision)
+              || String(state.config.activeAgentPortfolioId ?? '') !== String(portfolioId)
+              || String(state.config.agentTokenFingerprint ?? '') !== String(fingerprint)
+              || Number(state.config.agentTokenVerifiedAt ?? 0) !== Number(verifiedAt)
+            ) return null;
+            state.config = {
+              ...state.config,
+              executionMode: 'live',
+              safetyRevision: Number(state.config.safetyRevision ?? 0) + 1,
+            };
+            state.mutationQueries.push({ sql, args: this.args });
+            return { value: JSON.stringify(state.config) };
+          }
+          if (sql.includes('json_patch') && sql.includes('RETURNING value')) {
+            if (state.mutationFailures > 0) {
+              state.mutationFailures -= 1;
+              throw new Error('D1 mutazione non disponibile');
+            }
+            const patch = JSON.parse(this.args[2]);
+            state.config = {
+              ...state.config,
+              ...patch,
+              safetyRevision: Number(state.config.safetyRevision ?? 0) + 1,
+            };
+            state.mutationQueries.push({ sql, args: this.args });
+            return { value: JSON.stringify(state.config) };
+          }
+          if (sql.startsWith('SELECT value') && sql.includes('FROM config')) {
+            if (this.args[0] === 'vault') {
+              return state.vaultValue == null ? null : { value: state.vaultValue, updated_at: state.vaultUpdatedAt };
+            }
             const planned = safetyReads[state.configReads];
             state.configReads += 1;
             if (planned instanceof Error) throw planned;
@@ -110,10 +332,45 @@ function createSafetyDb(initialConfig = {}, { safetyReads = [], pipelineLock = n
           if (sql.startsWith('SELECT * FROM orders WHERE id = ?')) {
             return state.orders.get(this.args[0]) ?? null;
           }
+          if (sql.startsWith('UPDATE runs') && sql.includes("status = 'ok'") && sql.includes('AND EXISTS')) {
+            const [, equityUsd, runId,, expectedSafetyRevision, expectedDecisionRevision,
+              portfolioId, fingerprint, verifiedAt] = this.args;
+            const fenceMatches = state.config.executionMode === 'live'
+              && !state.config.frozen
+              && !state.config.recoveryRequired
+              && Number(state.config.safetyRevision) === Number(expectedSafetyRevision)
+              && Number(state.config.decisionRevision) === Number(expectedDecisionRevision)
+              && String(state.config.activeAgentPortfolioId ?? '') === String(portfolioId)
+              && String(state.config.agentTokenFingerprint ?? '') === String(fingerprint)
+              && Number(state.config.agentTokenVerifiedAt ?? 0) === Number(verifiedAt);
+            if (state.runs.get(runId) !== 'running' || !fenceMatches) return null;
+            state.runs.set(runId, 'ok');
+            state.finishedRuns.push({ status: 'ok', equityUsd, runId });
+            return { id: runId };
+          }
+          if (sql.startsWith('UPDATE runs SET finished_at')) {
+            state.finishedRuns.push({
+              finishedAt: this.args[0],
+              status: this.args[1],
+              equityUsd: this.args[2],
+              error: this.args[3],
+              runId: this.args[4],
+            });
+            return { id: this.args[4], status: this.args[1] };
+          }
           throw new Error(`first() non gestito nel fake D1: ${sql.slice(0, 80)}`);
         },
         async run() {
+          if (sql.startsWith('INSERT INTO config') && this.args[0] === 'vault') {
+            state.vaultValue = this.args[1];
+            state.vaultUpdatedAt = this.args[2];
+            return { success: true, meta: { changes: 1 }, results: [] };
+          }
           if (sql.startsWith('INSERT INTO orders')) {
+            state.orderWrites += 1;
+            if (state.orderWriteFailures.has(state.orderWrites)) {
+              throw new Error(`D1 ordine non disponibile alla scrittura ${state.orderWrites}`);
+            }
             const [
               id, runId, seq, createdAt, updatedAt, symbol, instrumentId, side,
               amountUsd, positionId, mode, orderState, etoroOrderId, positionIds,
@@ -153,6 +410,7 @@ function createSafetyDb(initialConfig = {}, { safetyReads = [], pipelineLock = n
           }
           if (sql.startsWith('INSERT INTO runs')) {
             state.runStarts += 1;
+            state.runs.set(this.args[0], 'running');
             return { success: true, meta: { changes: 1 }, results: [] };
           }
           if (sql.startsWith('UPDATE runs SET finished_at')) {
@@ -593,6 +851,33 @@ test('eToro: il mirrorId collega l’Agent Portfolio al capitale reale del propr
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test('eToro: la chiusura legacy non viene ritentata dopo timeout o errori ambigui', async () => {
+  const client = new EtoroClient({ apiKey: 'api', userKey: 'owner', agentToken: 'agent' });
+  const calls = [];
+  client.request = async (version) => {
+    calls.push(version);
+    throw new Error('timeout ambiguo');
+  };
+  await assert.rejects(
+    client.closeOrder({ positionId: 42, amountUsd: null, requestId: 'request-1' }),
+    /timeout ambiguo/,
+  );
+  assert.deepEqual(calls, ['v2']);
+});
+
+test('eToro: la chiusura legacy è usata solo se v2 dichiara la rotta incompatibile', async () => {
+  const client = new EtoroClient({ apiKey: 'api', userKey: 'owner', agentToken: 'agent' });
+  const calls = [];
+  client.request = async (version) => {
+    calls.push(version);
+    if (version === 'v2') throw Object.assign(new Error('not found'), { status: 404 });
+    return { orderId: 'legacy-order' };
+  };
+  const result = await client.closeOrder({ positionId: 42, amountUsd: null, requestId: 'request-2' });
+  assert.equal(result.orderId, 'legacy-order');
+  assert.deepEqual(calls, ['v2', 'v1']);
 });
 
 test('readiness: misura la capacità della shortlist entro i cap di classe', () => {
@@ -1450,6 +1735,21 @@ test('live fail-safe: congela in shadow e chiude la run frozen', async () => {
   assert.ok(db.state.audits.some((args) => args[3] === 'reconcile-fail-safe'));
 });
 
+test('live fail-safe: se D1 non conferma il freeze non dichiara falsamente Shadow', async () => {
+  const db = createSafetyDb({ executionMode: 'live', frozen: false }, { mutationFailures: 2 });
+  const result = await freezeLiveRun({
+    db,
+    runId: 'live-safety-unknown',
+    credentials: {},
+    reason: 'timeout ambiguo dopo invio',
+  });
+  assert.equal(result.safetyPersisted, false);
+  assert.equal(result.status, 'error');
+  assert.equal(result.config, null);
+  assert.equal(db.state.config.executionMode, 'live');
+  assert.equal(db.state.finishedRuns.length, 0, 'la run resta running come barriera di recovery');
+});
+
 test('watcher: il percorso propositivo non contiene chiamate dirette agli ordini', () => {
   const source = runWatcher.toString();
   assert.doesNotMatch(source, /client\.(?:openOrder|closeOrder)\s*\(/);
@@ -1476,6 +1776,105 @@ test('safety config: safe-stop aggiorna i tre campi in una sola query atomica', 
   assert.equal(db.state.configReads, 0, 'nessun read-modify-write separato');
 });
 
+test('safety config: ogni stop/unfreeze invalida una vecchia attivazione tramite epoch', async () => {
+  const db = createSafetyDb({
+    executionMode: 'shadow',
+    safetyRevision: 4,
+    decisionRevision: 9,
+  });
+  const observed = { ...db.state.config };
+  const stopped = await mutateSafetyConfig(db, {
+    executionMode: 'shadow',
+    frozen: true,
+    frozenReason: 'stop concorrente',
+  });
+  assert.equal(stopped.safetyRevision, 5);
+  const unfrozen = await mutateSafetyConfig(db, {
+    executionMode: 'shadow',
+    frozen: false,
+    frozenReason: '',
+  });
+  assert.equal(unfrozen.safetyRevision, 6);
+  assert.equal(await armLiveIfUnchanged(db, observed), null, 'l’epoch osservata prima dello stop non può armare');
+  const armed = await armLiveIfUnchanged(db, unfrozen);
+  assert.equal(armed.executionMode, 'live');
+  assert.equal(armed.safetyRevision, 7);
+});
+
+test('live final CAS: una run diventa ok solo con fence e binding ancora identici', async () => {
+  const db = createSafetyDb({
+    executionMode: 'live',
+    frozen: false,
+    recoveryRequired: false,
+    safetyRevision: 12,
+    decisionRevision: 4,
+    activeAgentPortfolioId: 'portfolio-live',
+    agentTokenFingerprint: 'token-fingerprint',
+    agentTokenVerifiedAt: 456,
+  });
+  const expected = { ...db.state.config };
+  db.state.runs.set('live-success', 'running');
+  assert.equal(await finishRunIfLiveFence(db, 'live-success', 2_500, expected), true);
+  assert.equal(db.state.runs.get('live-success'), 'ok');
+
+  db.state.runs.set('live-stopped', 'running');
+  await mutateSafetyConfig(db, {
+    executionMode: 'shadow',
+    frozen: true,
+    frozenReason: 'safe-stop concorrente',
+    recoveryRequired: true,
+    recoveryReason: 'verifica eToro',
+  });
+  assert.equal(await finishRunIfLiveFence(db, 'live-stopped', 2_500, expected), false);
+  assert.equal(db.state.runs.get('live-stopped'), 'running');
+
+  const bindingDb = createSafetyDb({ ...expected, activeAgentPortfolioId: 'portfolio-ruotato' });
+  bindingDb.state.runs.set('live-rebound', 'running');
+  assert.equal(await finishRunIfLiveFence(bindingDb, 'live-rebound', 2_500, expected), false);
+  assert.equal(bindingDb.state.runs.get('live-rebound'), 'running');
+});
+
+test('recovery barrier: considera soltanto ordini di run ancora running', async () => {
+  const queries = [];
+  const db = {
+    prepare(sql) {
+      queries.push(sql);
+      return {
+        bind() { return this; },
+        async first() {
+          if (sql.includes('FROM live_activation_requests')) return null;
+          return { id: 'order-1', run_id: 'stale-run', symbol: 'SPY', side: 'buy', state: 'sent', updated_at: 123 };
+        },
+      };
+    },
+  };
+  const barrier = await findLiveRecoveryBarrier(db);
+  assert.equal(barrier.order.run_id, 'stale-run');
+  const orderSql = queries.find((sql) => sql.includes('FROM orders o'));
+  assert.match(orderSql, /JOIN runs r ON r\.id = o\.run_id/);
+  assert.match(orderSql, /r\.status = 'running'/);
+});
+
+test('recovery pre-arm: cerca activation running orfane e non quelle già armate', async () => {
+  let captured = null;
+  const db = {
+    prepare(sql) {
+      captured = { sql, args: [] };
+      return {
+        bind(...args) { captured.args = args; return this; },
+        async all() {
+          return { results: [{ activation_id: 'old-id', run_id: 'old-run', status: 'running' }] };
+        },
+      };
+    },
+  };
+  const rows = await listStalePreArmActivations(db, { excludeActivationId: 'current-id' });
+  assert.equal(rows[0].run_id, 'old-run');
+  assert.match(captured.sql, /status = 'running'/);
+  assert.doesNotMatch(captured.sql, /arming-live|executing-live/);
+  assert.deepEqual(captured.args.slice(0, 2), ['current-id', 'current-id']);
+});
+
 test('control API: safe-stop congela e torna in shadow atomicamente', async () => {
   const db = createSafetyDb({ executionMode: 'live', frozen: false });
   const request = new Request('https://example.test/agent/safe-stop', {
@@ -1490,6 +1889,7 @@ test('control API: safe-stop congela e torna in shadow atomicamente', async () =
   assert.equal(body.config.executionMode, 'shadow');
   assert.equal(body.config.frozen, true);
   assert.equal(body.config.frozenReason, 'telefono offline');
+  assert.equal(body.config.recoveryRequired, true);
   assert.equal(db.state.mutationQueries.length, 1);
 });
 
@@ -1514,7 +1914,7 @@ test('control API: unfreeze resta in shadow e non riattiva il live', async () =>
   const request = new Request('https://example.test/agent/unfreeze', {
     method: 'POST',
     headers: { authorization: 'Bearer control-test', 'content-type': 'application/json' },
-    body: '{}',
+    body: JSON.stringify({ safetyRevision: 0 }),
   });
   const response = await handleAgentApi(request, { DB: db, CONTROL_TOKEN: 'control-test' }, null, '/agent/unfreeze');
   const body = await response.json();
@@ -1523,6 +1923,89 @@ test('control API: unfreeze resta in shadow e non riattiva il live', async () =>
   assert.equal(body.config.frozen, false);
   assert.equal(body.config.frozenReason, '');
   assert.equal(db.state.mutationQueries.length, 1);
+});
+
+test('control API: una recovery richiede conferma e revision esatta prima dello sblocco', async () => {
+  const db = createSafetyDb({
+    executionMode: 'shadow',
+    frozen: true,
+    frozenReason: 'ordine sent da verificare',
+    recoveryRequired: true,
+    recoveryReason: 'ordine sent da verificare',
+    safetyRevision: 7,
+  });
+  const request = (body) => new Request('https://example.test/agent/unfreeze', {
+    method: 'POST',
+    headers: { authorization: 'Bearer control-test', 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+
+  const missingConfirmation = await handleAgentApi(
+    request({ safetyRevision: 7 }),
+    { DB: db, CONTROL_TOKEN: 'control-test' },
+    null,
+    '/agent/unfreeze',
+  );
+  assert.equal(missingConfirmation.status, 409);
+  assert.equal(db.state.config.frozen, true);
+
+  const stale = await handleAgentApi(
+    request({ safetyRevision: 6, confirmation: LIVE_RECOVERY_CONFIRMATION }),
+    { DB: db, CONTROL_TOKEN: 'control-test' },
+    null,
+    '/agent/unfreeze',
+  );
+  assert.equal(stale.status, 409);
+  assert.equal(db.state.config.frozen, true);
+
+  const confirmed = await handleAgentApi(
+    request({ safetyRevision: 7, confirmation: LIVE_RECOVERY_CONFIRMATION }),
+    { DB: db, CONTROL_TOKEN: 'control-test' },
+    null,
+    '/agent/unfreeze',
+  );
+  const body = await confirmed.json();
+  assert.equal(confirmed.status, 200);
+  assert.equal(body.config.executionMode, 'shadow');
+  assert.equal(body.config.frozen, false);
+  assert.equal(body.config.recoveryRequired, false);
+  assert.equal(body.config.safetyRevision, 8);
+});
+
+test('control API: ruotare qualunque credenziale eToro forza Shadow e invalida il binding', async () => {
+  const db = createSafetyDb({
+    executionMode: 'live',
+    safetyRevision: 9,
+    activeAgentPortfolioId: 'portfolio-live',
+    activeAgentPortfolioName: 'Portfolio Live',
+    activeAgentPortfolioMirrorId: 'mirror-live',
+    agentTokenVerifiedAt: 123,
+    agentTokenHint: '••••test',
+    agentTokenFingerprint: 'old-fingerprint',
+    agentTokenOrigin: 'vault',
+  });
+  const request = new Request('https://example.test/agent/credentials', {
+    method: 'PUT',
+    headers: { authorization: 'Bearer control-test', 'content-type': 'application/json' },
+    body: JSON.stringify({ etoroApiKey: 'rotated-api-key' }),
+  });
+  const response = await handleAgentApi(request, {
+    DB: db,
+    CONTROL_TOKEN: 'control-test',
+    VAULT_KEY: 'vault-test-key',
+    ETORO_USER_KEY: 'owner-user-key',
+    ETORO_AGENT_TOKEN: 'agent-token',
+  }, null, '/agent/credentials');
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(body.applied, ['etoroApiKey']);
+  assert.equal(db.state.config.executionMode, 'shadow');
+  assert.ok(db.state.config.safetyRevision > 9);
+  assert.equal(db.state.config.activeAgentPortfolioId, '');
+  assert.equal(db.state.config.agentTokenVerifiedAt, 0);
+  assert.equal(db.state.config.agentTokenFingerprint, '');
+  assert.equal(db.state.mutationQueries[0].args[2], JSON.stringify({ executionMode: 'shadow' }));
 });
 
 test('control API: il live viene rifiutato quando il freeze è attivo', async () => {
@@ -1537,6 +2020,20 @@ test('control API: il live viene rifiutato quando il freeze è attivo', async ()
   assert.equal(response.status, 409);
   assert.match(body.error, /congelato/i);
   assert.equal(db.state.mutationQueries.length, 0);
+});
+
+test('control API: il trigger generico non può avviare una run Live', async () => {
+  const db = createSafetyDb({ executionMode: 'live', frozen: false });
+  const request = new Request('https://example.test/agent/trigger', {
+    method: 'POST',
+    headers: { authorization: 'Bearer control-test', 'content-type': 'application/json' },
+    body: JSON.stringify({ kind: 'rebalance', mode: 'live' }),
+  });
+  const response = await handleAgentApi(request, { DB: db, CONTROL_TOKEN: 'control-test' }, null, '/agent/trigger');
+  const body = await response.json();
+  assert.equal(response.status, 409);
+  assert.match(body.error, /attivazione atomica/i);
+  assert.equal(db.state.runStarts, 0);
 });
 
 function liveExecutorPlan() {
@@ -1564,6 +2061,47 @@ function liveExecutorClient(onSend, onEligibility = () => {}) {
   };
 }
 
+test('executor live: il pre-check già completato prima della CAS non viene duplicato', async () => {
+  const db = createSafetyDb();
+  let eligibilityCalls = 0;
+  const result = await executePlan({
+    db,
+    client: {
+      ...liveExecutorClient(() => {}),
+      eligibility: async () => { eligibilityCalls += 1; throw new Error('non deve essere richiamato'); },
+    },
+    runId: 'prechecked-dry-run',
+    plan: liveExecutorPlan(),
+    mode: 'dry-run',
+    config: DEFAULT_CONFIG,
+    eligibilityOverride: { ok: true, issues: [], checks: [] },
+  });
+  assert.equal(eligibilityCalls, 0);
+  assert.ok(result.results.every((item) => item.state === 'simulated'));
+});
+
+test('executor live: un filled non persistito resta sent e quindi ambiguo', async () => {
+  const db = createSafetyDb({}, {
+    safetyReads: [
+      { executionMode: 'live', frozen: false },
+      { executionMode: 'live', frozen: false },
+    ],
+    orderWriteFailures: [3, 4],
+  });
+  const oneOrderPlan = { ...liveExecutorPlan(), orders: [liveExecutorPlan().orders[0]] };
+  const result = await executePlan({
+    db,
+    client: liveExecutorClient(() => {}),
+    runId: 'verify-write-failed',
+    plan: oneOrderPlan,
+    mode: 'live',
+    config: DEFAULT_CONFIG,
+  });
+  assert.equal(result.results[0].state, 'sent');
+  assert.match(result.results[0].message, /verifica non riuscita/);
+  assert.equal([...db.state.orders.values()][0].state, 'sent');
+});
+
 test('executor live: un cambio a shadow interrompe gli invii successivi', async () => {
   const db = createSafetyDb({}, {
     safetyReads: [
@@ -1584,6 +2122,8 @@ test('executor live: un cambio a shadow interrompe gli invii successivi', async 
   assert.deepEqual(sent, [101]);
   assert.deepEqual(result.results.map((item) => item.state), ['filled', 'skipped', 'skipped']);
   assert.match(result.results[1].message, /modalità corrente shadow/);
+  assert.equal(result.blocked, true);
+  assert.match(result.error, /modalità corrente shadow/);
   assert.equal(db.state.configReads, 3, 'controlla prima dell’eligibility e subito prima di ciascun invio');
 });
 
@@ -1630,6 +2170,8 @@ test('executor live: freeze dopo intent converte current e remaining in skipped 
   assert.ok(result.results.every((item) => item.state === 'skipped'));
   assert.ok([...db.state.orders.values()].every((item) => item.state === 'skipped'));
   assert.ok(result.results.every((item) => /race safe-stop/.test(item.message)));
+  assert.equal(result.blocked, true);
+  assert.match(result.error, /race safe-stop/);
   assert.equal(db.state.configReads, 2);
 });
 
@@ -1654,6 +2196,8 @@ test('executor live: read D1 fallito dopo intent converte il piano in skipped', 
   assert.equal(result.results.length, 3);
   assert.ok(result.results.every((item) => item.state === 'skipped'));
   assert.ok(result.results.every((item) => /D1 perso dopo intent/.test(item.message)));
+  assert.equal(result.blocked, true);
+  assert.match(result.error, /D1 perso dopo intent/);
 });
 
 test('executor live: errore di lettura D1 fallisce chiuso senza chiamare eToro', async () => {

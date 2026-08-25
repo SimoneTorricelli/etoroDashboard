@@ -3,7 +3,7 @@
  * `CONTROL_TOKEN`; il passaggio a modalità `live` richiede una conferma
  * esplicita aggiuntiva.
  */
-import { runPipeline } from './pipeline.js';
+import { activateLiveAndRun, runPipeline } from './pipeline.js';
 import { extractJson, listFreeModels } from './brain.js';
 import { buildStrategyActivationNotification, notify, notifyTest } from './notify.js';
 import {
@@ -23,8 +23,12 @@ import {
 import { buildPolicyUniverse } from './universe-policy.js';
 import {
   audit, equityHistory, getRunBundle, listRuns, listWatcherEvents, loadConfig,
-  loadLedger, mutateSafetyConfig, saveConfig, DEFAULT_CONFIG,
+  latestDryRunWithArtifact, loadLedger, mutateSafetyConfig, saveConfig, unfreezeSafetyConfig, DEFAULT_CONFIG,
 } from './db.js';
+import {
+  buildDecisionContext, classifyDryRunForReuse, isDecisionConfigPatch,
+  LIVE_CONFIRMATION, LIVE_DRY_RUN_TTL_MS, LIVE_RECOVERY_CONFIRMATION,
+} from './live-plan.js';
 
 /** Confronto a tempo costante: evita di rivelare il token per timing. */
 export function safeEqual(a, b) {
@@ -98,6 +102,10 @@ export function sanitizeConfigPatch(patch) {
     if (!(key in DEFAULT_CONFIG)) { rejected.push(`${key}: chiave sconosciuta`); continue; }
     if (key === 'executionMode') { rejected.push('executionMode: usa POST /agent/mode'); continue; }
     if (key === 'frozen' || key === 'frozenReason') { rejected.push(`${key}: usa /agent/freeze o /agent/unfreeze`); continue; }
+    if (['decisionRevision', 'safetyRevision', 'recoveryRequired', 'recoveryReason', 'recoveryRunIds', 'recoveryUpdatedAt'].includes(key)) {
+      rejected.push(`${key}: gestito internamente dal server`);
+      continue;
+    }
     if ([
       'activeAgentPortfolioId', 'activeAgentPortfolioName', 'activeAgentPortfolioMirrorId',
       'activeAgentPortfolioVirtualBalanceUsd', 'agentTokenVerifiedAt', 'agentTokenHint',
@@ -205,6 +213,55 @@ export function sanitizeConfigPatch(patch) {
     rejected.push(`${key}: tipo non gestito`);
   }
   return { patch: out, rejected };
+}
+
+function parseStoredJson(value) {
+  if (value && typeof value === 'object') return value;
+  if (typeof value !== 'string' || !value) return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function optionalNumber(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+/** Anteprima server-authoritative della decisione che il prossimo Live proverà a promuovere. */
+async function buildLiveActivationPreview(db, config, now = Date.now()) {
+  const [latest, context] = await Promise.all([
+    latestDryRunWithArtifact(db),
+    buildDecisionContext(config),
+  ]);
+  if (!latest) return { serverNow: now, ttlMs: LIVE_DRY_RUN_TTL_MS, dryRun: null };
+
+  const classification = classifyDryRunForReuse(latest, context, now);
+  const plan = parseStoredJson(latest.plan_json);
+  const planConfidence = optionalNumber(plan?.confidence);
+  const proposalConfidence = optionalNumber(latest.proposal_confidence);
+  const turnoverPct = optionalNumber(plan?.turnoverPct);
+  return {
+    serverNow: now,
+    ttlMs: LIVE_DRY_RUN_TTL_MS,
+    dryRun: {
+      runId: latest.id,
+      status: latest.status,
+      finishedAt: Number(latest.finished_at) || null,
+      artifactCreatedAt: Number(latest.artifact_created_at) || null,
+      expiresAt: Number(latest.expires_at) || null,
+      reusable: classification.reusable,
+      reason: classification.reason,
+      model: latest.proposal_model ?? null,
+      confidence: planConfidence ?? proposalConfidence,
+      orderCount: Array.isArray(plan?.orders) ? plan.orders.length : 0,
+      turnoverPct,
+    },
+  };
 }
 
 const GUIDED_OBJECTIVE = {
@@ -821,10 +878,11 @@ export async function handleAgentApi(request, env, ctx, pathname) {
   if (route === 'state' && method === 'GET') {
     const storedConfig = await loadConfig(db);
     const trackingSince = Number(storedConfig.realCapitalTrackingStartedAt) || Number.MAX_SAFE_INTEGER;
-    const [runs, curve, resolved] = await Promise.all([
+    const [runs, curve, resolved, liveActivation] = await Promise.all([
       listRuns(db, 12),
       equityHistory(db, 200, trackingSince),
       resolveCredentials(db, env),
+      buildLiveActivationPreview(db, storedConfig),
     ]);
     const config = hydrateGuidedReview(storedConfig);
     const last = runs[0] ?? null;
@@ -841,6 +899,7 @@ export async function handleAgentApi(request, env, ctx, pathname) {
       credentials: describeCredentials(resolved),
       agentBindingVerified: hasVerifiedAgentBinding(resolved, config),
       notificationsActive: Boolean((resolved.values.telegramBotToken && resolved.values.telegramChatId) || resolved.values.notifyWebhookUrl),
+      liveActivation,
     });
   }
 
@@ -887,7 +946,7 @@ export async function handleAgentApi(request, env, ctx, pathname) {
     if (method === 'PUT') {
       const { patch, rejected } = sanitizeConfigPatch(body);
       if (!Object.keys(patch).length) return json({ error: 'nessuna modifica valida', rejected }, 400);
-      const config = await saveConfig(db, patch);
+      const config = await saveConfig(db, patch, { decisionChange: isDecisionConfigPatch(patch) });
       await audit(db, null, 'info', 'config', 'Configurazione aggiornata', { patch, rejected });
       return json({ config, applied: Object.keys(patch), rejected });
     }
@@ -1013,6 +1072,9 @@ export async function handleAgentApi(request, env, ctx, pathname) {
       const minHoldingDays = Math.max(0, Math.min(365, Math.round(Number(activationGuided.minHoldingDays) || 0)));
       const policyPool = buildPolicyUniverse(spec, { limit: Math.min(60, Math.max(40, maxHoldings * 3)) });
       const persistedDraft = strategyPreview(spec, activationGuided, scenario);
+      // Una nuova strategia parte sempre in Shadow, ma non può cancellare un
+      // freeze/recovery Live: lo sblocco ha il proprio CAS e conferma eToro.
+      await mutateSafetyConfig(db, { executionMode: 'shadow' });
       const next = await saveConfig(db, {
         strategySpecVersion: spec.schemaVersion,
         strategySpec: spec,
@@ -1057,9 +1119,7 @@ export async function handleAgentApi(request, env, ctx, pathname) {
         realCapitalTrackingStartedAt: 0,
         shadowDays,
         executionMode: 'shadow',
-        frozen: false,
-        frozenReason: '',
-      });
+      }, { decisionChange: true });
       await audit(db, null, 'warn', 'strategy', `Strategia “${spec.name}” attivata in shadow per ${shadowDays} giorni`, {
         portfolioId: requestedPortfolioId,
         maxHoldings,
@@ -1090,84 +1150,114 @@ export async function handleAgentApi(request, env, ctx, pathname) {
     }
   }
 
-  // POST /agent/mode  { mode, confirm }
+  // POST /agent/live/activate-and-run — conferma atomica: decide, arma il Live ed esegue.
+  if (route === 'live/activate-and-run' && method === 'POST') {
+    const activationId = String(body.activationId ?? '').trim();
+    if (!/^[a-f0-9-]{20,80}$/i.test(activationId)) {
+      return json({ error: 'activationId non valido' }, 400);
+    }
+    if (body.confirmation !== LIVE_CONFIRMATION) {
+      return json({ error: `per il Live serve confirmation = "${LIVE_CONFIRMATION}"` }, 400);
+    }
+    if (body.acknowledgePersistentLive !== true) {
+      return json({ error: 'acknowledgePersistentLive deve essere true' }, 400);
+    }
+    const result = await activateLiveAndRun({ env, activationId });
+    return json(result, result.busy ? 409 : 200);
+  }
+
+  // POST /agent/mode  { mode }
   if (route === 'mode' && method === 'POST') {
     const mode = String(body.mode ?? '');
     if (!['shadow', 'dry-run', 'live'].includes(mode)) return json({ error: 'modalità non ammessa' }, 400);
-    if (mode === 'live' && body.confirm !== 'ATTIVA ORDINI REALI') {
-      return json({ error: 'per la modalità live serve confirm = "ATTIVA ORDINI REALI"' }, 400);
-    }
-    const current = await loadConfig(db);
-    if (mode === 'live' && current.frozen) {
+    if (mode === 'live') {
+      const current = await loadConfig(db);
       return json({
-        error: `Autopilot congelato: ${current.frozenReason || 'freeze attivo'}. Riattivalo esplicitamente prima del live.`,
-        config: current,
+        error: current.frozen
+          ? `Autopilot congelato: ${current.frozenReason || 'freeze attivo'}. Il Live si attiva solo tramite POST /agent/live/activate-and-run dopo lo sblocco.`
+          : 'Il Live non può essere armato senza esecuzione: usa POST /agent/live/activate-and-run.',
+        endpoint: '/agent/live/activate-and-run',
+        ...(current.frozen ? { config: current } : {}),
       }, 409);
     }
     const resolved = await resolveCredentials(db, env);
     const credentials = resolved.values;
-    if (mode === 'live' && !hasVerifiedAgentBinding(resolved, current)) {
-      return json({ error: 'Agent Portfolio non verificato: genera un nuovo token e attendi la verifica prima del live' }, 400);
-    }
     const config = await mutateSafetyConfig(db, { executionMode: mode });
-    if (mode === 'live' && config.frozen) {
-      const stopped = await mutateSafetyConfig(db, { executionMode: 'shadow' });
-      return json({
-        error: `Autopilot congelato durante il cambio modalità: ${config.frozenReason || 'freeze attivo'}. Il live resta bloccato.`,
-        config: stopped,
-      }, 409);
-    }
     await audit(db, null, 'warn', 'config', `Modalità di esecuzione impostata su ${mode}`);
-    await notify(credentials, mode === 'live' ? 'critical' : 'info', `Autopilot: modalità ${mode}`, [
-      mode === 'live' ? 'Da ora gli ordini vengono inviati davvero su eToro.' : 'Nessun ordine reale verrà inviato.',
-    ]);
+    await notify(credentials, 'info', `Autopilot: modalità ${mode}`, ['Nessun ordine reale verrà inviato.']);
     return json({ config });
   }
 
   // POST /agent/safe-stop | /agent/freeze | /agent/unfreeze
   if (route === 'safe-stop' && method === 'POST') {
     const reason = String(body.reason ?? 'arresto remoto in sicurezza').slice(0, 300);
+    const current = await loadConfig(db);
     const config = await mutateSafetyConfig(db, {
       executionMode: 'shadow',
       frozen: true,
       frozenReason: reason,
+      recoveryRequired: true,
+      recoveryReason: current.recoveryReason || reason,
+      recoveryRunIds: current.recoveryRunIds ?? [],
+      recoveryUpdatedAt: Date.now(),
     });
     await audit(db, null, 'warn', 'config', `Arresto in sicurezza: ${reason}`);
     return json({ ok: true, config });
   }
   if (route === 'freeze' && method === 'POST') {
     const reason = String(body.reason ?? 'freeze manuale').slice(0, 300);
+    const current = await loadConfig(db);
     const config = await mutateSafetyConfig(db, {
       executionMode: 'shadow',
       frozen: true,
       frozenReason: reason,
+      recoveryRequired: true,
+      recoveryReason: current.recoveryReason || reason,
+      recoveryRunIds: current.recoveryRunIds ?? [],
+      recoveryUpdatedAt: Date.now(),
     });
     await audit(db, null, 'warn', 'config', `Agente congelato: ${reason}`);
     return json({ config });
   }
   if (route === 'unfreeze' && method === 'POST') {
-    const config = await mutateSafetyConfig(db, {
-      executionMode: 'shadow',
-      frozen: false,
-      frozenReason: '',
-    });
-    await audit(db, null, 'warn', 'config', 'Agente riattivato');
+    const current = await loadConfig(db);
+    const expectedSafetyRevision = Number(body.safetyRevision);
+    if (!Number.isInteger(expectedSafetyRevision) || expectedSafetyRevision < 0) {
+      return json({ error: 'safetyRevision corrente obbligatoria per lo sblocco', config: current }, 409);
+    }
+    const recoveryConfirmed = body.confirmation === LIVE_RECOVERY_CONFIRMATION;
+    if (current.recoveryRequired && !recoveryConfirmed) {
+      return json({
+        error: `prima dello sblocco verifica ordini e posizioni su eToro e conferma con "${LIVE_RECOVERY_CONFIRMATION}"`,
+        config: current,
+        recoveryRequired: true,
+      }, 409);
+    }
+    const config = await unfreezeSafetyConfig(db, { expectedSafetyRevision, recoveryConfirmed });
+    if (!config) {
+      return json({
+        error: 'lo stato di sicurezza è cambiato: aggiorna la dashboard prima di sbloccare',
+        config: await loadConfig(db),
+      }, 409);
+    }
+    await audit(db, null, 'warn', 'config', current.recoveryRequired
+      ? 'Agente riattivato dopo conferma di verifica eToro'
+      : 'Agente riattivato');
     return json({ config });
   }
 
   // POST /agent/trigger { kind, mode }
   if (route === 'trigger' && method === 'POST') {
     const kind = ['snapshot', 'rebalance', 'heartbeat'].includes(body.kind) ? body.kind : 'rebalance';
-    const modeOverride = ['shadow', 'dry-run', 'live'].includes(body.mode) ? body.mode : undefined;
-    if (modeOverride === 'live' && body.confirm !== 'ATTIVA ORDINI REALI') {
-      return json({ error: 'override live richiede confirm = "ATTIVA ORDINI REALI"' }, 400);
+    if (body.mode === 'live') {
+      return json({
+        error: 'Una run Live può partire solo dall’attivazione atomica dedicata.',
+        endpoint: '/agent/live/activate-and-run',
+      }, 409);
     }
-    if (modeOverride === 'live') {
-      const [resolved, config] = await Promise.all([resolveCredentials(db, env), loadConfig(db)]);
-      if (!hasVerifiedAgentBinding(resolved, config)) {
-        return json({ error: 'Agent Portfolio non verificato: genera un nuovo token prima della run live' }, 400);
-      }
-    }
+    // Un trigger generico non eredita mai il Live persistente: le sole run
+    // reali sono il cron già armato o l'endpoint atomico di attivazione.
+    const modeOverride = body.mode === 'dry-run' ? 'dry-run' : 'shadow';
     const result = await runPipeline({ env, kind, modeOverride });
     return json(result, result.busy ? 409 : 200);
   }
@@ -1178,8 +1268,13 @@ export async function handleAgentApi(request, env, ctx, pathname) {
       return json({ credentials: describeCredentials(await resolveCredentials(db, env)) });
     }
     if (method === 'PUT') {
+      const etoroCredentialKeys = ['etoroApiKey', 'etoroUserKey', 'etoroAgentToken'];
+      const requestedEtoroChange = etoroCredentialKeys.some((key) => Object.prototype.hasOwnProperty.call(body, key));
+      if (requestedEtoroChange) {
+        await mutateSafetyConfig(db, { executionMode: 'shadow' });
+      }
       const { applied, rejected } = await saveCredentials(db, env, body);
-      if (applied.includes('etoroAgentToken')) {
+      if (applied.some((key) => etoroCredentialKeys.includes(key))) {
         await saveConfig(db, {
           activeAgentPortfolioId: '',
           activeAgentPortfolioName: '',
@@ -1194,13 +1289,14 @@ export async function handleAgentApi(request, env, ctx, pathname) {
           agentTokenHint: '',
           agentTokenFingerprint: '',
           agentTokenOrigin: '',
-        });
+        }, { decisionChange: true });
       }
       await audit(db, null, 'warn', 'credentials', `Credenziali aggiornate: ${applied.join(', ') || 'nessuna'}`, { rejected });
       return json({ credentials: describeCredentials(await resolveCredentials(db, env)), applied, rejected });
     }
     if (method === 'DELETE') {
-      await clearCredentials(db);
+      await mutateSafetyConfig(db, { executionMode: 'shadow' });
+      await clearCredentials(db, env);
       await saveConfig(db, {
         activeAgentPortfolioId: '',
         activeAgentPortfolioName: '',
@@ -1215,7 +1311,7 @@ export async function handleAgentApi(request, env, ctx, pathname) {
         agentTokenHint: '',
         agentTokenFingerprint: '',
         agentTokenOrigin: '',
-      });
+      }, { decisionChange: true });
       await audit(db, null, 'warn', 'credentials', 'Vault credenziali svuotato');
       return json({ credentials: describeCredentials(await resolveCredentials(db, env)) });
     }
@@ -1233,7 +1329,9 @@ export async function handleAgentApi(request, env, ctx, pathname) {
     if (!known) return json({ error: 'profilo non riconosciuto' }, 400);
     const current = await loadConfig(db);
     const next = applyProfile(current, profileId);
-    const config = await saveConfig(db, next);
+    const profilePatch = Object.fromEntries(Object.entries(next)
+      .filter(([key, value]) => JSON.stringify(value) !== JSON.stringify(current[key])));
+    const config = await saveConfig(db, profilePatch, { decisionChange: true });
     await audit(db, null, 'warn', 'config', `Profilo di strategia impostato su ${profileId}`);
     return json({ config });
   }
@@ -1281,9 +1379,13 @@ export async function handleAgentApi(request, env, ctx, pathname) {
   if (route === 'agent-token' && method === 'POST') {
     const agentPortfolioId = String(body.agentPortfolioId ?? '').trim();
     if (!agentPortfolioId) return json({ error: 'agentPortfolioId obbligatorio' }, 400);
-    const { values: credentials } = await resolveCredentials(db, env);
+    const resolvedBeforeRemote = await resolveCredentials(db, env);
+    const credentials = resolvedBeforeRemote.values;
     if (!credentials.etoroApiKey || !credentials.etoroUserKey) return json({ error: 'credenziali eToro non configurate' }, 400);
     try {
+      // La rigenerazione può revocare o sostituire il token remoto: invalida
+      // l'epoch Live prima di qualunque chiamata eToro, non dopo la verifica.
+      await mutateSafetyConfig(db, { executionMode: 'shadow' });
       const client = new EtoroClient({ apiKey: credentials.etoroApiKey, userKey: credentials.etoroUserKey });
       const remote = (await client.agentPortfolios()).find((item) => item.id === agentPortfolioId);
       if (!remote) throw new Error(`Agent Portfolio ${agentPortfolioId} non trovato sul conto eToro`);
@@ -1301,11 +1403,14 @@ export async function handleAgentApi(request, env, ctx, pathname) {
       const currentConfig = await loadConfig(db);
       const { config } = await saveVerifiedAgentToken(db, env, {
         token,
+        etoroApiKey: credentials.etoroApiKey,
+        etoroUserKey: credentials.etoroUserKey,
         portfolioId: agentPortfolioId,
         portfolioName: body.agentPortfolioName || remote.name,
         mirrorId: remote.mirrorId,
         virtualBalanceUsd: remote.virtualBalanceUsd,
         verifiedAt: Date.now(),
+        expectedVaultRevision: resolvedBeforeRemote.vaultRevision,
         currentConfig: {
           ...currentConfig,
           lastManagedCapitalUsd: realPortfolio.equityUsd,
