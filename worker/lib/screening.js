@@ -103,7 +103,24 @@ export function buildShortlist({ universe, candles, heldSymbols, config, profile
       benchmarkReturns,
       heldReturns: heldSymbols.has(symbol) ? [] : heldReturns,
     });
-    if (!result) { skipped.push({ symbol, reason: 'storico insufficiente' }); continue; }
+    if (!result) {
+      if (heldSymbols.has(symbol)) {
+        // Una posizione esistente deve restare sempre visibile al modello,
+        // anche se lo storico manca: altrimenti non potrebbe né mantenerla né
+        // proporne l'uscita e verrebbe conteggiata erroneamente come cassa.
+        scored.push({
+          symbol, ...meta, score: -100, parts: {}, held: true, insufficientHistory: true,
+          metrics: {
+            momentum: null, vol30: null, drawdown3m: null, relativeStrength: null,
+            vsSma50: null, vsSma200: null, rsi14: null, avgCorrelation: null,
+            ret1m: null, ret3m: null, ret12m: null, price: null,
+          },
+        });
+      } else {
+        skipped.push({ symbol, reason: 'storico insufficiente' });
+      }
+      continue;
+    }
     scored.push({ symbol, ...meta, ...result, held: heldSymbols.has(symbol) });
   }
 
@@ -135,11 +152,13 @@ export function buildShortlist({ universe, candles, heldSymbols, config, profile
 
 /** Riga compatta per il prompt: una per strumento, larghezza fissa. */
 export function renderShortlistPrompt(shortlist) {
-  const lines = ['CANDIDATI   score  peso%  1m%    3m%    12m%   vol30  RSI  vsSMA200  mom    corr  stato'];
+  const lines = ['CANDIDATI   classe     max% score  peso%  1m%    3m%    12m%   vol30  RSI  vsSMA200  mom    corr  stato'];
   for (const item of shortlist) {
     const cell = (value, width) => `${value == null ? 'n/d' : value}`.padEnd(width);
     lines.push([
       item.symbol.padEnd(11),
+      String(item.class ?? 'n/d').padEnd(10),
+      cell(item.maxWeight == null ? 'n/d' : (item.maxWeight * 100).toFixed(0), 5),
       cell(item.score, 6),
       cell(((item.weight ?? 0) * 100).toFixed(1), 6),
       cell(item.metrics.ret1m, 6),

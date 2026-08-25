@@ -34,33 +34,45 @@ const asRecord = (value) => (value && typeof value === 'object' && !Array.isArra
 
 const recordList = (value) => (Array.isArray(value) ? value.filter((item) => item && typeof item === 'object') : []);
 
+const UUID_PATTERN = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
+const TOKEN_SECRET_KEYS = ['userToken', 'UserToken', 'userTokenValue', 'UserTokenValue'];
+
+/** Riconosce gli identificativi UUID che eToro usa per portfolio, token e client. */
+export function isUuidIdentifier(value) {
+  return typeof value === 'string' && UUID_PATTERN.test(value.trim());
+}
+
 /**
- * Cerca il segreto del token ovunque nella risposta.
- * eToro annida il valore in modo diverso a seconda dell'endpoint e della
- * versione: una lista fissa di chiavi non regge, serve una visita ricorsiva.
+ * Estrae esclusivamente il segreto esplicito restituito dalla POST eToro.
+ *
+ * La risposta ufficiale mette `userTokenId` prima di `userToken`: un parser
+ * euristico basato sulla parola "token" finirebbe quindi per salvare l'UUID e
+ * causare un 401. I campi metadata (`*Id`, `*Name`, `clientId`) e i generici
+ * `token`/`value` non sono mai accettati. Un UUID non è considerato un segreto
+ * neppure se arriva per errore sotto una chiave esplicita.
  */
-function deepFindToken(value, exclude = '', depth = 0) {
+export function extractAgentTokenSecret(value, depth = 0) {
   if (depth > 6 || value == null) return null;
   if (Array.isArray(value)) {
     for (const item of value) {
-      const found = deepFindToken(item, exclude, depth + 1);
+      const found = extractAgentTokenSecret(item, depth + 1);
       if (found) return found;
     }
     return null;
   }
   if (typeof value !== 'object') return null;
 
-  const looksLikeSecret = (key, text) => /token|secret|value|key/i.test(key)
-    && typeof text === 'string'
-    && text.trim().length >= 20
-    && text.trim() !== exclude
-    && !/^https?:/i.test(text);
-
-  for (const [key, item] of Object.entries(value)) {
-    if (looksLikeSecret(key, item)) return item.trim();
+  for (const key of TOKEN_SECRET_KEYS) {
+    const candidate = value[key];
+    if (typeof candidate !== 'string') continue;
+    const text = candidate.trim();
+    if (text.length >= 20 && !isUuidIdentifier(text) && !/^https?:/i.test(text)) return text;
   }
+
+  // Sono ammessi wrapper/array arbitrari, ma solo una chiave esplicita può
+  // produrre il risultato: attraversare i metadata non li rende candidati.
   for (const item of Object.values(value)) {
-    const found = deepFindToken(item, exclude, depth + 1);
+    const found = extractAgentTokenSecret(item, depth + 1);
     if (found) return found;
   }
   return null;
@@ -114,11 +126,17 @@ export class EtoroClient {
       if (!response.ok) {
         const record = asRecord(parsed);
         const nested = asRecord(pick(record, 'error', 'Error', 'data', 'Data'));
-        const message = pick(record, 'message', 'Message', 'detail', 'Detail', 'title', 'Title')
-          ?? pick(nested, 'message', 'Message', 'detail', 'Detail')
+        const message = pick(record, 'errorMessage', 'ErrorMessage', 'message', 'Message', 'detail', 'Detail', 'title', 'Title')
+          ?? pick(nested, 'errorMessage', 'ErrorMessage', 'message', 'Message', 'detail', 'Detail')
           ?? pick(record, 'error', 'Error');
+        const code = pick(record, 'errorCode', 'ErrorCode', 'code', 'Code')
+          ?? pick(nested, 'errorCode', 'ErrorCode', 'code', 'Code');
         const details = pick(record, 'errors', 'Errors', 'validationErrors', 'ValidationErrors');
-        const label = typeof message === 'string' && message ? message : `HTTP ${response.status}`;
+        const messageText = typeof message === 'string' ? message.trim() : '';
+        const codeText = typeof code === 'string' || typeof code === 'number' ? String(code).trim() : '';
+        const label = codeText && messageText && codeText.toLowerCase() !== messageText.toLowerCase()
+          ? `${codeText}: ${messageText}`
+          : messageText || codeText || `HTTP ${response.status}`;
         const extra = details ? ` — ${JSON.stringify(details).slice(0, 300)}` : (typeof message === 'object' ? ` — ${JSON.stringify(message).slice(0, 300)}` : '');
         throw new EtoroError(`${label}${extra}`, response.status, parsed);
       }
@@ -464,15 +482,8 @@ export class EtoroClient {
       method: 'POST',
       body: { userTokenName, scopeNames: EtoroClient.AGENT_SCOPES },
     });
-    const token = deepFindToken(data, userTokenName);
+    const token = extractAgentTokenSecret(data);
     if (token) return { token, name: userTokenName };
-    // Alcune installazioni non restituiscono il segreto nella POST: si rilegge
-    // il token appena creato dall'elenco dedicato.
-    try {
-      const listed = await this.request('v2', `agent-portfolios/${encodeURIComponent(agentPortfolioId)}/user-tokens`);
-      const fromList = deepFindToken(listed, userTokenName);
-      if (fromList) return { token: fromList, name: userTokenName };
-    } catch { /* endpoint non disponibile: si segnala il problema originale */ }
     throw new EtoroError(
       `eToro ha creato il token ma non ne ha restituito il segreto. Struttura ricevuta: ${describeShape(data)}`,
       502,

@@ -11,7 +11,10 @@
  * ottiene nulla di utile.
  */
 
+import { CONFIG_KEY } from './db.js';
+
 const VAULT_ROW = 'vault';
+const AGENT_BINDING_ROW = '__etoroAgentBinding';
 
 /** Campi ammessi nel vault. L'ordine è quello mostrato in dashboard. */
 export const CREDENTIAL_FIELDS = [
@@ -59,6 +62,14 @@ async function open(env, blob) {
   return JSON.parse(new TextDecoder().decode(plain));
 }
 
+/** Impronta non reversibile usata per legare il segreto al portfolio verificato. */
+export async function credentialFingerprint(value) {
+  const text = String(value ?? '');
+  if (!text) return '';
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`torino-agent-token:v1:${text}`)));
+  return [...digest].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
 async function readVault(db, env) {
   const row = await db.prepare('SELECT value FROM config WHERE key = ?').bind(VAULT_ROW).first();
   if (!row?.value) return {};
@@ -84,10 +95,60 @@ export async function saveCredentials(db, env, patch) {
     if (text) current[key] = text.slice(0, 4000); else delete current[key];
     applied.push(key);
   }
+  // Un token incollato manualmente non eredita mai la verifica del segreto
+  // precedente. La relazione portfolio↔token viene ricreata solo dal flusso
+  // ufficiale di generazione e collaudo.
+  if (Object.prototype.hasOwnProperty.call(patch ?? {}, 'etoroAgentToken')) {
+    delete current[AGENT_BINDING_ROW];
+  }
   await db.prepare('INSERT INTO config (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at')
     .bind(VAULT_ROW, await seal(env, current), Date.now())
     .run();
   return { applied, rejected };
+}
+
+/**
+ * Salva segreto, binding verificato e vista Autopilot in una singola transazione
+ * D1. Due generazioni concorrenti possono sovrascriversi, ma la tupla finale
+ * resta sempre internamente coerente e riconoscibile dalla fingerprint.
+ */
+export async function saveVerifiedAgentToken(db, env, {
+  token, portfolioId, portfolioName = '', verifiedAt = Date.now(), currentConfig,
+}) {
+  const cleanToken = String(token ?? '').trim();
+  const cleanPortfolioId = String(portfolioId ?? '').trim();
+  if (!cleanToken || !cleanPortfolioId) throw new Error('token e portfolioId sono obbligatori');
+  if (!db?.batch) throw new Error('D1 batch non disponibile: binding Agent non salvato');
+
+  const fingerprint = await credentialFingerprint(cleanToken);
+  const binding = {
+    version: 1,
+    portfolioId: cleanPortfolioId,
+    portfolioName: String(portfolioName ?? '').slice(0, 120),
+    fingerprint,
+    verifiedAt: Number(verifiedAt) || Date.now(),
+  };
+  const vault = await readVault(db, env);
+  vault.etoroAgentToken = cleanToken.slice(0, 4000);
+  vault[AGENT_BINDING_ROW] = binding;
+
+  const nextConfig = {
+    ...(currentConfig ?? {}),
+    activeAgentPortfolioId: binding.portfolioId,
+    activeAgentPortfolioName: binding.portfolioName,
+    agentTokenVerifiedAt: binding.verifiedAt,
+    agentTokenHint: `••••${cleanToken.slice(-4)}`,
+    agentTokenFingerprint: fingerprint,
+    agentTokenOrigin: 'vault',
+  };
+  const now = Date.now();
+  await db.batch([
+    db.prepare('INSERT INTO config (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at')
+      .bind(VAULT_ROW, await seal(env, vault), now),
+    db.prepare('INSERT INTO config (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at')
+      .bind(CONFIG_KEY, JSON.stringify(nextConfig), now),
+  ]);
+  return { config: nextConfig, binding };
 }
 
 export async function clearCredentials(db) {
@@ -109,7 +170,35 @@ export async function resolveCredentials(db, env) {
     else if (fromEnv) { values[field.key] = fromEnv; origin[field.key] = 'env'; }
     else { values[field.key] = ''; origin[field.key] = null; }
   }
-  return { values, origin };
+  const rawBinding = vault[AGENT_BINDING_ROW];
+  let agentBinding = null;
+  if (origin.etoroAgentToken === 'vault' && values.etoroAgentToken && rawBinding?.version === 1) {
+    const fingerprint = await credentialFingerprint(values.etoroAgentToken);
+    if (fingerprint && fingerprint === rawBinding.fingerprint) {
+      agentBinding = {
+        version: 1,
+        portfolioId: String(rawBinding.portfolioId ?? ''),
+        portfolioName: String(rawBinding.portfolioName ?? ''),
+        fingerprint,
+        verifiedAt: Number(rawBinding.verifiedAt) || 0,
+      };
+    }
+  }
+  return { values, origin, agentBinding };
+}
+
+/** Unico gate condiviso da API e pipeline per autorizzare l'uso del token. */
+export function hasVerifiedAgentBinding(resolved, config) {
+  const binding = resolved?.agentBinding;
+  return Boolean(
+    resolved?.values?.etoroAgentToken
+    && resolved?.origin?.etoroAgentToken === 'vault'
+    && binding?.portfolioId
+    && binding.portfolioId === config?.activeAgentPortfolioId
+    && binding.fingerprint === config?.agentTokenFingerprint
+    && binding.verifiedAt > 0
+    && binding.verifiedAt === Number(config?.agentTokenVerifiedAt),
+  );
 }
 
 const mask = (value) => (value ? `••••${value.slice(-4)}` : '');

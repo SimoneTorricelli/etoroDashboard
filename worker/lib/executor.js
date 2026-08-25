@@ -45,6 +45,15 @@ async function checkEligibility(client, orders, config) {
 export async function executePlan({ db, client, runId, plan, mode, config }) {
   const results = [];
 
+  // Fail closed: solo il valore esatto "live" può raggiungere gli endpoint
+  // di trading. Configurazioni corrotte, spazi o maiuscole non vengono
+  // reinterpretati e non fanno nemmeno il pre-check di rete.
+  if (!['shadow', 'dry-run', 'live'].includes(mode)) {
+    const message = `modalità di esecuzione non valida: ${String(mode)}`;
+    if (db) await audit(db, runId, 'error', 'executor', message);
+    return { mode, executed: false, results, eligibility: null, blocked: true, error: message };
+  }
+
   if (mode === 'shadow') {
     for (const order of plan.orders) {
       const id = await deterministicId(runId, order.seq, order.symbol, order.side);
@@ -146,20 +155,28 @@ async function verifyOrders({ db, client, results }) {
  * Rilegge il portafoglio reale e confronta i pesi con i target attesi.
  * Una divergenza oltre soglia è un segnale di esecuzione non allineata.
  */
-export async function reconcile({ client, plan, config }) {
-  const snapshot = await client.portfolio();
+export async function reconcile({ client, plan, config, portfolioUserKey }) {
+  const snapshot = await client.portfolio(portfolioUserKey);
   const equity = snapshot.equityUsd || 1;
+  const plannedEquity = plan.equityUsd || equity;
   const byInstrument = new Map();
   for (const position of snapshot.positions) {
     byInstrument.set(position.instrumentId, (byInstrument.get(position.instrumentId) ?? 0) + position.valueUsd);
   }
   const rows = plan.deltas.map((delta) => {
     const actualWeight = round((byInstrument.get(delta.instrumentId) ?? 0) / equity, 4);
+    // Il piano può essere ridotto da turnover, liquidità, taglio massimo e
+    // numero ordini. La riconciliazione deve quindi confrontare il portafoglio
+    // con ciò che è stato davvero ordinato, non con il target teorico dell'AI.
+    const orderedDeltaUsd = plan.orders
+      .filter((order) => order.instrumentId === delta.instrumentId)
+      .reduce((sum, order) => sum + (order.side === 'buy' ? order.amountUsd : -order.amountUsd), 0);
+    const expectedWeight = round(Math.max(0, delta.currentWeight + orderedDeltaUsd / plannedEquity), 4);
     return {
       symbol: delta.symbol,
-      expectedWeight: delta.skipped ? delta.currentWeight : delta.targetWeight,
+      expectedWeight,
       actualWeight,
-      divergence: round(Math.abs(actualWeight - (delta.skipped ? delta.currentWeight : delta.targetWeight)), 4),
+      divergence: round(Math.abs(actualWeight - expectedWeight), 4),
     };
   });
   const worst = rows.reduce((max, row) => Math.max(max, row.divergence), 0);

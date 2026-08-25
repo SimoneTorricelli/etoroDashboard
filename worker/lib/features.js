@@ -245,7 +245,7 @@ export function buildFeatures({ snapshot, universe, candles, external, config, e
  * Serializza le feature nel prompt più compatto possibile: tabella a larghezza
  * fissa invece di JSON, così il modello riceve ~5x meno token.
  */
-export function renderFeaturesPrompt(features, config) {
+export function renderFeaturesPrompt(features, config, { includeInstruments = true } = {}) {
   const lines = [];
   const p = features.portfolio;
   lines.push(`PORTAFOGLIO (USD) equity=${p.equityUsd} cash=${p.cashUsd} (${(features.allocationByClass.cash * 100).toFixed(1)}%) investito=${p.investedUsd} pnl_aperto=${p.unrealizedPnlUsd} posizioni=${p.openPositions}`);
@@ -260,25 +260,27 @@ export function renderFeaturesPrompt(features, config) {
     lines.push(`CRYPTO mcap24h=${g.marketCapChange24hPct}% btc_dom=${g.btcDominancePct}% fear_greed=${fg?.value ?? 'n/d'} (${fg?.label ?? 'n/d'})`);
   }
 
-  lines.push('');
-  lines.push('STRUMENTI  peso%  max%  1m%    3m%    12m%   vol30  RSI  vsSMA50  vsSMA200  mom   corrSPY  pnl%');
-  for (const item of features.instruments) {
-    const cell = (value, width, suffix = '') => `${value == null ? 'n/d' : value}${suffix}`.padEnd(width);
-    lines.push([
-      item.symbol.padEnd(10),
-      cell((item.weight * 100).toFixed(1), 6),
-      cell((item.maxWeight * 100).toFixed(0), 5),
-      cell(item.ret1m, 6),
-      cell(item.ret3m, 6),
-      cell(item.ret12m, 6),
-      cell(item.vol30, 6),
-      cell(item.rsi14, 4),
-      cell(item.vsSma50, 8),
-      cell(item.vsSma200, 9),
-      cell(item.momentum, 5),
-      cell(item.corrSpy, 8),
-      cell(item.pnlPct, 6),
-    ].join(' '));
+  if (includeInstruments) {
+    lines.push('');
+    lines.push('STRUMENTI  peso%  max%  1m%    3m%    12m%   vol30  RSI  vsSMA50  vsSMA200  mom   corrSPY  pnl%');
+    for (const item of features.instruments) {
+      const cell = (value, width, suffix = '') => `${value == null ? 'n/d' : value}${suffix}`.padEnd(width);
+      lines.push([
+        item.symbol.padEnd(10),
+        cell((item.weight * 100).toFixed(1), 6),
+        cell((item.maxWeight * 100).toFixed(0), 5),
+        cell(item.ret1m, 6),
+        cell(item.ret3m, 6),
+        cell(item.ret12m, 6),
+        cell(item.vol30, 6),
+        cell(item.rsi14, 4),
+        cell(item.vsSma50, 8),
+        cell(item.vsSma200, 9),
+        cell(item.momentum, 5),
+        cell(item.corrSpy, 8),
+        cell(item.pnlPct, 6),
+      ].join(' '));
+    }
   }
 
   if (features.news.top.length) {

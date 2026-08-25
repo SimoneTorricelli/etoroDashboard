@@ -14,10 +14,10 @@ const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
  * Il prefisso `@cf/` è la convenzione dei modelli ospitati da Cloudflare.
  */
 export const WORKERS_AI_MODELS = [
+  '@cf/openai/gpt-oss-120b',
+  '@cf/nvidia/nemotron-3-120b-a12b',
+  '@cf/qwen/qwen3-30b-a3b-fp8',
   '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
-  '@cf/qwen/qwen2.5-coder-32b-instruct',
-  '@cf/mistralai/mistral-small-3.1-24b-instruct',
-  '@cf/meta/llama-3.1-8b-instruct-fast',
 ];
 
 export const PROVIDERS = {
@@ -40,7 +40,7 @@ export const PROVIDERS = {
     label: 'Google Gemini',
     note: 'Free tier generoso e stabile. Chiave gratuita da aistudio.google.com.',
     needsKey: 'geminiApiKey',
-    defaultModels: ['gemini-2.0-flash', 'gemini-2.0-flash-lite'],
+    defaultModels: ['gemini-3.7-flash', 'gemini-3.6-flash'],
   },
   groq: {
     id: 'groq',

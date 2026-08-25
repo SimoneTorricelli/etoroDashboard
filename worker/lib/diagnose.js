@@ -4,10 +4,11 @@
  * Ogni controllo è isolato e restituisce un esito leggibile: serve a capire
  * *quale* credenziale è sbagliata invece di vedere un generico HTTP 401.
  */
-import { EtoroClient } from './etoro.js';
+import { EtoroClient, isUuidIdentifier } from './etoro.js';
 import { probeModels } from './brain.js';
 import { checkTelegram } from './notify.js';
 import { collectExternalContext } from './sources.js';
+import { hasVerifiedAgentBinding } from './vault.js';
 
 function ok(id, label, detail, extra = {}) {
   return { id, label, ok: true, detail, ...extra };
@@ -24,6 +25,14 @@ function etoroHint(status) {
   if (status === 403) return 'Chiavi valide ma senza i permessi richiesti: verifica gli scope dell’applicazione su eToro.';
   if (status === 429) return 'Troppe richieste: attendi qualche minuto e riprova.';
   return undefined;
+}
+
+/** Messaggio sicuro e specifico per un token Agent rifiutato con HTTP 401. */
+export function agentToken401Hint(token) {
+  if (isUuidIdentifier(token)) {
+    return 'Il valore salvato è un UUID: sembra l’ID del portfolio o del token, non il segreto userToken. Genera un nuovo token e salva il segreto restituito da eToro, non un campo che termina in Id.';
+  }
+  return 'eToro ha rifiutato il segreto: può essere revocato, scaduto, associato a un’altra API key o limitato da una whitelist IP. Rigeneralo per questo portfolio usando la stessa API key configurata nell’Autopilot.';
 }
 
 /**
@@ -69,9 +78,15 @@ export async function runDiagnostics(resolved, config, env = {}) {
     } catch (error) {
       checks.push(ko('etoro.agent', 'eToro — token Agent Portfolio', error.message,
         error.status === 401
-          ? 'Token non valido o revocato. Rigeneralo dalla sezione Agent (Genera token) e reincollalo qui.'
+          ? agentToken401Hint(credentials.etoroAgentToken)
           : etoroHint(error.status)));
     }
+  }
+  if (credentials.etoroAgentToken) {
+    checks.push(hasVerifiedAgentBinding(resolved, config)
+      ? ok('etoro.binding', 'eToro — binding Agent Portfolio', `verificato per ${config.activeAgentPortfolioName || config.activeAgentPortfolioId}`)
+      : ko('etoro.binding', 'eToro — binding Agent Portfolio', 'Il token presente non coincide con il binding verificato.',
+          'Rigenera il token dalla selezione Agent Portfolio: incollare un token o usare un Worker Secret non eredita la verifica precedente.'));
   }
 
   // --- Elenco degli Agent Portfolio disponibili ---------------------------

@@ -9,7 +9,7 @@ import { motion } from 'framer-motion';
 import { toast, Toaster } from 'sonner';
 import {
   Activity, ArrowRight, Bot, Circle, CircleCheck, Clock, Eye, FlaskConical,
-  Lock, RefreshCw, ShieldAlert, Snowflake, Radio, Unlock, XCircle,
+  Lock, RefreshCw, ShieldAlert, Snowflake, Radio, Unlock, X, XCircle,
 } from 'lucide-react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -29,10 +29,17 @@ import { GuardrailsEditor } from '@/components/autopilot/GuardrailsEditor';
 import { ProfileSelector } from '@/components/autopilot/ProfileSelector';
 import { WatcherPanel } from '@/components/autopilot/WatcherPanel';
 import { CredentialsSection } from '@/components/autopilot/CredentialsSection';
+import {
+  StrategyOnboarding, createStrategyOnboardingPreview,
+  DEFAULT_STRATEGY_ONBOARDING_ANSWERS,
+  type StrategyOnboardingAnswers, type StrategyOnboardingDraft,
+  type StrategyOnboardingPortfolio,
+} from '@/components/autopilot/StrategyOnboarding';
 import { cn } from '@/lib/utils';
 import {
   autopilot, getBaseUrl, getControlToken, isTokenRemembered, setBaseUrl, setControlToken,
   type AutopilotState, type ExecutionMode, type RunBundle, type RunSummary,
+  type GuidedStrategyBundle,
 } from '@/lib/agent/autopilot-api';
 
 const stagger = (i: number) => ({
@@ -81,6 +88,12 @@ export default function Autopilot() {
   const [remember, setRemember] = useState(isTokenRemembered());
   const [connected, setConnected] = useState(true);
   const [storageWarning, setStorageWarning] = useState(false);
+  const onboardingQuery = typeof window !== 'undefined'
+    ? new URLSearchParams(window.location.search).get('onboarding')
+    : null;
+  const [onboardingOpen, setOnboardingOpen] = useState(Boolean(onboardingQuery));
+  const [onboardingPortfolios, setOnboardingPortfolios] = useState<StrategyOnboardingPortfolio[] | undefined>();
+  const [strategyBundle, setStrategyBundle] = useState<GuidedStrategyBundle<StrategyOnboardingDraft> | null>(null);
 
   const refresh = useCallback(async () => {
     if (!getControlToken()) {
@@ -111,6 +124,32 @@ export default function Autopilot() {
 
   useEffect(() => { void refresh(); }, [refresh]);
 
+  useEffect(() => {
+    if (state?.config && !state.config.onboardingComplete && getControlToken()) setOnboardingOpen(true);
+  }, [state]);
+
+  useEffect(() => {
+    if (!onboardingOpen || !getControlToken()) return;
+    let cancelled = false;
+    void autopilot.agentPortfolios()
+      .then(({ portfolios }) => {
+        if (cancelled) return;
+        const activeId = state?.config.activeAgentPortfolioId;
+        const verified = Boolean(state?.agentBindingVerified);
+        setOnboardingPortfolios(portfolios.map((portfolio) => ({
+          id: portfolio.id,
+          name: portfolio.name,
+          subtitle: portfolio.id === activeId && verified ? 'Agent Portfolio verificato' : 'Agent Portfolio esistente',
+          balanceEur: portfolio.virtualBalanceUsd,
+          status: portfolio.id === activeId && verified ? 'connected' : 'needs-token',
+        })));
+      })
+      .catch(() => {
+        if (!cancelled) setOnboardingPortfolios(undefined);
+      });
+    return () => { cancelled = true; };
+  }, [onboardingOpen, state?.config.activeAgentPortfolioId, state?.agentBindingVerified]);
+
   const guarded = async (label: string, task: () => Promise<unknown>) => {
     setLoading(true);
     try {
@@ -131,6 +170,44 @@ export default function Autopilot() {
     try { setDetail(await autopilot.run(id)); } catch (caught) { toast.error(caught instanceof Error ? caught.message : String(caught)); }
   };
 
+  const generateGuidedStrategy = async (answers: StrategyOnboardingAnswers): Promise<StrategyOnboardingDraft> => {
+    if (!getControlToken()) {
+      toast.info('Anteprima locale pronta. Collega il Worker prima di attivarla.');
+      return createStrategyOnboardingPreview(answers);
+    }
+    const bundle = await autopilot.strategyDraft<StrategyOnboardingDraft>(answers as unknown as Record<string, unknown>);
+    setStrategyBundle(bundle);
+    if (bundle.generation.source === 'ai') toast.success(`Strategia generata da ${bundle.generation.model}`);
+    else toast.info('Strategia sicura generata deterministicamente: i provider AI non erano disponibili.');
+    return bundle.draft;
+  };
+
+  const activateGuidedStrategy = async (draft: StrategyOnboardingDraft, answers: StrategyOnboardingAnswers) => {
+    if (!getControlToken()) throw new Error('Collega prima il Worker con il CONTROL_TOKEN. La bozza locale non è stata attivata.');
+    const selected = onboardingPortfolios?.find((portfolio) => portfolio.id === answers.portfolioId);
+    const isVerified = selected?.status === 'connected'
+      || (state?.config.activeAgentPortfolioId === answers.portfolioId && Boolean(state.agentBindingVerified));
+    if (!isVerified) {
+      const generated = await autopilot.generateAgentToken(answers.portfolioId, selected?.name);
+      toast.success(`Token ${generated.hint} verificato sul portfolio selezionato.`);
+    }
+    let bundle = strategyBundle;
+    const effectiveAnswers = answers;
+    if (!bundle) {
+      bundle = await autopilot.strategyDraft<StrategyOnboardingDraft>(effectiveAnswers as unknown as Record<string, unknown>);
+      setStrategyBundle(bundle);
+    }
+    await autopilot.activateStrategy<StrategyOnboardingDraft>({
+      answers: effectiveAnswers as unknown as Record<string, unknown>,
+      strategySpec: bundle.strategySpec,
+      portfolioId: answers.portfolioId,
+      generatedBy: bundle.generation.model ?? bundle.generation.source,
+      reviewMaxDrawdownPct: draft.riskRangePct,
+    });
+    await refresh();
+    toast.success(`“${draft.strategyName}” è attiva in shadow. Nessun ordine reale verrà inviato.`);
+  };
+
   const config = state?.config;
   const mode = config?.executionMode ?? 'shadow';
   const frozen = Boolean(config?.frozen);
@@ -144,6 +221,33 @@ export default function Autopilot() {
     { done: state?.notificationsActive ?? false, label: 'Collega Telegram (facoltativo ma consigliato)' },
     { done: hasRun, label: 'Lancia la prima run in shadow' },
   ];
+
+  if (onboardingOpen) {
+    const showReview = onboardingQuery === 'review';
+    const previewAnswers = DEFAULT_STRATEGY_ONBOARDING_ANSWERS;
+    return (
+      <div className="fixed inset-y-0 right-0 z-50 overflow-y-auto bg-[#faf9f5] md:left-16 xl:left-[232px]">
+        <Toaster position="top-right" richColors />
+        <button
+          type="button"
+          onClick={() => setOnboardingOpen(false)}
+          className="fixed right-4 top-3 z-[60] grid size-9 place-items-center rounded-full border border-[#233a2c1f] bg-white/90 text-[#56645c] shadow-sm backdrop-blur transition-colors hover:text-[#0d5434] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0d5434]"
+          aria-label="Chiudi onboarding e torna ad Autopilot"
+          title="Torna ad Autopilot"
+        >
+          <X className="size-4" />
+        </button>
+        <StrategyOnboarding
+          portfolios={onboardingPortfolios}
+          initialAnswers={previewAnswers}
+          initialStep={showReview ? 'review' : 'goals'}
+          initialDraft={showReview ? createStrategyOnboardingPreview(previewAnswers) : null}
+          onGenerate={generateGuidedStrategy}
+          onActivate={activateGuidedStrategy}
+        />
+      </div>
+    );
+  }
 
   return (
     <div className="grid grid-cols-12 gap-4">
@@ -162,6 +266,9 @@ export default function Autopilot() {
         </div>
         <Button variant="outline" size="sm" onClick={() => void refresh()} disabled={loading}>
           <RefreshCw className={cn('size-4', loading && 'animate-spin')} /> Aggiorna
+        </Button>
+        <Button size="sm" onClick={() => setOnboardingOpen(true)}>
+          <Bot className="size-4" /> Nuova strategia guidata
         </Button>
       </motion.div>
 

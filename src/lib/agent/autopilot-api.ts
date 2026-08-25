@@ -48,6 +48,20 @@ export interface WatcherEvent {
 export interface AutopilotConfig {
   executionMode: ExecutionMode;
   strategyProfile: string;
+  strategySpecVersion?: number;
+  strategySpec?: Record<string, unknown> | null;
+  onboardingAnswers?: Record<string, unknown> | null;
+  onboardingComplete?: boolean;
+  strategyName?: string;
+  strategyGeneratedBy?: string;
+  strategyScenario?: Record<string, unknown> | null;
+  policyUniverse?: Record<string, unknown> | null;
+  shadowStartedAt?: number;
+  shadowDays?: number;
+  activeAgentPortfolioId?: string;
+  activeAgentPortfolioName?: string;
+  agentTokenVerifiedAt?: number;
+  agentTokenHint?: string;
   universeMode: 'fixed' | 'dynamic';
   shortlistSize: number;
   maxHoldings: number;
@@ -81,12 +95,14 @@ export interface AutopilotConfig {
   maxOrdersPerDay: number;
   minOrderUsd: number;
   maxOrderUsd: number;
+  maxOrderPctOfCapital?: number;
   maxTurnoverPct: number;
   minRebalanceBandAbs: number;
   minRebalanceBandRel: number;
   maxWeightPerClass: Record<string, number>;
   minCashPct: number;
   maxCashPct: number;
+  targetDeploymentPct?: number;
   drawdownStopPct: number;
   reconcileTolerancePct: number;
   minConfidence: number;
@@ -150,6 +166,7 @@ export interface AutopilotState {
   highWaterMarkUsd: number;
   drawdownPct: number;
   credentials: CredentialStatus[];
+  agentBindingVerified: boolean;
   notificationsActive: boolean;
 }
 
@@ -212,6 +229,18 @@ export interface DiagnosticsReport {
   readyForShadow: boolean;
   readyForLive: boolean;
   checks: DiagnosticCheck[];
+}
+
+export interface GuidedStrategyBundle<TDraft = Record<string, unknown>> {
+  draft: TDraft;
+  strategySpec: Record<string, unknown>;
+  onboardingAnswers: Record<string, unknown>;
+  scenario: Record<string, unknown>;
+  generation: {
+    source: 'ai' | 'deterministic';
+    model: string | null;
+    attempts: Array<{ provider: string; model: string; ok: boolean; error?: string }>;
+  };
 }
 
 /**
@@ -339,9 +368,31 @@ export const autopilot = {
   setProfile: (profile: string) =>
     call<{ config: AutopilotConfig }>('/agent/profile', { method: 'POST', body: JSON.stringify({ profile }) }),
   watcherEvents: (limit = 50) => call<{ events: WatcherEvent[] }>(`/agent/watcher?limit=${limit}`),
-  generateAgentToken: (agentPortfolioId: string) =>
-    call<{ ok: true; tokenName: string; hint: string; credentials: CredentialStatus[] }>('/agent/agent-token', {
+  strategyDraft: <TDraft = Record<string, unknown>>(answers: Record<string, unknown>) =>
+    call<GuidedStrategyBundle<TDraft>>('/agent/strategy/draft', {
       method: 'POST',
-      body: JSON.stringify({ agentPortfolioId }),
+      body: JSON.stringify({ answers }),
+    }),
+  activateStrategy: <TDraft = Record<string, unknown>>(payload: {
+    answers: Record<string, unknown>;
+    strategySpec: Record<string, unknown>;
+    portfolioId: string;
+    generatedBy?: string;
+    reviewMaxDrawdownPct?: number;
+  }) => call<{ ok: true; config: AutopilotConfig; strategySpec: Record<string, unknown>; scenario: Record<string, unknown>; draft: TDraft }>('/agent/strategy/activate', {
+    method: 'POST',
+      body: JSON.stringify(payload),
+  }),
+  generateAgentToken: (agentPortfolioId: string, agentPortfolioName?: string) =>
+    call<{
+      ok: true;
+      tokenName: string;
+      hint: string;
+      verified: true;
+      portfolio: { id: string; name: string; equityUsd: number; positions: number };
+      credentials: CredentialStatus[];
+    }>('/agent/agent-token', {
+      method: 'POST',
+      body: JSON.stringify({ agentPortfolioId, agentPortfolioName }),
     }),
 };

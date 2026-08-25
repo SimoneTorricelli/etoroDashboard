@@ -38,8 +38,8 @@ export function AgentTokenGenerator({ onGenerated }: Props) {
   const generate = async (portfolio: AgentPortfolioSummary) => {
     setBusy(portfolio.id);
     try {
-      const result = await autopilot.generateAgentToken(portfolio.id);
-      toast.success(`Token generato e salvato nel vault (${result.hint})`);
+      const result = await autopilot.generateAgentToken(portfolio.id, portfolio.name);
+      toast.success(`Token ${result.hint} verificato sul portfolio e salvato nel vault.`);
       await onGenerated();
     } catch (error) {
       toast.error(error instanceof Error ? error.message : String(error));
@@ -56,8 +56,8 @@ export function AgentTokenGenerator({ onGenerated }: Props) {
             <KeyRound className="size-4 text-agent" /> Hai perso il token?
           </p>
           <p className="text-xs leading-relaxed text-text-1">
-            Non è un problema: il token si rigenera quante volte vuoi. Il Worker ne crea uno nuovo e lo salva direttamente nel vault,
-            senza mostrartelo. Il precedente resta valido finché non lo revochi da eToro.
+            Il Worker crea un nuovo segreto, prova subito a leggere il portfolio selezionato e lo salva nel vault solo se la verifica riesce.
+            Il precedente non viene sovrascritto in caso di errore; puoi revocare da eToro quelli che non usi più.
           </p>
         </div>
         <Button variant="outline" size="sm" onClick={() => void load()} disabled={loading}>

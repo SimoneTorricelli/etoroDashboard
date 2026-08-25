@@ -14,6 +14,7 @@ import { PROFILES, applyProfile, describeProfile, listProfiles } from './lib/pro
 import { checkChurnRules, filterMarginalSubstitutions, isWorthTheCost } from './lib/churn.js';
 import { buildShortlist, scoreInstrument } from './lib/screening.js';
 import { decideWatcherAction, detectAnomalies, isStabilized, relevantHeadlines } from './lib/watcher.js';
+import { executePlan, reconcile } from './lib/executor.js';
 
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -149,7 +150,7 @@ test('guardrail: gli acquisti non intaccano la riserva di cassa', () => {
 test('nessuna azione quando i pesi sono già a target e rispettano i cap', () => {
   // I cap vengono allargati apposta: il portafoglio sintetico è sovrappesato su
   // BTC e SPY, e con i cap di default il validator dovrebbe (giustamente) agire.
-  const permissive = { ...config, whitelist: config.whitelist.map((item) => ({ ...item, maxWeight: 1 })), maxWeightPerClass: { etf: 1, bond: 1, commodity: 1, crypto: 1, cash: 1 } };
+  const permissive = { ...config, minHoldings: 1, whitelist: config.whitelist.map((item) => ({ ...item, maxWeight: 1 })), maxWeightPerClass: { etf: 1, bond: 1, commodity: 1, crypto: 1, cash: 1 } };
   const permissiveFeatures = buildFeatures({ snapshot, universe: new Map([...universe].map(([key, value]) => [key, { ...value, maxWeight: 1 }])), candles, external, config: permissive, equityHistory: [] });
   const targets = Object.fromEntries(permissiveFeatures.instruments.map((item) => [item.symbol, item.weight]));
   targets.CASH = permissiveFeatures.allocationByClass.cash;
@@ -331,6 +332,17 @@ test('watcher: tetto settimanale rispettato', () => {
   assert.match(decision.reason, /questa settimana/);
 });
 
+test('watcher: non apre una nuova posizione oltre il tetto del portafoglio', () => {
+  const decision = decideWatcherAction({
+    anomaly: { symbol: 'NVDA', class: 'stock', kind: 'crash', held: false, metrics: { stabilized: true } },
+    verdict: { classification: 'technical_overreaction', confidence: 0.85, suggestedAction: 'accumulate' },
+    config: { ...DEFAULT_CONFIG, maxHoldings: 20 }, ledger: new Map(),
+    budgetUsd: 500, opportunisticThisWeek: 0, equityUsd: 2_000, holdingCount: 20,
+  });
+  assert.equal(decision.action, 'noop');
+  assert.match(decision.reason, /massimo di 20 posizioni/);
+});
+
 test('watcher: le notizie vengono filtrate sullo strumento', () => {
   const news = { items: [
     { title: 'NVIDIA beats earnings expectations', score: 1, topic: 'markets' },
@@ -358,10 +370,58 @@ test('validator: il numero massimo di posizioni viene rispettato', () => {
   assert.ok(violations.some((item) => item.code === 'max_holdings'));
 });
 
+test('validator: il numero minimo di posizioni è un vincolo bloccante', () => {
+  const proposal = { targetWeights: { SPY: 0.8, CASH: 0.2 }, confidence: 0.9, rationale: '', risks: [], watch: [] };
+  const result = validateProposal({ proposal, features, config: { ...config, minHoldings: 4 } });
+  assert.equal(result.ok, false);
+  assert.ok(result.violations.some((item) => item.code === 'min_holdings' && item.severity === 'blocking'));
+});
+
+test('reconcile: confronta gli ordini scalati, non il target teorico', async () => {
+  const plan = {
+    equityUsd: 1_000,
+    deltas: [{
+      symbol: 'SPY', instrumentId: 1001, currentWeight: 0.2,
+      targetWeight: 0.5, skipped: null,
+    }],
+    // Il cap di turnover ha consentito solo 100 USD dei 300 USD teorici.
+    orders: [{ symbol: 'SPY', instrumentId: 1001, side: 'buy', amountUsd: 100 }],
+  };
+  const result = await reconcile({
+    client: { portfolio: async () => ({ equityUsd: 1_000, positions: [{ instrumentId: 1001, valueUsd: 300 }] }) },
+    plan,
+    config: { reconcileTolerancePct: 0.01 },
+    portfolioUserKey: 'verified-agent-portfolio',
+  });
+  assert.equal(result.rows[0].expectedWeight, 0.3);
+  assert.equal(result.rows[0].actualWeight, 0.3);
+  assert.equal(result.ok, true);
+});
+
+test('executor: qualunque modalità non esatta fallisce senza ordini', async () => {
+  for (const mode of [undefined, 'garbage', 'live ', 'LIVE']) {
+    let calls = 0;
+    const result = await executePlan({
+      db: null,
+      client: {
+        eligibility: async () => { calls += 1; return new Map(); },
+        openOrder: async () => { calls += 1; return {}; },
+      },
+      runId: 'invalid-mode',
+      plan: { orders: [{ seq: 0, symbol: 'SPY', instrumentId: 1001, side: 'buy', amountUsd: 100 }] },
+      mode,
+      config: DEFAULT_CONFIG,
+    });
+    assert.equal(calls, 0, `nessuna chiamata per mode=${String(mode)}`);
+    assert.equal(result.blocked, true);
+    assert.equal(result.executed, false);
+  }
+});
+
 let failed = 0;
 for (const [name, fn] of tests) {
   try {
-    fn();
+    await fn();
     console.log(`  ok  ${name}`);
   } catch (error) {
     failed += 1;

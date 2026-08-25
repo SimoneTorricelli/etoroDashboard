@@ -6,11 +6,19 @@
 import { runPipeline } from './pipeline.js';
 import { listFreeModels } from './brain.js';
 import { notify, notifyTest } from './notify.js';
-import { clearCredentials, describeCredentials, resolveCredentials, saveCredentials } from './vault.js';
+import {
+  clearCredentials, describeCredentials, hasVerifiedAgentBinding, resolveCredentials,
+  saveCredentials, saveVerifiedAgentToken,
+} from './vault.js';
 import { runDiagnostics } from './diagnose.js';
 import { EtoroClient } from './etoro.js';
 import { applyProfile, listProfiles } from './profiles.js';
-import { PROVIDERS } from './llm.js';
+import { PROVIDERS, buildAttemptPlan, callModel } from './llm.js';
+import {
+  buildDeterministicScenarioSummary, buildSafeStrategySpec, buildStrategyPrompt, checkStrategyFeasibility,
+  createDefaultOnboardingAnswers, normalizeAiStrategySpec, normalizeOnboardingAnswers,
+} from './strategy.js';
+import { buildPolicyUniverse } from './universe-policy.js';
 import {
   audit, equityHistory, getRunBundle, listRuns, listWatcherEvents, loadConfig,
   loadLedger, saveConfig, DEFAULT_CONFIG,
@@ -45,6 +53,7 @@ const NUMERIC_BOUNDS = {
   maxOrdersPerDay: [1, 40],
   minOrderUsd: [1, 10000],
   maxOrderUsd: [5, 100000],
+  maxOrderPctOfCapital: [0.01, 1],
   maxTurnoverPct: [0.01, 1],
   minRebalanceBandAbs: [0.001, 0.5],
   minRebalanceBandRel: [0.01, 2],
@@ -75,6 +84,7 @@ const NUMERIC_BOUNDS = {
   maxAverageDown: [0, 5],
   stabilizationBars: [0, 10],
   watcherMinConfidence: [0, 1],
+  targetDeploymentPct: [0.5, 1],
 };
 
 /** Ripulisce la patch di configurazione: chiavi ignote e valori fuori range vengono scartati. */
@@ -85,6 +95,10 @@ export function sanitizeConfigPatch(patch) {
     if (!(key in DEFAULT_CONFIG)) { rejected.push(`${key}: chiave sconosciuta`); continue; }
     if (key === 'executionMode') { rejected.push('executionMode: usa POST /agent/mode'); continue; }
     if (key === 'frozen' || key === 'frozenReason') { rejected.push(`${key}: usa /agent/freeze o /agent/unfreeze`); continue; }
+    if (['activeAgentPortfolioId', 'activeAgentPortfolioName', 'agentTokenVerifiedAt', 'agentTokenHint', 'agentTokenFingerprint', 'agentTokenOrigin'].includes(key)) {
+      rejected.push(`${key}: gestito esclusivamente dal flusso token Agent`);
+      continue;
+    }
 
     if (key in NUMERIC_BOUNDS) {
       const numeric = Number(value);
@@ -175,6 +189,210 @@ export function sanitizeConfigPatch(patch) {
   return { patch: out, rejected };
 }
 
+const GUIDED_OBJECTIVE = {
+  'balanced-growth': 'balanced-growth',
+  dividends: 'income',
+  'capital-preservation': 'capital-preservation',
+  tactical: 'tactical',
+};
+
+/** Traduce il form umano nel contratto versionato e fail-closed del motore. */
+function guidedAnswersToContract(raw) {
+  const source = raw && typeof raw === 'object' ? raw : {};
+  const macros = Array.isArray(source.macroPreferences) ? source.macroPreferences.map(String) : [];
+  const objective = GUIDED_OBJECTIVE[source.objective] ?? 'balanced-growth';
+  const drawdown = Math.max(2, Math.min(60, Number(source.maxDrawdownPct) || 20));
+  const maxHoldings = Math.max(1, Math.min(20, Math.round(Number(source.maxHoldings) || 12)));
+  const cashTarget = Math.max(0, Math.min(50, Number(source.cashTargetPct) || 0));
+  const turnover = Math.max(1, Math.min(100, Number(source.maxTurnoverPct) || 25));
+  const cryptoChoice = String(source.cryptoPreference ?? 'none');
+  const cryptoEnabled = cryptoChoice !== 'none' && macros.includes('crypto-large-cap');
+
+  const styles = objective === 'income'
+    ? ['dividend', 'quality']
+    : objective === 'capital-preservation'
+      ? ['quality', 'value']
+      : objective === 'tactical'
+        ? ['momentum', 'thematic']
+        : ['broad-market', 'quality'];
+  if ((macros.includes('technology') || macros.includes('healthcare')) && !styles.includes('thematic')) styles.push('thematic');
+
+  const assetClasses = [];
+  if (macros.some((item) => ['global-equities', 'technology', 'healthcare'].includes(item))) assetClasses.push('etf', 'stock');
+  if (macros.includes('bonds')) assetClasses.push('bond');
+  if (macros.includes('commodities')) assetClasses.push('commodity');
+  if (cryptoEnabled) assetClasses.push('crypto');
+  if (!assetClasses.length) assetClasses.push('etf', 'stock');
+
+  const preferredSectors = [];
+  if (macros.includes('technology')) preferredSectors.push('technology');
+  if (macros.includes('healthcare')) preferredSectors.push('healthcare');
+  const preferredThemes = [];
+  if (macros.includes('global-equities')) preferredThemes.push('broad-market');
+  if (macros.includes('technology')) preferredThemes.push('artificial-intelligence', 'semiconductors');
+  if (macros.includes('healthcare')) preferredThemes.push('healthcare-innovation');
+  if (objective === 'income') preferredThemes.push('dividend-quality');
+
+  const riskLevel = drawdown <= 12 ? 'low' : drawdown <= 24 ? 'moderate' : drawdown <= 36 ? 'high' : 'very-high';
+  const contract = createDefaultOnboardingAnswers({
+    objective,
+    styles: [...new Set(styles)],
+    horizonMonths: Math.max(3, Math.min(240, Math.round(Number(source.horizonMonths) || 12))),
+    risk: { level: riskLevel, maxAcceptableDrawdownPct: drawdown },
+    capital: {
+      budgetMode: 'budget-envelope',
+      budgetEur: Math.max(10, Math.min(100000, Number(source.budgetEur) || 1000)),
+      targetDeploymentPct: 100 - cashTarget,
+    },
+    diversification: {
+      preferredPositions: Math.min(maxHoldings, Math.max(3, Math.round(maxHoldings * 0.65))),
+      maxPositions: maxHoldings,
+    },
+    sectors: { include: [], prefer: preferredSectors, exclude: [] },
+    themes: { include: [], prefer: [...new Set(preferredThemes)], exclude: [] },
+    assetClasses: [...new Set(assetClasses)],
+    crypto: {
+      enabled: cryptoEnabled,
+      tiers: !cryptoEnabled ? [] : cryptoChoice === 'majors' ? ['large-cap'] : cryptoChoice === 'broad' ? ['large-cap', 'mid-cap', 'small-cap'] : ['large-cap', 'mid-cap', 'small-cap'],
+      allowMeme: cryptoEnabled && cryptoChoice === 'meme-opt-in' && source.excludeMemeCoins !== true,
+      maxWeightPct: cryptoEnabled ? Math.max(1, Math.min(50, Number(source.maxAssetPct) * 2 || 20)) : 0,
+    },
+    cash: {
+      reserveFloorPct: cashTarget,
+      allowTemporaryIntent: true,
+      temporaryMaxPct: Math.max(cashTarget, Math.min(40, cashTarget + 15)),
+      temporaryMaxDays: 30,
+    },
+    execution: {
+      cadence: 'weekly',
+      turnoverTolerance: turnover <= 12 ? 'low' : turnover <= 25 ? 'moderate' : 'high',
+      minOrderEur: Math.max(1, Math.min(10000, Number(source.minOrderEur) || 10)),
+      maxOrderPctOfCapital: Math.max(1, Math.min(100, Number(source.maxAssetPct) || 12)),
+    },
+  });
+  const normalized = normalizeOnboardingAnswers(contract);
+  if (!normalized.ok) throw new TypeError(`onboarding non valido: ${normalized.errors.join(' · ')}`);
+  return { answers: normalized.value, guided: source };
+}
+
+function applyGuidedGuardrails(spec, guided) {
+  const next = structuredClone(spec);
+  if (guided.strategyName) next.name = String(guided.strategyName).trim().slice(0, 80) || next.name;
+  const maxAssetPct = Number(guided.maxAssetPct);
+  const maxSectorPct = Number(guided.maxSectorPct);
+  const maxTurnoverPct = Number(guided.maxTurnoverPct);
+  const maxDrawdownPct = Number(guided.maxDrawdownPct);
+  if (Number.isFinite(maxAssetPct)) next.diversification.maxInstrumentWeightPct = Math.min(next.diversification.maxInstrumentWeightPct, maxAssetPct);
+  if (Number.isFinite(maxSectorPct)) next.diversification.maxSectorWeightPct = Math.min(next.diversification.maxSectorWeightPct, maxSectorPct);
+  if (Number.isFinite(maxTurnoverPct)) next.execution.maxTurnoverPct = Math.min(next.execution.maxTurnoverPct, maxTurnoverPct);
+  if (Number.isFinite(maxDrawdownPct)) next.risk.maxDrawdownPct = Math.min(next.risk.maxDrawdownPct, maxDrawdownPct);
+  const feasibility = checkStrategyFeasibility(next);
+  if (!feasibility.ok) throw new TypeError(`strategia non fattibile: ${feasibility.errors.join(' · ')}`);
+  return next;
+}
+
+function scenarioAssumptions(spec) {
+  const annualReturnPct = {
+    'capital-preservation': 4.5,
+    'balanced-growth': 7,
+    'capital-growth': 9,
+    income: 5.5,
+    tactical: 8,
+  }[spec.objective.primary] ?? 6;
+  return {
+    annualReturnPct,
+    annualVolatilityPct: (spec.risk.targetVolatilityPct.min + spec.risk.targetVolatilityPct.max) / 2,
+  };
+}
+
+const ALLOCATION_META = {
+  'global-equities': { label: 'Azioni globali', weight: 45, color: '#075d3b' },
+  technology: { label: 'Tecnologia', weight: 25, color: '#75a58a' },
+  healthcare: { label: 'Salute', weight: 15, color: '#6d9dd8' },
+  'crypto-large-cap': { label: 'Crypto large cap', weight: 10, color: '#e8c36f' },
+  bonds: { label: 'Obbligazionario', weight: 8, color: '#aa98ca' },
+  commodities: { label: 'Materie prime', weight: 8, color: '#c47f61' },
+};
+
+function strategyPreview(spec, guided, scenario) {
+  const selected = (Array.isArray(guided.macroPreferences) ? guided.macroPreferences : [])
+    .map((key) => ({ key, ...ALLOCATION_META[key] }))
+    .filter((item) => item.label);
+  const cashPct = 100 - spec.capital.targetDeploymentPct;
+  const rawTotal = selected.reduce((sum, item) => sum + item.weight, 0) || 1;
+  const allocations = selected.map((item) => ({
+    key: item.key,
+    label: item.label,
+    weightPct: Math.round(item.weight / rawTotal * spec.capital.targetDeploymentPct),
+    color: item.color,
+  }));
+  if (allocations.length) {
+    const invested = allocations.reduce((sum, item) => sum + item.weightPct, 0);
+    allocations[0].weightPct += spec.capital.targetDeploymentPct - invested;
+  }
+  if (cashPct > 0) allocations.push({ key: 'cash', label: 'Liquidità', weightPct: cashPct, color: '#c8c9c7' });
+  return {
+    strategyName: spec.name,
+    summary: spec.objective.description,
+    allocations,
+    scenario: {
+      horizonMonths: scenario.horizonMonths,
+      favorablePct: scenario.percentiles.p90ChangePct,
+      medianPct: scenario.percentiles.p50ChangePct,
+      adversePct: Math.min(scenario.percentiles.p10ChangePct, scenario.stress.changePct),
+    },
+    riskRangePct: spec.risk.maxDrawdownPct,
+    guardrails: {
+      maxDrawdownPct: spec.risk.maxDrawdownPct,
+      maxAssetPct: spec.diversification.maxInstrumentWeightPct,
+      maxSectorPct: spec.diversification.maxSectorWeightPct,
+      minCashPct: spec.capital.cashFloorPct,
+      maxTurnoverPct: spec.execution.maxTurnoverPct,
+      minHoldingDays: Math.max(0, Math.round(Number(guided.minHoldingDays) || 0)),
+      maxHoldings: spec.diversification.maxPositions,
+    },
+    reasons: [
+      { title: 'Crescita con controllo del rischio', detail: spec.objective.description, kind: 'growth' },
+      { title: 'Diversificazione intelligente', detail: `Fino a ${spec.diversification.maxPositions} posizioni, con tetto ${spec.diversification.maxInstrumentWeightPct}% per asset e ${spec.diversification.maxSectorWeightPct}% per settore.`, kind: 'diversification' },
+      { title: 'Adattiva al mercato', detail: 'L’universo resta dinamico: segnali quantitativi, qualità e notizie ordinano i candidati entro le preferenze scelte.', kind: 'adaptive' },
+    ],
+    shadowDays: Math.max(1, Math.min(90, Math.round(Number(guided.shadowDays) || 14))),
+  };
+}
+
+async function generateGuidedStrategy({ rawAnswers, config, credentials, env }) {
+  const { answers, guided } = guidedAnswersToContract(rawAnswers);
+  const prompt = buildStrategyPrompt(answers);
+  let spec = buildSafeStrategySpec(answers);
+  let source = 'deterministic';
+  let model = null;
+  const attempts = [];
+  const llmConfig = { ...config, llmTemperature: Math.min(0.2, config.llmTemperature), llmMaxTokens: Math.max(3200, config.llmMaxTokens) };
+  for (const attempt of buildAttemptPlan({ config: llmConfig, credentials, env }).slice(0, 3)) {
+    try {
+      const response = await callModel({ ...attempt, messages: prompt.messages, config: llmConfig, credentials, env, jsonMode: true, timeoutMs: 55_000 });
+      const normalized = normalizeAiStrategySpec(response.content, answers);
+      if (!normalized.ok) {
+        attempts.push({ ...attempt, ok: false, error: normalized.error });
+        continue;
+      }
+      spec = normalized.value;
+      source = 'ai';
+      model = `${attempt.provider}/${attempt.model}`;
+      attempts.push({ ...attempt, ok: true });
+      break;
+    } catch (error) {
+      attempts.push({ ...attempt, ok: false, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  spec = applyGuidedGuardrails(spec, guided);
+  const scenario = buildDeterministicScenarioSummary(spec, scenarioAssumptions(spec), {
+    horizonMonths: Math.max(3, Math.min(120, Number(guided.horizonMonths) || 12)),
+    startingCapitalEur: spec.capital.budgetEur,
+  });
+  return { answers, guided, spec, scenario, draft: strategyPreview(spec, guided, scenario), generation: { source, model, attempts } };
+}
+
 export async function handleAgentApi(request, env, ctx, pathname) {
   if (!env.DB) return json({ error: 'binding D1 "DB" non configurato' }, 500);
   if (!isAuthorized(request, env)) return json({ error: 'non autorizzato' }, 401);
@@ -201,6 +419,7 @@ export async function handleAgentApi(request, env, ctx, pathname) {
       highWaterMarkUsd: hwm,
       drawdownPct: hwm > 0 ? (hwm - equity) / hwm : 0,
       credentials: describeCredentials(resolved),
+      agentBindingVerified: hasVerifiedAgentBinding(resolved, config),
       notificationsActive: Boolean((resolved.values.telegramBotToken && resolved.values.telegramChatId) || resolved.values.notifyWebhookUrl),
     });
   }
@@ -230,6 +449,120 @@ export async function handleAgentApi(request, env, ctx, pathname) {
     }
   }
 
+  // POST /agent/strategy/draft — genera una policy, mai ordini o ticker.
+  if (route === 'strategy/draft' && method === 'POST') {
+    try {
+      const [config, { values: credentials }] = await Promise.all([loadConfig(db), resolveCredentials(db, env)]);
+      const bundle = await generateGuidedStrategy({ rawAnswers: body.answers ?? body, config, credentials, env });
+      await audit(db, null, 'info', 'strategy', `Bozza strategia generata (${bundle.generation.source})`, {
+        model: bundle.generation.model,
+        attempts: bundle.generation.attempts.map(({ provider, model, ok, error }) => ({ provider, model, ok, error })),
+        objective: bundle.spec.objective.primary,
+        maxPositions: bundle.spec.diversification.maxPositions,
+      });
+      return json({
+        draft: bundle.draft,
+        strategySpec: bundle.spec,
+        onboardingAnswers: bundle.answers,
+        scenario: bundle.scenario,
+        generation: bundle.generation,
+      });
+    } catch (error) {
+      return json({ error: error instanceof Error ? error.message : String(error) }, 400);
+    }
+  }
+
+  // POST /agent/strategy/activate — persiste i guardrail e parte sempre in shadow.
+  if (route === 'strategy/activate' && method === 'POST') {
+    try {
+      const { answers, guided } = guidedAnswersToContract(body.answers ?? {});
+      const activationGuided = {
+        ...guided,
+        maxDrawdownPct: Number.isFinite(Number(body.reviewMaxDrawdownPct))
+          ? Number(body.reviewMaxDrawdownPct)
+          : guided.maxDrawdownPct,
+      };
+      const [current, resolved] = await Promise.all([loadConfig(db), resolveCredentials(db, env)]);
+      const requestedPortfolioId = String(body.portfolioId ?? guided.portfolioId ?? '').trim();
+      if (!requestedPortfolioId || requestedPortfolioId !== current.activeAgentPortfolioId || !hasVerifiedAgentBinding(resolved, current)) {
+        return json({
+          error: 'Il portfolio selezionato non ha un token verificato. Genera il token dalla selezione Agent Portfolio e riprova.',
+          selectedPortfolioId: requestedPortfolioId || null,
+          activePortfolioId: current.activeAgentPortfolioId || null,
+        }, 409);
+      }
+
+      let spec;
+      if (body.strategySpec) {
+        const normalized = normalizeAiStrategySpec(body.strategySpec, answers);
+        if (!normalized.ok) return json({ error: 'StrategySpec non valido', details: normalized.errors }, 400);
+        spec = normalized.value;
+      } else {
+        spec = buildSafeStrategySpec(answers);
+      }
+      spec = applyGuidedGuardrails(spec, activationGuided);
+      const scenario = buildDeterministicScenarioSummary(spec, scenarioAssumptions(spec), {
+        horizonMonths: Math.max(3, Math.min(120, Number(activationGuided.horizonMonths) || 12)),
+        startingCapitalEur: spec.capital.budgetEur,
+      });
+      const classCaps = Object.fromEntries(Object.entries(spec.universePolicy.assetClassCapsPct)
+        .map(([klass, pct]) => [klass, Number(pct) / 100]));
+      classCaps.cash = 1;
+      const shadowDays = Math.max(1, Math.min(90, Math.round(Number(activationGuided.shadowDays) || 14)));
+      const maxHoldings = spec.diversification.maxPositions;
+      const minHoldingDays = Math.max(0, Math.min(365, Math.round(Number(activationGuided.minHoldingDays) || 0)));
+      const policyPool = buildPolicyUniverse(spec, { limit: Math.min(60, Math.max(40, maxHoldings * 3)) });
+      const next = await saveConfig(db, {
+        strategySpecVersion: spec.schemaVersion,
+        strategySpec: spec,
+        onboardingAnswers: answers,
+        onboardingComplete: true,
+        strategyName: spec.name,
+        strategyGeneratedBy: String(body.generatedBy ?? 'guided-onboarding').slice(0, 160),
+        strategyScenario: scenario,
+        policyUniverse: spec.universePolicy,
+        universeMode: 'dynamic',
+        pool: policyPool,
+        budgetEur: spec.capital.budgetEur,
+        targetDeploymentPct: spec.capital.targetDeploymentPct / 100,
+        maxHoldings,
+        minHoldings: spec.diversification.minPositions,
+        shortlistSize: Math.min(40, Math.max(24, maxHoldings * 2)),
+        minHoldingDays,
+        cadence: spec.execution.cadence,
+        minOrderUsd: Math.max(1, spec.execution.minOrderEur * current.fallbackEurUsd),
+        // L'assoluto diventa solo un fusibile molto alto; il validator usa il
+        // tetto percentuale sull'equity virtuale del portfolio.
+        maxOrderUsd: 100000,
+        maxOrderPctOfCapital: spec.execution.maxOrderPctOfCapital / 100,
+        maxTurnoverPct: spec.execution.maxTurnoverPct / 100,
+        maxWeightPerClass: classCaps,
+        minCashPct: spec.capital.cashFloorPct / 100,
+        maxCashPct: spec.capital.cashCeilingPct / 100,
+        drawdownStopPct: spec.risk.maxDrawdownPct / 100,
+        maxOrdersPerRun: Math.min(20, maxHoldings),
+        maxOrdersPerDay: Math.min(40, Math.max(maxHoldings, maxHoldings * 2)),
+        watcherEnabled: true,
+        riskProfile: `${spec.objective.description} Nessuna leva, nessuno short. Universo dinamico entro le preferenze e i cap della StrategySpec v${spec.schemaVersion}.`,
+        shadowStartedAt: Date.now(),
+        shadowDays,
+        executionMode: 'shadow',
+        frozen: false,
+        frozenReason: '',
+      });
+      await audit(db, null, 'warn', 'strategy', `Strategia “${spec.name}” attivata in shadow per ${shadowDays} giorni`, {
+        portfolioId: requestedPortfolioId,
+        maxHoldings,
+        targetDeploymentPct: spec.capital.targetDeploymentPct,
+        cashFloorPct: spec.capital.cashFloorPct,
+        policyCandidates: policyPool.length,
+      });
+      return json({ ok: true, config: next, strategySpec: spec, scenario, draft: strategyPreview(spec, activationGuided, scenario) });
+    } catch (error) {
+      return json({ error: error instanceof Error ? error.message : String(error) }, 400);
+    }
+  }
+
   // POST /agent/mode  { mode, confirm }
   if (route === 'mode' && method === 'POST') {
     const mode = String(body.mode ?? '');
@@ -237,9 +570,11 @@ export async function handleAgentApi(request, env, ctx, pathname) {
     if (mode === 'live' && body.confirm !== 'ATTIVA ORDINI REALI') {
       return json({ error: 'per la modalità live serve confirm = "ATTIVA ORDINI REALI"' }, 400);
     }
-    const { values: credentials } = await resolveCredentials(db, env);
-    if (mode === 'live' && !credentials.etoroAgentToken) {
-      return json({ error: 'token Agent Portfolio non configurato: impossibile operare in live' }, 400);
+    const resolved = await resolveCredentials(db, env);
+    const credentials = resolved.values;
+    const current = await loadConfig(db);
+    if (mode === 'live' && !hasVerifiedAgentBinding(resolved, current)) {
+      return json({ error: 'Agent Portfolio non verificato: genera un nuovo token e attendi la verifica prima del live' }, 400);
     }
     const config = await saveConfig(db, { executionMode: mode });
     await audit(db, null, 'warn', 'config', `Modalità di esecuzione impostata su ${mode}`);
@@ -269,6 +604,12 @@ export async function handleAgentApi(request, env, ctx, pathname) {
     if (modeOverride === 'live' && body.confirm !== 'ATTIVA ORDINI REALI') {
       return json({ error: 'override live richiede confirm = "ATTIVA ORDINI REALI"' }, 400);
     }
+    if (modeOverride === 'live') {
+      const [resolved, config] = await Promise.all([resolveCredentials(db, env), loadConfig(db)]);
+      if (!hasVerifiedAgentBinding(resolved, config)) {
+        return json({ error: 'Agent Portfolio non verificato: genera un nuovo token prima della run live' }, 400);
+      }
+    }
     const result = await runPipeline({ env, kind, modeOverride });
     return json(result);
   }
@@ -280,11 +621,29 @@ export async function handleAgentApi(request, env, ctx, pathname) {
     }
     if (method === 'PUT') {
       const { applied, rejected } = await saveCredentials(db, env, body);
+      if (applied.includes('etoroAgentToken')) {
+        await saveConfig(db, {
+          activeAgentPortfolioId: '',
+          activeAgentPortfolioName: '',
+          agentTokenVerifiedAt: 0,
+          agentTokenHint: '',
+          agentTokenFingerprint: '',
+          agentTokenOrigin: '',
+        });
+      }
       await audit(db, null, 'warn', 'credentials', `Credenziali aggiornate: ${applied.join(', ') || 'nessuna'}`, { rejected });
       return json({ credentials: describeCredentials(await resolveCredentials(db, env)), applied, rejected });
     }
     if (method === 'DELETE') {
       await clearCredentials(db);
+      await saveConfig(db, {
+        activeAgentPortfolioId: '',
+        activeAgentPortfolioName: '',
+        agentTokenVerifiedAt: 0,
+        agentTokenHint: '',
+        agentTokenFingerprint: '',
+        agentTokenOrigin: '',
+      });
       await audit(db, null, 'warn', 'credentials', 'Vault credenziali svuotato');
       return json({ credentials: describeCredentials(await resolveCredentials(db, env)) });
     }
@@ -355,12 +714,39 @@ export async function handleAgentApi(request, env, ctx, pathname) {
     try {
       const client = new EtoroClient({ apiKey: credentials.etoroApiKey, userKey: credentials.etoroUserKey });
       const { token, name } = await client.createAgentUserToken(agentPortfolioId);
-      await saveCredentials(db, env, { etoroAgentToken: token });
-      await audit(db, null, 'warn', 'credentials', `Nuovo token Agent Portfolio generato e salvato (${name})`, { agentPortfolioId });
+      // eToro restituisce il segreto una sola volta. Lo collaudiamo prima di
+      // sostituire l'eventuale token valido già nel vault.
+      const verifier = new EtoroClient({
+        apiKey: credentials.etoroApiKey,
+        userKey: credentials.etoroUserKey,
+        agentToken: token,
+      });
+      const portfolio = await verifier.portfolio(token);
+      const currentConfig = await loadConfig(db);
+      const { config } = await saveVerifiedAgentToken(db, env, {
+        token,
+        portfolioId: agentPortfolioId,
+        portfolioName: body.agentPortfolioName,
+        verifiedAt: Date.now(),
+        currentConfig,
+      });
+      const hint = config.agentTokenHint;
+      await audit(db, null, 'warn', 'credentials', `Nuovo token Agent Portfolio verificato e salvato (${name})`, {
+        agentPortfolioId,
+        equityUsd: portfolio.equityUsd,
+        positions: portfolio.positions.length,
+      });
       return json({
         ok: true,
         tokenName: name,
-        hint: `••••${token.slice(-4)}`,
+        hint,
+        verified: true,
+        portfolio: {
+          id: agentPortfolioId,
+          name: config.activeAgentPortfolioName,
+          equityUsd: portfolio.equityUsd,
+          positions: portfolio.positions.length,
+        },
         credentials: describeCredentials(await resolveCredentials(db, env)),
       });
     } catch (error) {

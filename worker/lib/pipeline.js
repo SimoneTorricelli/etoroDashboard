@@ -16,7 +16,7 @@ import { describeLedger } from './churn.js';
 import { classifyAnomaly, decideWatcherAction, detectAnomalies } from './watcher.js';
 import { notify } from './notify.js';
 import { PROFILES, describeProfile } from './profiles.js';
-import { resolveCredentials, missingRequired } from './vault.js';
+import { hasVerifiedAgentBinding, resolveCredentials, missingRequired, saveCredentials } from './vault.js';
 import {
   audit, cacheUniverse, countOpportunisticThisWeek, countOrdersToday, equityHistory,
   finishRun, listWatcherEvents, loadConfig, loadLedger, loadUniverseCache, recordEquity,
@@ -54,14 +54,19 @@ export function decideKind(config, parts) {
   return 'heartbeat';
 }
 
-function buildClient(credentials) {
+function buildClient(resolved, config) {
+  const credentials = resolved.values;
   const missing = missingRequired(credentials).filter((label) => label.startsWith('eToro'));
   if (missing.length) throw new Error(`credenziali mancanti: ${missing.join(', ')}`);
+  const verifiedAgentToken = hasVerifiedAgentBinding(resolved, config)
+    ? credentials.etoroAgentToken
+    : '';
   return new EtoroClient({
     apiKey: credentials.etoroApiKey,
-    // Sull'Agent Portfolio si legge e si opera con il suo token dedicato.
-    userKey: credentials.etoroAgentToken || credentials.etoroUserKey,
-    agentToken: credentials.etoroAgentToken || '',
+    // La owner key resta sempre la credenziale predefinita per catalogo e dati.
+    // Il token Agent viene abilitato solo dopo una verifica reale del portfolio.
+    userKey: credentials.etoroUserKey,
+    agentToken: verifiedAgentToken || '',
   });
 }
 
@@ -106,6 +111,48 @@ async function resolveUniverse(client, db, config) {
   return { universe, unresolved };
 }
 
+function normalizeHeldAssetClass(label) {
+  const value = String(label ?? '').toLowerCase();
+  if (value.includes('crypto')) return 'crypto';
+  if (value.includes('etf') || value.includes('fund')) return 'etf';
+  if (value.includes('bond') || value.includes('fixed income')) return 'bond';
+  if (value.includes('commod')) return 'commodity';
+  return 'stock';
+}
+
+/**
+ * Le posizioni reali restano nell'universo anche se non erano nel pool della
+ * nuova strategia. In questo modo sono misurate, sottoposte ai cap e vendibili.
+ */
+async function mergeHeldPositions(client, db, universe, snapshot) {
+  const knownIds = new Set([...universe.values()].map((item) => item.instrumentId));
+  const missingIds = [...new Set(snapshot.positions.map((item) => item.instrumentId).filter((id) => id && !knownIds.has(id)))];
+  if (!missingIds.length) return [];
+  let metadata = [];
+  try { metadata = await client.instruments(missingIds); } catch { /* fallback per ID sotto */ }
+  const byId = new Map(metadata.map((item) => [item.instrumentId, item]));
+  const added = [];
+  for (const instrumentId of missingIds) {
+    const item = byId.get(instrumentId) ?? {};
+    const rawSymbol = String(item.symbol ?? '').trim().toUpperCase();
+    const symbol = rawSymbol || `HELD_${instrumentId}`;
+    const entry = {
+      symbol,
+      name: String(item.name ?? `Posizione eToro ${instrumentId}`),
+      class: normalizeHeldAssetClass(item.assetClass),
+      maxWeight: 0,
+      instrumentId,
+      heldOutsidePolicy: true,
+      sellOnly: true,
+      buyEligible: false,
+    };
+    universe.set(symbol, entry);
+    added.push(entry);
+  }
+  if (added.length) await cacheUniverse(db, added);
+  return added;
+}
+
 /** Serie giornaliere con cache 12h: riduce di molto le chiamate a eToro. */
 async function loadCandles(client, env, universe) {
   const candles = new Map();
@@ -144,7 +191,9 @@ async function runWatcher({ env, db, config, credentials, client, snapshot, feat
 
   const ledger = await loadLedger(db);
   const opportunisticThisWeek = await countOpportunisticThisWeek(db);
+  const ordersToday = await countOrdersToday(db);
   const budgetUsd = snapshot.equityUsd * config.opportunisticBudgetPct;
+  const holdingCount = features.instruments.filter((item) => item.weight > 0.001).length;
   const actions = [];
   let escalated = 0;
 
@@ -153,25 +202,39 @@ async function runWatcher({ env, db, config, credentials, client, snapshot, feat
     const verdict = await classifyAnomaly({ config, credentials, env, anomaly, news: external.news });
     escalated += 1;
 
-    const decision = decideWatcherAction({
+    let decision = decideWatcherAction({
       anomaly, verdict, config, ledger, budgetUsd,
       opportunisticThisWeek: opportunisticThisWeek + actions.filter((item) => item.action === 'buy').length,
       equityUsd: snapshot.equityUsd,
+      holdingCount,
+      currentClassWeight: features.allocationByClass?.[anomaly.class] ?? 0,
+      availableCashUsd: snapshot.cashUsd,
+      ordersToday: ordersToday + actions.filter((item) => item.executed).length,
     });
 
     let executed = false;
     if (decision.action === 'buy' && mode === 'live' && !config.frozen) {
       const id = await deterministicId(runId, `watch-${anomaly.symbol}`, anomaly.symbol, 'buy');
       try {
-        const response = await client.openOrder({ instrumentId: anomaly.instrumentId, amountUsd: decision.amountUsd, requestId: id });
-        await upsertOrder(db, {
-          id, runId, seq: 900, symbol: anomaly.symbol, instrumentId: anomaly.instrumentId,
-          side: 'buy', amountUsd: decision.amountUsd, mode, state: 'sent',
-          etoroOrderId: String(response?.orderId ?? '') || null,
-          message: `opportunistico: ${decision.reason}`.slice(0, 500),
-        });
-        await recordLedgerTrade(db, anomaly.symbol, 'buy', { opportunistic: true, averagingDown: anomaly.held });
-        executed = true;
+        const eligibility = await client.eligibility([anomaly.instrumentId]);
+        const eligible = eligibility.get(anomaly.instrumentId);
+        if (!eligible?.allowOpenPosition) {
+          decision = { action: 'noop', reason: `${anomaly.symbol}: mercato chiuso o strumento non negoziabile` };
+          await audit(db, runId, 'warn', 'watcher', decision.reason);
+        } else if (decision.amountUsd + 0.005 < eligible.minPositionUsd) {
+          decision = { action: 'noop', reason: `${anomaly.symbol}: importo sotto il minimo eToro di ${eligible.minPositionUsd} USD` };
+          await audit(db, runId, 'warn', 'watcher', decision.reason);
+        } else {
+          const response = await client.openOrder({ instrumentId: anomaly.instrumentId, amountUsd: decision.amountUsd, requestId: id });
+          await upsertOrder(db, {
+            id, runId, seq: 900, symbol: anomaly.symbol, instrumentId: anomaly.instrumentId,
+            side: 'buy', amountUsd: decision.amountUsd, mode, state: 'sent',
+            etoroOrderId: String(response?.orderId ?? '') || null,
+            message: `opportunistico: ${decision.reason}`.slice(0, 500),
+          });
+          await recordLedgerTrade(db, anomaly.symbol, 'buy', { opportunistic: true, averagingDown: anomaly.held });
+          executed = true;
+        }
       } catch (error) {
         await audit(db, runId, 'error', 'watcher', `Ordine opportunistico fallito su ${anomaly.symbol}`, { message: error.message });
       }
@@ -210,20 +273,59 @@ async function runWatcher({ env, db, config, credentials, client, snapshot, feat
 export async function runPipeline({ env, kind, modeOverride }) {
   const db = env.DB;
   const config = await loadConfig(db);
-  const { values: credentials } = await resolveCredentials(db, env);
   const mode = modeOverride ?? config.executionMode;
-  const profile = PROFILES[config.strategyProfile] ?? PROFILES.balanced;
+  const baseProfile = PROFILES[config.strategyProfile] ?? PROFILES.balanced;
+  const profile = config.strategySpec ? {
+    ...baseProfile,
+    targetVolPct: [
+      config.strategySpec.risk?.targetVolatilityPct?.min ?? baseProfile.targetVolPct[0],
+      config.strategySpec.risk?.targetVolatilityPct?.max ?? baseProfile.targetVolPct[1],
+    ],
+    maxHoldings: config.strategySpec.diversification?.maxPositions ?? baseProfile.maxHoldings,
+  } : baseProfile;
   const runId = `${new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}-${kind}-${crypto.randomUUID().slice(0, 8)}`;
 
   await startRun(db, runId, kind, mode);
   await audit(db, runId, 'info', 'start', `Run ${kind} avviata in modalità ${mode} · profilo ${profile.label}`);
 
+  if (!['shadow', 'dry-run', 'live'].includes(mode)) {
+    const error = `modalità di esecuzione non valida: ${String(mode)}`;
+    await audit(db, runId, 'error', 'start', error);
+    await finishRun(db, runId, 'blocked', null, error);
+    return { runId, status: 'blocked', error };
+  }
+
   let equityUsd = null;
   try {
-    const client = buildClient(credentials);
+    const resolved = await resolveCredentials(db, env);
+    const credentials = resolved.values;
+    const client = buildClient(resolved, config);
+    const hasVerifiedAgent = hasVerifiedAgentBinding(resolved, config);
+    if (mode === 'live' && !hasVerifiedAgent) {
+      throw new Error('Agent Portfolio non verificato: genera e verifica un nuovo token prima di attivare il live');
+    }
+    const portfolioUserKey = hasVerifiedAgent ? client.agentToken : client.userKey;
 
     // --- 1. Snapshot -------------------------------------------------------
-    const snapshot = await client.portfolio();
+    let snapshot;
+    try {
+      snapshot = await client.portfolio(portfolioUserKey);
+    } catch (error) {
+      if (hasVerifiedAgent && Number(error?.status) === 401) {
+        await saveCredentials(db, env, { etoroAgentToken: '' });
+        await saveConfig(db, {
+          executionMode: 'shadow',
+          activeAgentPortfolioId: '',
+          activeAgentPortfolioName: '',
+          agentTokenVerifiedAt: 0,
+          agentTokenHint: '',
+          agentTokenFingerprint: '',
+          agentTokenOrigin: '',
+        });
+        await audit(db, runId, 'error', 'credentials', 'Token Agent revocato o non valido: binding rimosso e live disattivato');
+      }
+      throw error;
+    }
     equityUsd = snapshot.equityUsd;
     await saveSnapshot(db, runId, snapshot);
     const { hwm, drawdown } = await recordEquity(db, snapshot.equityUsd, snapshot.investedUsd, snapshot.cashUsd);
@@ -241,8 +343,12 @@ export async function runPipeline({ env, kind, modeOverride }) {
 
     // --- 3. Universo, storici e contesto -----------------------------------
     const { universe, unresolved } = await resolveUniverse(client, db, config);
+    const heldOutsidePolicy = await mergeHeldPositions(client, db, universe, snapshot);
     if (!universe.size) throw new Error(`nessuno strumento risolto su eToro${unresolved.length ? ` (falliti: ${unresolved.join(', ')})` : ''}`);
     if (unresolved.length) await audit(db, runId, 'warn', 'universe', `Simboli non risolti: ${unresolved.join(', ')}`);
+    if (heldOutsidePolicy.length) {
+      await audit(db, runId, 'warn', 'universe', `${heldOutsidePolicy.length} posizioni esistenti aggiunte fuori policy`, heldOutsidePolicy.map((item) => item.symbol));
+    }
 
     const [candles, external] = await Promise.all([
       loadCandles(client, env, universe),
@@ -297,7 +403,7 @@ export async function runPipeline({ env, kind, modeOverride }) {
       weight: features.instruments.find((row) => row.symbol === item.symbol)?.weight ?? 0,
     }));
     const featuresPrompt = dynamic
-      ? [renderFeaturesPrompt(features, config).split('\nSTRUMENTI')[0], renderShortlistPrompt(shortlistWithWeights)].join('\n')
+      ? [renderFeaturesPrompt(features, config, { includeInstruments: false }), renderShortlistPrompt(shortlistWithWeights)].join('\n')
       : renderFeaturesPrompt(features, config);
     const ledgerNotes = describeLedger(ledger, config);
 
@@ -354,7 +460,7 @@ export async function runPipeline({ env, kind, modeOverride }) {
     // --- 9. Riconciliazione ------------------------------------------------
     let reconciliation = null;
     if (mode === 'live' && execution.executed) {
-      reconciliation = await reconcile({ client, plan: validation.plan, config });
+      reconciliation = await reconcile({ client, plan: validation.plan, config, portfolioUserKey });
       await audit(db, runId, reconciliation.ok ? 'info' : 'error', 'reconcile', `Divergenza massima ${(reconciliation.worstDivergence * 100).toFixed(2)}%`, reconciliation.rows);
       if (!reconciliation.ok) {
         await saveConfig(db, { frozen: true, frozenReason: `riconciliazione fuori tolleranza (${(reconciliation.worstDivergence * 100).toFixed(2)}%)` });

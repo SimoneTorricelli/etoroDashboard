@@ -5,7 +5,7 @@ module.exports = {
   theme: {
     extend: {
       colors: {
-        // shadcn tokens (mapped to dark palette in index.css)
+        // shadcn tokens (mapped to the warm light palette in index.css)
         border: "hsl(var(--border))",
         input: "hsl(var(--input))",
         ring: "hsl(var(--ring))",
@@ -49,27 +49,27 @@ module.exports = {
           border: "hsl(var(--sidebar-border))",
           ring: "hsl(var(--sidebar-ring))",
         },
-        // ── Design tokens (design.md) ──────────────────────────────
-        'bg-0': '#0A0E13', // app background
-        'bg-1': '#0F141B', // card / panel surface
-        'bg-2': '#151C26', // raised surface (hover, popovers, table header)
-        'bg-3': '#1C2530', // active/selected surface, input bg
-        'text-0': '#F2F5F8', // primary text, numbers
-        'text-1': '#9AA7B4', // secondary text, labels
-        'text-2': '#5C6B7A', // tertiary, placeholders, axis labels
-        gain: '#00C390',      // brand accent, gains, buy
-        'gain-dim': '#00C39026',
-        loss: '#F4556B',      // losses, sell, destructive, kill switch
-        'loss-dim': '#F4556B26',
-        warn: '#F5A623',      // warnings, pending, medium risk
-        info: '#4C9AFF',      // links, info, FX module accent
-        agent: '#9B8CFF',     // Agent/automation accent
-        hairline: '#FFFFFF14',
-        'hairline-strong': '#FFFFFF24',
+        // ── Human light design tokens ───────────────────────────────
+        'bg-0': '#FAF9F5', // warm app canvas
+        'bg-1': '#FFFFFF', // card / panel surface
+        'bg-2': '#EFF1EA', // raised surface, table header
+        'bg-3': '#E4E9E0', // active/selected surface, input bg
+        'text-0': '#1C2B22', // primary text, numbers
+        'text-1': '#56645C', // secondary text, labels
+        'text-2': '#7D8981', // tertiary, placeholders, axis labels
+        gain: '#0D5434',      // forest brand accent, gains, buy
+        'gain-dim': '#0D543426',
+        loss: '#E0543F',      // losses, sell, destructive, kill switch
+        'loss-dim': '#E0543F26',
+        warn: '#A76C20',      // warnings, pending, medium risk
+        info: '#356F9F',      // links, info, FX module accent
+        agent: '#3C7059',     // Agent/automation accent
+        hairline: '#233A2C1F',
+        'hairline-strong': '#233A2C38',
       },
       fontFamily: {
-        sans: ['Inter', 'system-ui', 'sans-serif'],
-        display: ['"Space Grotesk"', 'Inter', 'sans-serif'],
+        sans: ['Manrope', 'system-ui', 'sans-serif'],
+        display: ['"DM Serif Display"', 'Georgia', 'serif'],
         mono: ['"JetBrains Mono"', 'ui-monospace', 'monospace'],
       },
       fontSize: {

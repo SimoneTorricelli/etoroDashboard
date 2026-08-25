@@ -33,6 +33,17 @@ export const DEFAULT_CONFIG = {
 
   /** defensive | balanced | dynamic | aggressive — vedi profiles.js */
   strategyProfile: 'balanced',
+  /** Contratto generato dall'onboarding guidato; null mantiene compatibilità con le configurazioni storiche. */
+  strategySpecVersion: 0,
+  strategySpec: null,
+  onboardingAnswers: null,
+  onboardingComplete: false,
+  strategyName: '',
+  strategyGeneratedBy: '',
+  strategyScenario: null,
+  policyUniverse: null,
+  shadowStartedAt: 0,
+  shadowDays: 14,
   /** Blocco totale attivato da circuit breaker o dall'utente. */
   frozen: false,
   frozenReason: '',
@@ -46,6 +57,16 @@ export const DEFAULT_CONFIG = {
 
   /** Capitale nominale gestito dall'agente, in EUR. */
   budgetEur: 250,
+  /**
+   * Binding verificato tra Autopilot e uno specifico Agent Portfolio.
+   * Il segreto resta nel vault: qui persistono solo identità e verifica.
+   */
+  activeAgentPortfolioId: '',
+  activeAgentPortfolioName: '',
+  agentTokenVerifiedAt: 0,
+  agentTokenHint: '',
+  agentTokenFingerprint: '',
+  agentTokenOrigin: '',
   /** Cambio EUR→USD di fallback se le fonti FX non rispondono. */
   fallbackEurUsd: 1.08,
 
@@ -105,12 +126,16 @@ export const DEFAULT_CONFIG = {
   maxOrdersPerDay: 8,
   minOrderUsd: 10,
   maxOrderUsd: 120,
+  /** Tetto dinamico per ordine rispetto all'equity virtuale gestita. */
+  maxOrderPctOfCapital: 0.20,
   maxTurnoverPct: 0.20,         // quota max di portafoglio movimentata per run
   minRebalanceBandAbs: 0.03,    // scostamento assoluto minimo per agire
   minRebalanceBandRel: 0.15,    // scostamento relativo minimo per agire
   maxWeightPerClass: { etf: 0.80, bond: 0.40, commodity: 0.25, crypto: 0.20, cash: 1.0 },
   minCashPct: 0.05,
   maxCashPct: 0.60,
+  /** Quota che la strategia mira a mantenere investita in condizioni normali. */
+  targetDeploymentPct: 0.95,
   /** Drawdown dal massimo storico che congela l'agente. */
   drawdownStopPct: 0.15,
   /** Divergenza tollerata in riconciliazione prima del freeze. */
@@ -125,18 +150,20 @@ export const DEFAULT_CONFIG = {
   llmProviders: ['workers-ai', 'gemini', 'groq', 'openrouter'],
   /** Modelli per provider. Vuoto = si usano i default del provider. */
   llmModels: {
-    'workers-ai': ['@cf/meta/llama-3.3-70b-instruct-fp8-fast', '@cf/mistralai/mistral-small-3.1-24b-instruct'],
-    gemini: ['gemini-2.0-flash', 'gemini-2.0-flash-lite'],
+    'workers-ai': ['@cf/openai/gpt-oss-120b', '@cf/nvidia/nemotron-3-120b-a12b', '@cf/qwen/qwen3-30b-a3b-fp8'],
+    gemini: ['gemini-3.7-flash', 'gemini-3.6-flash'],
     groq: ['llama-3.3-70b-versatile'],
     openrouter: [],
   },
+  /** Mantiene l'ordine dichiarato: modelli migliori prima, fallback solo in caso di errore. */
+  llmRoutingPolicy: 'quality-first',
   llmTemperature: 0.2,
   llmMaxTokens: 1600,
   /** Politica di rischio in linguaggio naturale, iniettata nel prompt. */
   riskProfile: 'Bilanciato. Priorità alla protezione del capitale, crescita moderata, nessuna leva, nessuno short.',
 };
 
-const CONFIG_KEY = 'autopilot';
+export const CONFIG_KEY = 'autopilot';
 
 export async function migrate(db) {
   for (const statement of SCHEMA) {

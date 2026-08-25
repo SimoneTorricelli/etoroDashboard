@@ -59,7 +59,45 @@ export function clampWeights(targetWeights, features, config, violations) {
     cash = config.minCashPct;
   }
   if (cash > config.maxCashPct) {
-    violations.push(violation('cash_ceiling', `cash ${(cash * 100).toFixed(1)}% sopra il massimo ${(config.maxCashPct * 100).toFixed(0)}%: proposta accettata ma segnalata`, 'info'));
+    // Prova a usare la capacità residua dei simboli già proposti senza
+    // inventare nuovi titoli. Se i cap rendono impossibile il deployment,
+    // il piano viene bloccato invece di lasciare cassa non intenzionale.
+    let excess = cash - config.maxCashPct;
+    const classCurrent = {};
+    for (const [symbol, weight] of Object.entries(weights)) {
+      if (symbol === 'CASH') continue;
+      const klass = bySymbol.get(symbol)?.class ?? 'other';
+      classCurrent[klass] = (classCurrent[klass] ?? 0) + weight;
+    }
+    for (let pass = 0; pass < 4 && excess > 0.0001; pass += 1) {
+      const capacities = Object.entries(weights)
+        .filter(([symbol]) => symbol !== 'CASH')
+        .map(([symbol, weight]) => {
+          const meta = bySymbol.get(symbol);
+          const klass = meta?.class ?? 'other';
+          const symbolRoom = Math.max(0, (meta?.maxWeight ?? 0) - weight);
+          const classRoom = Math.max(0, (classCaps[klass] ?? 1) - (classCurrent[klass] ?? 0));
+          return { symbol, klass, room: Math.min(symbolRoom, classRoom) };
+        })
+        .filter((item) => item.room > 0.0001);
+      if (!capacities.length) break;
+      const share = excess / capacities.length;
+      let filled = 0;
+      for (const item of capacities) {
+        const addition = Math.min(item.room, share);
+        weights[item.symbol] += addition;
+        classCurrent[item.klass] = (classCurrent[item.klass] ?? 0) + addition;
+        filled += addition;
+      }
+      if (filled <= 0.0001) break;
+      excess -= filled;
+    }
+    cash = round(1 - Object.entries(weights).reduce((sum, [symbol, weight]) => sum + (symbol === 'CASH' ? 0 : weight), 0), 4);
+    if (cash > config.maxCashPct + 0.0001) {
+      violations.push(violation('cash_ceiling', `cash ${(cash * 100).toFixed(1)}% sopra il massimo ${(config.maxCashPct * 100).toFixed(0)}%: capacità insufficiente entro i cap`));
+    } else {
+      violations.push(violation('cash_deployed', `cassa eccedente riallocata entro i cap; target ${(cash * 100).toFixed(1)}%`, 'clamped'));
+    }
   }
 
   weights.CASH = round(cash, 4);
@@ -96,6 +134,15 @@ export function validateProposal({ proposal, features, config, ordersToday = 0, 
     const total = keep.reduce((sum, [, weight]) => sum + weight, 0);
     const cashTarget = round(1 - total, 4);
     targets = { ...kept, CASH: Math.max(cashTarget, config.minCashPct) };
+  }
+  const targetPositionCount = Object.entries(targets)
+    .filter(([symbol, weight]) => symbol !== 'CASH' && weight > 0.001)
+    .length;
+  if (config.minHoldings && targetPositionCount < config.minHoldings) {
+    violations.push(violation(
+      'min_holdings',
+      `proposti ${targetPositionCount} strumenti, sotto il minimo di diversificazione ${config.minHoldings}`,
+    ));
   }
 
   const deltas = [];
@@ -180,11 +227,17 @@ export function validateProposal({ proposal, features, config, ordersToday = 0, 
     candidates = candidates.filter((item) => Math.abs(item.deltaUsd) >= config.minOrderUsd);
   }
 
-  // Cap per singolo ordine.
+  // Cap per singolo ordine: percentuale dinamica dell'equity. Il vecchio cap
+  // assoluto resta fallback solo per configurazioni anteriori all'onboarding.
+  const proportionalOrderCap = Number(config.maxOrderPctOfCapital) > 0
+    ? equityUsd * Number(config.maxOrderPctOfCapital)
+    : Number(config.maxOrderUsd);
+  const absoluteSafetyCap = Number(config.maxOrderUsd) > 0 ? Number(config.maxOrderUsd) : Number.POSITIVE_INFINITY;
+  const orderCapUsd = Math.max(config.minOrderUsd, Math.min(proportionalOrderCap || absoluteSafetyCap, absoluteSafetyCap));
   for (const item of candidates) {
-    if (Math.abs(item.deltaUsd) > config.maxOrderUsd) {
-      violations.push(violation('order_cap', `${item.symbol}: importo ridotto a ${config.maxOrderUsd} USD`, 'clamped'));
-      item.deltaUsd = round(Math.sign(item.deltaUsd) * config.maxOrderUsd, 2);
+    if (Math.abs(item.deltaUsd) > orderCapUsd) {
+      violations.push(violation('order_cap', `${item.symbol}: importo ridotto al ${(Number(config.maxOrderPctOfCapital) * 100).toFixed(0)}% del capitale (${round(orderCapUsd, 2)} USD)`, 'clamped'));
+      item.deltaUsd = round(Math.sign(item.deltaUsd) * orderCapUsd, 2);
     }
   }
 

@@ -164,7 +164,11 @@ export async function classifyAnomaly({ config, credentials, env, anomaly, news 
  * Trasforma una classificazione in una decisione operativa, applicando tutti i
  * cancelli deterministici. È qui che si decide se l'AI viene ascoltata.
  */
-export function decideWatcherAction({ anomaly, verdict, config, ledger, budgetUsd, opportunisticThisWeek, equityUsd }) {
+export function decideWatcherAction({
+  anomaly, verdict, config, ledger, budgetUsd, opportunisticThisWeek, equityUsd,
+  holdingCount = 0, currentClassWeight = 0, availableCashUsd = Number.POSITIVE_INFINITY,
+  ordersToday = 0,
+}) {
   const deny = (reason) => ({ action: 'noop', reason });
 
   if (!verdict) return deny('nessuna classificazione disponibile');
@@ -185,11 +189,30 @@ export function decideWatcherAction({ anomaly, verdict, config, ledger, budgetUs
   if (opportunisticThisWeek >= config.maxOpportunisticPerWeek) {
     return deny(`già ${opportunisticThisWeek} operazioni opportunistiche questa settimana, massimo ${config.maxOpportunisticPerWeek}`);
   }
+  if (!anomaly.held && config.maxHoldings && holdingCount >= config.maxHoldings) {
+    return deny(`raggiunto il massimo di ${config.maxHoldings} posizioni`);
+  }
+  if (ordersToday >= config.maxOrdersPerDay) {
+    return deny(`raggiunto il limite giornaliero di ${config.maxOrdersPerDay} ordini`);
+  }
 
   const churn = checkChurnRules({ symbol: anomaly.symbol, side: 'buy', ledger, config, isOpportunistic: true });
   if (!churn.allowed) return deny(churn.reason);
 
-  const perTradeUsd = Math.min(budgetUsd, config.maxOrderUsd, equityUsd * config.opportunisticBudgetPct / Math.max(1, config.maxOpportunisticPerWeek));
+  const percentageCapUsd = Number(config.maxOrderPctOfCapital) > 0
+    ? equityUsd * Number(config.maxOrderPctOfCapital)
+    : Number.POSITIVE_INFINITY;
+  const classCap = Number(config.maxWeightPerClass?.[anomaly.class] ?? 1);
+  const classRoomUsd = Math.max(0, (classCap - currentClassWeight) * equityUsd);
+  const spendableCashUsd = Math.max(0, availableCashUsd - (Number(config.minCashPct) || 0) * equityUsd);
+  const perTradeUsd = Math.min(
+    budgetUsd,
+    Number(config.maxOrderUsd) || Number.POSITIVE_INFINITY,
+    percentageCapUsd,
+    classRoomUsd,
+    spendableCashUsd,
+    equityUsd * config.opportunisticBudgetPct / Math.max(1, config.maxOpportunisticPerWeek),
+  );
   if (perTradeUsd < config.minOrderUsd) return deny(`budget opportunistico residuo ${round(perTradeUsd)} USD sotto l'ordine minimo`);
 
   return { action: 'buy', reason: verdict.rationale, amountUsd: round(perTradeUsd) };

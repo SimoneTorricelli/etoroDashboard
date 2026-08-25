@@ -131,6 +131,15 @@ export function applyProfile(config, profileId) {
 
 /** Descrizione testuale del profilo, iniettata nel prompt. */
 export function describeProfile(config) {
+  if (config.strategySpec) {
+    const spec = config.strategySpec;
+    return [
+      `Strategia guidata “${spec.name}”: ${spec.objective?.description ?? config.riskProfile}`,
+      `Orizzonte ${spec.objective?.horizonMonths ?? 'n/d'} mesi. Volatilità annua desiderata ${spec.risk?.targetVolatilityPct?.min ?? 'n/d'}–${spec.risk?.targetVolatilityPct?.max ?? 'n/d'}%.`,
+      `Tieni fra ${spec.diversification?.minPositions ?? config.minHoldings} e ${spec.diversification?.maxPositions ?? config.maxHoldings} strumenti; universo policy-dynamic, cap e preferenze non ampliabili dall'AI.`,
+      config.riskProfile,
+    ].join(' ');
+  }
   const profile = PROFILES[config.strategyProfile] ?? PROFILES.balanced;
   return [
     `Profilo ${profile.label}: ${profile.summary}`,
