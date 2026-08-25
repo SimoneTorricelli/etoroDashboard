@@ -8,6 +8,7 @@ import { listFreeModels } from './brain.js';
 import { notify, notifyTest } from './notify.js';
 import { clearCredentials, describeCredentials, resolveCredentials, saveCredentials } from './vault.js';
 import { runDiagnostics } from './diagnose.js';
+import { EtoroClient } from './etoro.js';
 import {
   audit, equityHistory, getRunBundle, listRuns, loadConfig, saveConfig, DEFAULT_CONFIG,
 } from './db.js';
@@ -227,6 +228,55 @@ export async function handleAgentApi(request, env, ctx, pathname) {
       await clearCredentials(db);
       await audit(db, null, 'warn', 'credentials', 'Vault credenziali svuotato');
       return json({ credentials: describeCredentials(await resolveCredentials(db, env)) });
+    }
+  }
+
+  // GET /agent/instruments?q=...  — ricerca nel catalogo eToro
+  if (route === 'instruments' && method === 'GET') {
+    const term = new URL(request.url).searchParams.get('q') ?? '';
+    const { values: credentials } = await resolveCredentials(db, env);
+    if (!credentials.etoroApiKey || !credentials.etoroUserKey) return json({ error: 'credenziali eToro non configurate' }, 400);
+    try {
+      const client = new EtoroClient({ apiKey: credentials.etoroApiKey, userKey: credentials.etoroUserKey });
+      return json({ results: (await client.searchInstruments(term)).slice(0, 25) });
+    } catch (error) {
+      return json({ error: error instanceof Error ? error.message : String(error) }, 502);
+    }
+  }
+
+  // GET /agent/agent-portfolios
+  if (route === 'agent-portfolios' && method === 'GET') {
+    const { values: credentials } = await resolveCredentials(db, env);
+    if (!credentials.etoroApiKey || !credentials.etoroUserKey) return json({ error: 'credenziali eToro non configurate' }, 400);
+    try {
+      const client = new EtoroClient({ apiKey: credentials.etoroApiKey, userKey: credentials.etoroUserKey });
+      const portfolios = await client.agentPortfolios();
+      return json({ portfolios: portfolios.map(({ raw, ...rest }) => { void raw; return rest; }) });
+    } catch (error) {
+      return json({ error: error instanceof Error ? error.message : String(error) }, 502);
+    }
+  }
+
+  // POST /agent/agent-token { agentPortfolioId }
+  // Genera un nuovo token operativo e lo salva nel vault senza mai restituirlo.
+  if (route === 'agent-token' && method === 'POST') {
+    const agentPortfolioId = String(body.agentPortfolioId ?? '').trim();
+    if (!agentPortfolioId) return json({ error: 'agentPortfolioId obbligatorio' }, 400);
+    const { values: credentials } = await resolveCredentials(db, env);
+    if (!credentials.etoroApiKey || !credentials.etoroUserKey) return json({ error: 'credenziali eToro non configurate' }, 400);
+    try {
+      const client = new EtoroClient({ apiKey: credentials.etoroApiKey, userKey: credentials.etoroUserKey });
+      const { token, name } = await client.createAgentUserToken(agentPortfolioId);
+      await saveCredentials(db, env, { etoroAgentToken: token });
+      await audit(db, null, 'warn', 'credentials', `Nuovo token Agent Portfolio generato e salvato (${name})`, { agentPortfolioId });
+      return json({
+        ok: true,
+        tokenName: name,
+        hint: `••••${token.slice(-4)}`,
+        credentials: describeCredentials(await resolveCredentials(db, env)),
+      });
+    } catch (error) {
+      return json({ error: error instanceof Error ? error.message : String(error) }, 502);
     }
   }
 

@@ -91,18 +91,27 @@ export async function runDiagnostics(resolved, config) {
   // --- Risoluzione dell'universo -----------------------------------------
   if (readClient) {
     const resolvedSymbols = [];
+    const approximate = [];
     const missing = [];
     for (const entry of config.whitelist) {
       try {
         const found = await readClient.searchInstrument(entry.symbol);
-        if (found?.instrumentId) resolvedSymbols.push(entry.symbol); else missing.push(entry.symbol);
-      } catch { missing.push(entry.symbol); }
+        if (!found?.instrumentId) missing.push(entry.symbol);
+        else if (found.exact) resolvedSymbols.push(`${entry.symbol}→#${found.instrumentId}`);
+        else approximate.push(`${entry.symbol} risolto come ${found.matchedAs} (#${found.instrumentId})`);
+      } catch (error) {
+        missing.push(`${entry.symbol} (${error.message})`);
+      }
     }
+    const detail = [
+      resolvedSymbols.length ? `${resolvedSymbols.length} esatti` : null,
+      approximate.length ? `${approximate.length} approssimati: ${approximate.join('; ')}` : null,
+    ].filter(Boolean).join(' · ');
     checks.push(missing.length === 0
-      ? ok('etoro.universe', 'Universo strumenti', `${resolvedSymbols.length} simboli risolti su eToro`)
+      ? ok('etoro.universe', 'Universo strumenti', detail || 'nessuno strumento in whitelist')
       : ko('etoro.universe', 'Universo strumenti',
-          `non risolti: ${missing.join(', ')}`,
-          'Rimuovili dalla whitelist o correggi il ticker: eToro non li riconosce.'));
+          `non risolti: ${missing.join(', ')}${detail ? ` — ${detail}` : ''}`,
+          'Usa la ricerca nel tab Strategia: cerca il nome dello strumento e scegli la voce giusta dal catalogo eToro, invece di scrivere il ticker a mano.'));
   }
 
   // --- OpenRouter ---------------------------------------------------------

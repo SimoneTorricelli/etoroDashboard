@@ -123,6 +123,23 @@ export interface RunBundle {
   logs: Array<{ at: number; level: string; stage: string; message: string }>;
 }
 
+export interface InstrumentHit {
+  instrumentId: number;
+  symbol: string;
+  aliases: string[];
+  name: string;
+  assetClass: string;
+  currency: string;
+  price: number | null;
+}
+
+export interface AgentPortfolioSummary {
+  id: string;
+  name: string;
+  virtualBalanceUsd: number;
+  createdAt: string;
+}
+
 export interface DiagnosticCheck {
   id: string;
   label: string;
@@ -223,4 +240,12 @@ export const autopilot = {
   clearCredentials: () => call<{ credentials: CredentialStatus[] }>('/agent/credentials', { method: 'DELETE' }),
   testNotifications: () => call<{ sent: number; attempted: number; checks: DiagnosticCheck[] }>('/agent/notify-test', { method: 'POST', body: '{}' }),
   diagnose: () => call<DiagnosticsReport>('/agent/diagnose', { method: 'POST', body: '{}' }),
+  searchInstruments: (query: string) =>
+    call<{ results: InstrumentHit[] }>(`/agent/instruments?q=${encodeURIComponent(query)}`),
+  agentPortfolios: () => call<{ portfolios: AgentPortfolioSummary[] }>('/agent/agent-portfolios'),
+  generateAgentToken: (agentPortfolioId: string) =>
+    call<{ ok: true; tokenName: string; hint: string; credentials: CredentialStatus[] }>('/agent/agent-token', {
+      method: 'POST',
+      body: JSON.stringify({ agentPortfolioId }),
+    }),
 };

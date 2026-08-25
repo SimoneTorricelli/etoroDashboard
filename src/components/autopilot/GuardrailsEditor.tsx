@@ -16,7 +16,18 @@ import { Separator } from '@/components/ui/separator';
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select';
-import { autopilot, type AutopilotConfig, type WhitelistEntry } from '@/lib/agent/autopilot-api';
+import { InstrumentSearch } from '@/components/autopilot/InstrumentSearch';
+import { autopilot, type AutopilotConfig, type InstrumentHit, type WhitelistEntry } from '@/lib/agent/autopilot-api';
+
+/** eToro classifica gli strumenti con etichette libere: le normalizziamo. */
+function inferClass(assetClass: string, name: string): WhitelistEntry['class'] {
+  const text = `${assetClass} ${name}`.toLowerCase();
+  if (/crypto|coin|token|bitcoin|ethereum/.test(text)) return 'crypto';
+  if (/etf|index|fund/.test(text)) return 'etf';
+  if (/bond|treasury|gilt/.test(text)) return 'bond';
+  if (/gold|silver|oil|commodit|natural gas/.test(text)) return 'commodity';
+  return 'stock';
+}
 
 const WEEKDAYS = ['Lunedì', 'Martedì', 'Mercoledì', 'Giovedì', 'Venerdì', 'Sabato', 'Domenica'];
 const CLASSES: WhitelistEntry['class'][] = ['etf', 'stock', 'bond', 'commodity', 'crypto'];
@@ -230,7 +241,7 @@ export function GuardrailsEditor({ config, onSaved }: Props) {
               </Badge>
               <Button variant="outline" size="sm"
                 onClick={() => set('whitelist', [...draft.whitelist, { symbol: '', name: '', class: 'etf', maxWeight: 0.2 }])}>
-                <Plus className="size-4" /> Aggiungi
+                <Plus className="size-4" /> Riga vuota
               </Button>
             </div>
           </div>
@@ -238,6 +249,16 @@ export function GuardrailsEditor({ config, onSaved }: Props) {
             L’AI può proporre solo questi ticker. Qualunque simbolo fuori lista fa scartare l’intera proposta.
             Il tetto è il peso massimo che quello strumento può raggiungere in portafoglio. La somma dei tetti deve superare il 100%, altrimenti l’allocazione non è realizzabile.
           </p>
+
+          <InstrumentSearch
+            existing={draft.whitelist.map((item) => item.symbol)}
+            onPick={(hit: InstrumentHit) => set('whitelist', [...draft.whitelist, {
+              symbol: hit.aliases[0] ?? hit.symbol,
+              name: hit.name,
+              class: inferClass(hit.assetClass, hit.name),
+              maxWeight: 0.2,
+            }])}
+          />
 
           <div className="space-y-2">
             {draft.whitelist.map((entry, index) => (

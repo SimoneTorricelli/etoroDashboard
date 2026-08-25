@@ -14,6 +14,7 @@ import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Separator } from '@/components/ui/separator';
+import { AgentTokenGenerator } from '@/components/autopilot/AgentTokenGenerator';
 import { autopilot, type CredentialKey, type CredentialStatus } from '@/lib/agent/autopilot-api';
 
 const GROUPS: Array<{ title: string; description: string; keys: CredentialKey[] }> = [
@@ -126,6 +127,7 @@ export function CredentialsSection({ credentials, notificationsActive, onChanged
                 );
               })}
             </div>
+            {group.title === 'eToro' && <AgentTokenGenerator onGenerated={onChanged} />}
             <Separator />
           </div>
         ))}

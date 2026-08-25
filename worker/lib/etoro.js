@@ -129,18 +129,109 @@ export class EtoroClient {
     };
   }
 
-  async searchInstrument(symbol) {
-    const data = await this.request('v1', `market-data/search?internalSymbolFull=${encodeURIComponent(symbol)}`);
-    const rows = recordList(pick(asRecord(data), 'instruments', 'Instruments', 'data', 'Data'))
-      .concat(Array.isArray(data) ? data : []);
-    const first = rows[0];
-    if (!first) return null;
+  /** Estrae le righe da qualunque forma di risposta della ricerca. */
+  static searchRows(data) {
+    if (Array.isArray(data)) return recordList(data);
+    const record = asRecord(data);
+    for (const key of ['instruments', 'Instruments', 'results', 'Results', 'items', 'Items', 'data', 'Data']) {
+      const value = record[key];
+      if (Array.isArray(value)) return recordList(value);
+      // Alcune risposte annidano l'array un livello più sotto.
+      if (value && typeof value === 'object') {
+        for (const inner of Object.values(value)) {
+          if (Array.isArray(inner)) return recordList(inner);
+        }
+      }
+    }
+    return [];
+  }
+
+  static rowSymbols(raw) {
+    return [
+      pick(raw, 'internalSymbolFull', 'InternalSymbolFull'),
+      pick(raw, 'symbolFull', 'SymbolFull'),
+      pick(raw, 'symbol', 'Symbol'),
+      pick(raw, 'ticker', 'Ticker'),
+    ].filter(Boolean).map((value) => String(value).toUpperCase());
+  }
+
+  static toInstrument(raw) {
+    const id = num(pick(raw, 'instrumentId', 'InstrumentID', 'instrumentID', 'InstrumentId', 'id', 'Id'));
+    if (!id) return null;
+    const symbols = EtoroClient.rowSymbols(raw);
     return {
-      symbol,
-      instrumentId: num(pick(first, 'instrumentId', 'InstrumentID', 'InstrumentId', 'id')),
-      name: String(pick(first, 'instrumentDisplayName', 'InstrumentDisplayName', 'name', 'Name') ?? symbol),
-      assetClass: String(pick(first, 'instrumentTypeDescription', 'InstrumentTypeDescription', 'assetClass') ?? ''),
+      instrumentId: id,
+      symbol: symbols[0] ?? `#${id}`,
+      aliases: symbols,
+      name: String(pick(raw, 'instrumentDisplayName', 'InstrumentDisplayName', 'name', 'Name') ?? symbols[0] ?? `#${id}`),
+      assetClass: String(pick(raw, 'instrumentTypeDescription', 'InstrumentTypeDescription', 'assetClass', 'AssetClass') ?? ''),
+      currency: String(pick(raw, 'currency', 'Currency') ?? 'USD'),
+      price: num(pick(raw, 'currentRate', 'CurrentRate', 'lastExecution')) || null,
     };
+  }
+
+  /**
+   * Ricerca strumenti con più strategie di query: eToro accetta parametri
+   * diversi a seconda dell'endpoint, e una sola forma non basta.
+   */
+  async searchInstruments(term) {
+    const query = String(term ?? '').trim();
+    if (!query) return [];
+    const attempts = [
+      `market-data/search?internalSymbolFull=${encodeURIComponent(query)}`,
+      `market-data/search?symbols=${encodeURIComponent(query)}`,
+      `market-data/search?query=${encodeURIComponent(query)}`,
+      `market-data/search?searchText=${encodeURIComponent(query)}`,
+      `market-data/search?name=${encodeURIComponent(query)}`,
+    ];
+    const seen = new Map();
+    for (const path of attempts) {
+      let rows = [];
+      try {
+        rows = EtoroClient.searchRows(await this.request('v1', path));
+      } catch {
+        continue;
+      }
+      for (const raw of rows) {
+        const instrument = EtoroClient.toInstrument(raw);
+        if (instrument && !seen.has(instrument.instrumentId)) seen.set(instrument.instrumentId, instrument);
+      }
+      // Con una corrispondenza esatta si può smettere di provare altre forme.
+      const wanted = query.toUpperCase();
+      if ([...seen.values()].some((item) => item.aliases.includes(wanted))) break;
+    }
+    const wanted = query.toUpperCase();
+    return [...seen.values()].sort((a, b) => {
+      const scoreA = a.aliases.includes(wanted) ? 0 : a.aliases.some((alias) => alias.startsWith(wanted)) ? 1 : 2;
+      const scoreB = b.aliases.includes(wanted) ? 0 : b.aliases.some((alias) => alias.startsWith(wanted)) ? 1 : 2;
+      return scoreA - scoreB;
+    });
+  }
+
+  /**
+   * Risoluzione di un ticker in instrumentId. Prova il simbolo così com'è, poi
+   * le varianti comuni (senza suffisso di borsa, con suffisso USD per le crypto).
+   */
+  async searchInstrument(symbol) {
+    const original = String(symbol ?? '').trim().toUpperCase();
+    if (!original) return null;
+    const variants = [...new Set([
+      original,
+      original.split('.')[0],
+      original.replace(/\.[A-Z]+$/, ''),
+      `${original}USD`,
+      original.replace(/USD$/, ''),
+    ])].filter(Boolean);
+
+    for (const variant of variants) {
+      const candidates = await this.searchInstruments(variant);
+      const exact = candidates.find((item) => item.aliases.includes(variant));
+      if (exact) return { ...exact, symbol: original, matchedAs: exact.aliases[0], exact: true };
+      if (candidates.length && variant === original) {
+        return { ...candidates[0], symbol: original, matchedAs: candidates[0].aliases[0], exact: false };
+      }
+    }
+    return null;
   }
 
   async instruments(ids) {
@@ -280,11 +371,35 @@ export class EtoroClient {
 
   async agentPortfolios() {
     const data = await this.request('v1', 'agent-portfolios');
-    return recordList(pick(asRecord(data), 'agentPortfolios', 'AgentPortfolios', 'data') ?? data)
-      .map((raw) => ({
-        id: String(pick(raw, 'agentPortfolioId', 'id', 'Id') ?? ''),
-        name: String(pick(raw, 'name', 'Name') ?? ''),
-        virtualBalanceUsd: num(pick(raw, 'virtualBalance', 'VirtualBalance')),
-      }));
+    const rows = EtoroClient.searchRows(data);
+    return rows.map((raw) => {
+      const id = String(pick(raw, 'agentPortfolioId', 'AgentPortfolioId', 'portfolioId', 'id', 'Id') ?? '');
+      const name = String(pick(raw, 'name', 'Name', 'displayName', 'DisplayName', 'portfolioName', 'PortfolioName', 'title', 'Title') ?? '');
+      return {
+        id,
+        name: name || `Portfolio ${id.slice(0, 8)}`,
+        virtualBalanceUsd: num(pick(raw, 'virtualBalance', 'VirtualBalance', 'balance', 'Balance')),
+        createdAt: String(pick(raw, 'createdAt', 'CreatedAt', 'creationDate') ?? ''),
+        raw,
+      };
+    }).filter((item) => item.id);
+  }
+
+  /**
+   * Genera un nuovo user-token per un Agent Portfolio esistente.
+   * eToro mostra il segreto una sola volta: va salvato immediatamente.
+   */
+  async createAgentUserToken(agentPortfolioId, tokenName = `autopilot-${Date.now()}`) {
+    const data = await this.request('v2', `agent-portfolios/${encodeURIComponent(agentPortfolioId)}/user-tokens`, {
+      method: 'POST',
+      body: { name: tokenName },
+    });
+    const root = asRecord(pick(asRecord(data), 'data', 'Data', 'userToken', 'UserToken') ?? data);
+    const direct = pick(root, 'userTokenValue', 'UserTokenValue', 'tokenValue', 'TokenValue', 'userToken', 'UserToken', 'token', 'Token', 'value', 'Value');
+    if (typeof direct === 'string' && direct.trim()) return { token: direct.trim(), name: tokenName };
+    const nested = asRecord(direct);
+    const nestedValue = pick(nested, 'userTokenValue', 'UserTokenValue', 'tokenValue', 'TokenValue', 'value', 'Value');
+    if (typeof nestedValue === 'string' && nestedValue.trim()) return { token: nestedValue.trim(), name: tokenName };
+    throw new EtoroError('eToro non ha restituito il valore del token', 502, data);
   }
 }
