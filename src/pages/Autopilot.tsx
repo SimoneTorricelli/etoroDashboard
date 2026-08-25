@@ -193,7 +193,6 @@ export default function Autopilot() {
           id: portfolio.id,
           name: portfolio.name,
           subtitle: portfolio.id === activeId && verified ? 'Agent Portfolio verificato' : 'Agent Portfolio esistente',
-          virtualBalanceUsd: portfolio.virtualBalanceUsd,
           status: portfolio.id === activeId && verified ? 'connected' : 'needs-token',
         })));
       })

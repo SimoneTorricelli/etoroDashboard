@@ -91,6 +91,8 @@ test('prompt compatto sotto i 6000 caratteri', () => {
   const prompt = renderFeaturesPrompt(features, config);
   assert.ok(prompt.length < 6000, `prompt di ${prompt.length} caratteri`);
   assert.ok(prompt.includes('STRUMENTI'));
+  assert.ok(prompt.includes('fascia_capitale='));
+  assert.ok(!prompt.includes(`equity=${features.portfolio.equityUsd}`), 'non espone il capitale esatto ai provider AI');
 });
 
 test('router AI: alterna i provider prima dei modelli secondari', () => {

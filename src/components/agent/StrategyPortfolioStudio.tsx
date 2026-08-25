@@ -352,7 +352,7 @@ export function StrategyPortfolioStudio({
     const remoteMatch = remote.find((item) => item.id === portfolio.etoroAgentPortfolioId);
     const virtualBalanceUsd = portfolio.virtualBalanceUsd ?? remoteMatch?.virtualBalanceUsd ?? 0;
     if (!(virtualBalanceUsd > 0)) {
-      toast.error('Saldo virtuale Agent non disponibile', { description: 'Premi “Leggi da eToro” e riprova.' });
+      toast.error('Dati operativi Agent non disponibili', { description: 'Premi “Leggi da eToro” e riprova.' });
       return;
     }
     setPlanningId(portfolio.id);
@@ -675,7 +675,7 @@ export function StrategyPortfolioStudio({
             <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
               {remote.map((item) => (
                 <div key={item.id} className="rounded-lg border border-hairline bg-bg-1 px-3 py-3">
-                  <div className="flex items-start justify-between gap-3"><div className="min-w-0"><p className="truncate text-caption font-medium text-text-0">{item.name}</p><p className="truncate font-mono text-micro text-text-2">ID {item.id}</p>{item.virtualBalanceUsd ? <p className="mt-1 text-micro text-text-2">Saldo virtuale {money(item.virtualBalanceUsd, 'USD')}</p> : null}{item.createdAt ? <p className="mt-1 text-micro text-text-2">Creato {new Date(item.createdAt).toLocaleString('it-IT')}</p> : null}</div><span className="shrink-0 rounded-full bg-gain/10 px-2 py-1 text-micro text-gain">Su eToro</span></div>
+                  <div className="flex items-start justify-between gap-3"><div className="min-w-0"><p className="truncate text-caption font-medium text-text-0">{item.name}</p><p className="truncate font-mono text-micro text-text-2">ID {item.id}</p>{item.createdAt ? <p className="mt-1 text-micro text-text-2">Creato {new Date(item.createdAt).toLocaleString('it-IT')}</p> : null}</div><span className="shrink-0 rounded-full bg-gain/10 px-2 py-1 text-micro text-gain">Su eToro</span></div>
                   {portfolios.some((portfolio) => portfolio.etoroAgentPortfolioId === item.id) ? <p className="mt-2 flex items-center gap-1.5 text-micro text-gain"><Check className="h-3.5 w-3.5" aria-hidden /> Associato a Torri</p> : <div className="mt-3 flex gap-2"><select aria-label={`Strategia locale da associare a ${item.name}`} value={remoteBindings[item.id] ?? ''} onChange={(event) => setRemoteBindings((current) => ({ ...current, [item.id]: event.target.value }))} className="min-w-0 flex-1 rounded-md border border-hairline-strong bg-bg-0 px-2 py-1.5 text-micro text-text-1"><option value="">Associa a…</option>{portfolios.filter((portfolio) => !portfolio.etoroAgentPortfolioId).map((portfolio) => <option key={portfolio.id} value={portfolio.id}>{portfolio.name} · {getStrategyTemplate(portfolio.templateId).name}</option>)}</select><button type="button" disabled={!remoteBindings[item.id]} onClick={() => bindRemotePortfolio(item)} className="rounded-md border border-agent/40 px-2 py-1.5 text-micro font-medium text-agent hover:bg-agent/10 disabled:opacity-40">Collega</button></div>}
                 </div>
               ))}
@@ -772,19 +772,19 @@ export function StrategyPortfolioStudio({
             </DialogHeader>
             <div className="grid gap-2 sm:grid-cols-4">
               <Metric label="Capitale collegato" value={money(fromUsd(orderPlan.mirrorBudgetUsd), displayCurrency)} />
-              <Metric label="Saldo virtuale Agent" value={money(orderPlan.virtualBalanceUsd, 'USD')} />
-              <Metric label="Scala mirror" value={`${orderPlan.scale.toLocaleString('it-IT', { maximumFractionDigits: 1 })}×`} />
+              <Metric label="Capitale da investire" value={money(fromUsd(orderPlan.orders.reduce((sum, item) => sum + item.mirrorAmountUsd, 0)), displayCurrency)} />
+              <Metric label="Asset previsti" value={String(orderPlan.orders.length)} />
               <Metric label="Liquidità prevista" value={`${orderPlan.cashReservePct}%`} />
             </div>
             <div className="overflow-x-auto rounded-xl border border-hairline bg-bg-1">
-              <div className="grid min-w-[640px] grid-cols-[1.1fr_auto_auto_1fr] gap-3 border-b border-hairline px-3 py-2 text-micro uppercase tracking-wide text-text-2"><span>Asset / peso</span><span>Impatto reale</span><span>Ordini virtuali</span><span>Controllo eToro</span></div>
+              <div className="grid min-w-[640px] grid-cols-[1.1fr_auto_auto_1fr] gap-3 border-b border-hairline px-3 py-2 text-micro uppercase tracking-wide text-text-2"><span>Asset / peso</span><span>Importo reale</span><span>Invio</span><span>Controllo eToro</span></div>
               {orderPlan.orders.map((item) => {
                 const check = planValidation?.checks.find((candidate) => candidate.instrumentId === item.instrumentId);
                 return (
                   <div key={item.symbol} className="grid min-w-[640px] grid-cols-[1.1fr_auto_auto_1fr] items-center gap-3 border-b border-hairline px-3 py-3 last:border-b-0">
                     <div><p className="font-mono text-caption font-medium text-text-0">{item.symbol} · {item.weightPct.toFixed(1).replace('.', ',')}%</p><p className="text-micro text-text-2">Instrument ID {item.instrumentId}</p></div>
                     <span className="font-mono text-caption text-text-0">{money(fromUsd(item.mirrorAmountUsd), displayCurrency)}</span>
-                    <span className="text-right font-mono text-caption text-agent">{item.chunks.length} · {money(item.virtualAmountUsd, 'USD')}</span>
+                    <span className="text-right font-mono text-caption text-agent">{item.chunks.length} {item.chunks.length === 1 ? 'ordine' : 'ordini'}</span>
                     <div className={cn('text-micro', !check ? 'text-text-2' : check.eligible ? 'text-gain' : 'text-loss')}>
                       {validatingPlan && !check ? 'Verifica…' : check ? check.detail : 'Da verificare'}
                       {check && check.minPositionExposureUsd > 0 ? <span className="block text-text-2">Minimo {money(check.minPositionExposureUsd, 'USD')}</span> : null}
@@ -796,8 +796,8 @@ export function StrategyPortfolioStudio({
             {orderPlan.unresolvedSymbols.length > 0 && <div className="rounded-lg border border-loss/35 bg-loss/5 p-3 text-caption text-loss">Strumenti non risolti: {orderPlan.unresolvedSymbols.join(', ')}. Nessun ordine può essere inviato finché il piano non è completo.</div>}
             {orderPlan.totalOrders > planPortfolio.maxOrdersPerDay && <div className="rounded-lg border border-warn/35 bg-warn/5 p-3 text-caption text-warn">Il piano richiede {orderPlan.totalOrders} ordini, ma il limite giornaliero è {planPortfolio.maxOrdersPerDay}. Aumenta il limite o il massimo per singola entrata prima di procedere.</div>}
             <div className="rounded-xl border border-info/25 bg-info/5 p-3 text-caption text-text-1">
-              <p className="font-medium text-info">Perché gli importi virtuali sono grandi?</p>
-              <p className="mt-1 leading-relaxed">eToro assegna all’Agent un saldo virtuale fisso. Il tuo investimento reale lo copia in proporzione: per esempio, un acquisto virtuale del 25% produce circa il 25% anche sui {money(fromUsd(planPortfolio.budgetUsd), displayCurrency)} collegati.</p>
+              <p className="font-medium text-info">Come vengono inviati gli ordini?</p>
+              <p className="mt-1 leading-relaxed">Torri decide e mostra sempre pesi e importi reali. La conversione tecnica richiesta dall’Agent Portfolio avviene solo al momento dell’invio, senza alterare l’allocazione percentuale.</p>
             </div>
             {!loadAgentSessionToken(planPortfolio.etoroAgentPortfolioId ?? '') ? (
               <div className="space-y-2 rounded-xl border border-warn/30 bg-warn/5 p-3">
@@ -818,7 +818,7 @@ export function StrategyPortfolioStudio({
             {executionResult ? <div className="space-y-3 rounded-xl border border-hairline bg-bg-1 p-3">
               <div className="flex flex-wrap items-center justify-between gap-2"><div><p className="text-caption font-medium text-text-0">Esito inizializzazione</p><p className="text-micro text-text-2">{executionResult.filled} eseguiti · {executionResult.partial} parziali · {executionResult.pending} in attesa · {executionResult.failed} non riusciti · residuo reale stimato {money(fromUsd(executionResult.residualMirrorUsd), displayCurrency)}</p></div><button type="button" onClick={() => void checkExecutionStatus()} disabled={checkingOrders || executionResult.ok} className="inline-flex items-center gap-1.5 rounded-lg border border-info/40 px-2.5 py-1.5 text-micro text-info hover:bg-info/10 disabled:opacity-40">{checkingOrders ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <RefreshCw className="h-3.5 w-3.5" aria-hidden />} Ricontrolla esecuzioni</button></div>
               <div className="divide-y divide-hairline rounded-lg border border-hairline bg-bg-0">
-                {executionResult.receipts.map((receipt, index) => <div key={`${receipt.referenceId}-${index}`} className="grid gap-1 px-3 py-2 text-micro sm:grid-cols-[1fr_auto]"><div><span className="font-mono font-medium text-text-0">{receipt.symbol}</span><span className="ml-2 text-text-2">{receipt.orderId ? `Ordine #${receipt.orderId}` : receipt.statusLabel}</span>{receipt.error ? <p className="mt-0.5 text-loss">{receipt.error}</p> : null}</div><div className={cn('font-mono', receipt.status === 'filled' ? 'text-gain' : receipt.status === 'pending' || receipt.status === 'accepted' || receipt.status === 'partially-filled' ? 'text-warn' : 'text-loss')}>{money(receipt.filledVirtualAmountUsd, 'USD')} / {money(receipt.requestedVirtualAmountUsd, 'USD')} · {receipt.statusLabel}</div></div>)}
+                {executionResult.receipts.map((receipt, index) => <div key={`${receipt.referenceId}-${index}`} className="grid gap-1 px-3 py-2 text-micro sm:grid-cols-[1fr_auto]"><div><span className="font-mono font-medium text-text-0">{receipt.symbol}</span><span className="ml-2 text-text-2">{receipt.orderId ? `Ordine #${receipt.orderId}` : receipt.statusLabel}</span>{receipt.error ? <p className="mt-0.5 text-loss">{receipt.error}</p> : null}</div><div className={cn('font-mono', receipt.status === 'filled' ? 'text-gain' : receipt.status === 'pending' || receipt.status === 'accepted' || receipt.status === 'partially-filled' ? 'text-warn' : 'text-loss')}>{money(fromUsd(receipt.filledVirtualAmountUsd / orderPlan.scale), displayCurrency)} / {money(fromUsd(receipt.requestedVirtualAmountUsd / orderPlan.scale), displayCurrency)} · {receipt.statusLabel}</div></div>)}
               </div>
               {executionResult.ok ? <p className="flex items-center gap-1.5 text-caption text-gain"><Check className="h-4 w-4" aria-hidden /> Inizializzazione completata: il portafoglio è ora attivo.</p> : <p className="text-micro text-warn">Il portafoglio resta “in attesa di inizializzazione”. Non vengono reinviati automaticamente gli ordini residui: prima controlla l’esito su eToro.</p>}
             </div> : null}

@@ -59,7 +59,6 @@ export interface StrategyOnboardingPortfolio {
   id: string;
   name: string;
   subtitle?: string;
-  virtualBalanceUsd?: number;
   status?: 'connected' | 'needs-token' | 'unavailable';
 }
 
@@ -618,7 +617,7 @@ export function StrategyOnboarding({
                       onChange={(event) => patchAnswers('budgetEur', Math.max(0, Number(event.target.value)))}
                     />
                   </div>
-                  <small>Inserisci quanto hai realmente investito nel copy dell’Agent Portfolio (es. 200 €), non i 10.000 USD virtuali mostrati da eToro.</small>
+                  <small>Questo valore aiuta a creare la strategia; durante ogni run il capitale viene aggiornato dal portfolio reale collegato.</small>
                 </div>
               </div>
 
