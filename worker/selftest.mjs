@@ -13,8 +13,8 @@ import {
   prioritizeUntriedPlan, selectDiverseAttemptPlan,
 } from './lib/brain.js';
 import {
-  acquirePipelineLock, armLiveIfUnchanged, DEFAULT_CONFIG, findLiveRecoveryBarrier,
-  finishRunIfLiveFence, listStalePreArmActivations, mutateSafetyConfig, releasePipelineLock, renewPipelineLock,
+  acquirePipelineLock, armLiveIfUnchanged, armRecoveryLiveIfUnchanged, DEFAULT_CONFIG, findLiveRecoveryBarrier,
+  finishRecoveryToShadowIfUnchanged, finishRunIfLiveFence, listStalePreArmActivations, mutateSafetyConfig, releasePipelineLock, renewPipelineLock,
 } from './lib/db.js';
 import { PROFILES, applyProfile, describeProfile, listProfiles } from './lib/profiles.js';
 import { checkChurnRules, filterMarginalSubstitutions, isWorthTheCost } from './lib/churn.js';
@@ -35,7 +35,7 @@ import {
 } from './lib/llm.js';
 import {
   buildCandleRefreshQueue, buildFailedProposalRetryContext, capitalTrackingResetReason, decideKind, romeParts,
-  freezeLiveRun, resolveVerifiedAgentMirror, runPipeline, runWatcher, scaleAgentSnapshotToReal,
+  freezeLiveRun, recoveryResidualPreview, recoverySnapshotsStable, resolveVerifiedAgentMirror, runPipeline, runWatcher, scaleAgentSnapshotToReal,
   shortlistDeploymentCapacity,
 } from './lib/pipeline.js';
 import { buildStrategyActivationNotification } from './lib/notify.js';
@@ -264,6 +264,52 @@ function createSafetyDb(initialConfig = {}, {
             state.vaultValue = value;
             state.vaultUpdatedAt = nextUpdatedAt;
             return { value, updated_at: nextUpdatedAt };
+          }
+          if (sql.startsWith('UPDATE config') && sql.includes('{"executionMode":"live","frozen":false') && sql.includes('RETURNING value')) {
+            const [,, expectedSafetyRevision, expectedDecisionRevision, portfolioId, fingerprint, verifiedAt] = this.args;
+            if (
+              state.config.executionMode !== 'shadow'
+              || !state.config.frozen
+              || !state.config.recoveryRequired
+              || Number(state.config.safetyRevision) !== Number(expectedSafetyRevision)
+              || Number(state.config.decisionRevision) !== Number(expectedDecisionRevision)
+              || String(state.config.activeAgentPortfolioId ?? '') !== String(portfolioId)
+              || String(state.config.agentTokenFingerprint ?? '') !== String(fingerprint)
+              || Number(state.config.agentTokenVerifiedAt ?? 0) !== Number(verifiedAt)
+            ) return null;
+            state.config = {
+              ...state.config,
+              executionMode: 'live',
+              frozen: false,
+              frozenReason: '',
+              recoveryRequired: false,
+              recoveryReason: '',
+              recoveryRunIds: [],
+              recoveryUpdatedAt: 0,
+              safetyRevision: Number(state.config.safetyRevision ?? 0) + 1,
+            };
+            state.mutationQueries.push({ sql, args: this.args });
+            return { value: JSON.stringify(state.config) };
+          }
+          if (sql.startsWith('UPDATE config') && sql.includes('{"executionMode":"shadow","frozen":false') && !sql.includes('OR ? = 1') && sql.includes('RETURNING value')) {
+            const [,, expectedSafetyRevision, expectedDecisionRevision, portfolioId, fingerprint, verifiedAt] = this.args;
+            if (
+              state.config.executionMode !== 'live'
+              || state.config.frozen
+              || state.config.recoveryRequired
+              || Number(state.config.safetyRevision) !== Number(expectedSafetyRevision)
+              || Number(state.config.decisionRevision) !== Number(expectedDecisionRevision)
+              || String(state.config.activeAgentPortfolioId ?? '') !== String(portfolioId)
+              || String(state.config.agentTokenFingerprint ?? '') !== String(fingerprint)
+              || Number(state.config.agentTokenVerifiedAt ?? 0) !== Number(verifiedAt)
+            ) return null;
+            state.config = {
+              ...state.config,
+              executionMode: 'shadow',
+              safetyRevision: Number(state.config.safetyRevision ?? 0) + 1,
+            };
+            state.mutationQueries.push({ sql, args: this.args });
+            return { value: JSON.stringify(state.config) };
           }
           if (sql.startsWith('UPDATE config') && sql.includes('recoveryRequired":false') && sql.includes('RETURNING value')) {
             const [,, expectedSafetyRevision, recoveryConfirmed] = this.args;
@@ -1633,6 +1679,52 @@ test('guardrail: il portafoglio iniziale mira alle posizioni preferite e rispett
   assert.equal(result.plan.executionScale, 20);
 });
 
+test('guardrail: la recovery della costruzione iniziale completa il residuo senza riapplicare il turnover ricorrente', () => {
+  const partialFeatures = {
+    portfolio: { equityUsd: 500, cashUsd: 300, openPositions: 1, cashWeight: 0.6, executionScale: 20 },
+    instruments: [{
+      symbol: 'SPY', instrumentId: 101, class: 'etf', maxWeight: 1,
+      weight: 0.4, valueUsd: 200, investedUsd: 200, pnlUsd: 0, pnlPct: 0,
+      positionIds: [1001],
+    }],
+  };
+  const recoveryConfig = {
+    ...DEFAULT_CONFIG,
+    frozen: false,
+    minConfidence: 0.5,
+    minHoldings: 1,
+    maxHoldings: 2,
+    minCashPct: 0.1,
+    maxCashPct: 0.1,
+    targetDeploymentPct: 0.9,
+    maxTurnoverPct: 0.1,
+    maxOrdersPerRun: 4,
+    maxOrdersPerDay: 20,
+    minOrderUsd: 1,
+    maxOrderUsd: 100_000,
+    maxOrderPctOfCapital: 1,
+    minRebalanceBandAbs: 0.001,
+    minRebalanceBandRel: 0.01,
+    transactionCostBps: 0,
+    maxWeightPerClass: { etf: 1, cash: 1 },
+    whitelist: [{ symbol: 'SPY', name: 'SPY', class: 'etf', maxWeight: 1 }],
+  };
+  const proposal = {
+    targetWeights: { SPY: 0.9, CASH: 0.1 }, confidence: 0.9,
+    rationale: '', risks: [], watch: [],
+  };
+  const normal = validateProposal({ proposal, features: partialFeatures, config: recoveryConfig });
+  const recovery = validateProposal({
+    proposal,
+    features: partialFeatures,
+    config: recoveryConfig,
+    initialConstructionOverride: true,
+  });
+  assert.equal(normal.plan.orders[0].amountUsd, 50);
+  assert.equal(recovery.plan.orders[0].amountUsd, 250);
+  assert.equal(recovery.plan.orders[0].symbol, 'SPY');
+});
+
 test('guardrail: freeze blocca sempre', () => {
   const proposal = { targetWeights: { SPY: 0.4, CASH: 0.6 }, confidence: 0.9, rationale: '', risks: [], watch: [] };
   const result = validateProposal({ proposal, features, config: { ...config, frozen: true, frozenReason: 'test' } });
@@ -1910,6 +2002,83 @@ test('reconcile: confronta gli ordini scalati, non il target teorico', async () 
   assert.equal(result.ok, true);
 });
 
+test('reconcile: aspetta che il portfolio rifletta gli acquisti prima del fail-safe', async () => {
+  let reads = 0;
+  const plan = {
+    equityUsd: 1_000,
+    deltas: [{ symbol: 'SPY', instrumentId: 1001, currentWeight: 0, targetWeight: 0.1 }],
+    orders: [{ symbol: 'SPY', instrumentId: 1001, side: 'buy', amountUsd: 100 }],
+  };
+  const result = await reconcile({
+    client: {
+      portfolio: async () => {
+        reads += 1;
+        return {
+          equityUsd: 1_000,
+          positions: reads === 1 ? [] : [{ instrumentId: 1001, valueUsd: 100 }],
+        };
+      },
+    },
+    plan,
+    config: { reconcileTolerancePct: 0.01 },
+    portfolioUserKey: 'verified-agent-portfolio',
+    maxAttempts: 2,
+    retryDelaysMs: [0, 0],
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.attempts, 2);
+  assert.equal(reads, 2);
+});
+
+test('recovery: richiede due snapshot con composizione e liquidità stabili', () => {
+  const first = {
+    equityUsd: 500,
+    cashUsd: 200,
+    positions: [{ instrumentId: 1001, valueUsd: 150 }, { instrumentId: 1002, valueUsd: 150 }],
+  };
+  assert.equal(recoverySnapshotsStable(first, {
+    ...first,
+    cashUsd: 199.5,
+    positions: [{ instrumentId: 1001, valueUsd: 151 }, { instrumentId: 1002, valueUsd: 149.5 }],
+  }).stable, true);
+  assert.equal(recoverySnapshotsStable(first, {
+    ...first,
+    positions: [...first.positions, { instrumentId: 1003, valueUsd: 25 }],
+  }).stable, false);
+  assert.equal(recoverySnapshotsStable(first, { ...first, cashUsd: 180 }).stable, false);
+});
+
+test('recovery: il residuo nasce dalle posizioni reali e non ricompra ciò che è già a target', () => {
+  const bundle = {
+    validation: {
+      plan: {
+        targets: { SPY: 0.4, GLD: 0.3, CASH: 0.3 },
+        deltas: [
+          { symbol: 'SPY', instrumentId: 101, targetWeight: 0.4 },
+          { symbol: 'GLD', instrumentId: 102, targetWeight: 0.3 },
+        ],
+      },
+    },
+  };
+  const rows = recoveryResidualPreview(bundle, {
+    equityUsd: 500,
+    positions: [
+      { instrumentId: 101, valueUsd: 200 },
+      { instrumentId: 102, valueUsd: 50 },
+    ],
+  }, { minOrderUsd: 10 });
+  const spy = rows.find((row) => row.symbol === 'SPY');
+  const gld = rows.find((row) => row.symbol === 'GLD');
+  assert.equal(spy.actualUsd, 200);
+  assert.equal(spy.residualUsd, 0);
+  assert.equal(spy.actionable, false, 'SPY già acquistato non genera un nuovo ordine');
+  assert.equal(gld.actualUsd, 50);
+  assert.equal(gld.targetUsd, 150);
+  assert.equal(gld.residualUsd, 100);
+  assert.equal(gld.side, 'buy');
+  assert.equal(gld.actionable, true);
+});
+
 test('pipeline lock: acquire, renew e release rispettano owner e lease', async () => {
   const db = createSafetyDb();
   const first = await acquirePipelineLock(db, 'run-a', { now: 1_000, leaseMs: 2_000 });
@@ -2040,6 +2209,35 @@ test('safety config: ogni stop/unfreeze invalida una vecchia attivazione tramite
   assert.equal(armed.safetyRevision, 7);
 });
 
+test('recovery one-shot: arma solo da Shadow + Frozen e torna in Shadow con la stessa fence', async () => {
+  const db = createSafetyDb({
+    executionMode: 'shadow',
+    frozen: true,
+    frozenReason: 'reconcile 7.40%',
+    recoveryRequired: true,
+    recoveryReason: 'reconcile 7.40%',
+    recoveryRunIds: ['live-parziale'],
+    safetyRevision: 12,
+    decisionRevision: 4,
+    activeAgentPortfolioId: 'portfolio-live',
+    agentTokenFingerprint: 'token-fingerprint',
+    agentTokenVerifiedAt: 456,
+  });
+  const previewFence = { ...db.state.config };
+  const armed = await armRecoveryLiveIfUnchanged(db, previewFence);
+  assert.equal(armed.executionMode, 'live');
+  assert.equal(armed.frozen, false);
+  assert.equal(armed.recoveryRequired, false);
+  assert.equal(armed.safetyRevision, 13);
+  assert.equal(await armRecoveryLiveIfUnchanged(db, previewFence), null, 'la conferma non può essere riutilizzata');
+
+  const shadow = await finishRecoveryToShadowIfUnchanged(db, armed);
+  assert.equal(shadow.executionMode, 'shadow');
+  assert.equal(shadow.frozen, false);
+  assert.equal(shadow.safetyRevision, 14);
+  assert.equal(await finishRecoveryToShadowIfUnchanged(db, armed), null, 'la fence Live è single-use');
+});
+
 test('live final CAS: una run diventa ok solo con fence e binding ancora identici', async () => {
   const db = createSafetyDb({
     executionMode: 'live',
@@ -2146,6 +2344,61 @@ test('control API: freeze forza shadow oltre a congelare', async () => {
   assert.equal(body.config.frozen, true);
   assert.equal(body.config.frozenReason, 'stop dal telefono');
   assert.equal(db.state.mutationQueries.length, 1);
+});
+
+test('control API: preparare la recovery richiede una conferma dedicata e non arma il Live', async () => {
+  const db = createSafetyDb({
+    executionMode: 'shadow',
+    frozen: true,
+    recoveryRequired: true,
+    safetyRevision: 7,
+  });
+  const request = new Request('https://example.test/agent/recovery/prepare', {
+    method: 'POST',
+    headers: { authorization: 'Bearer control-test', 'content-type': 'application/json' },
+    body: JSON.stringify({ safetyRevision: 7, confirmation: 'SBLOCCA' }),
+  });
+  const response = await handleAgentApi(
+    request,
+    { DB: db, CONTROL_TOKEN: 'control-test' },
+    null,
+    '/agent/recovery/prepare',
+  );
+  const body = await response.json();
+  assert.equal(response.status, 400);
+  assert.match(body.error, /VERIFICA ACQUISTI E PREPARA RIPRESA/);
+  assert.equal(db.state.config.executionMode, 'shadow');
+  assert.equal(db.state.config.frozen, true);
+});
+
+test('control API: completare il residuo richiede piano, conferma one-shot e non accetta scorciatoie', async () => {
+  const db = createSafetyDb({
+    executionMode: 'shadow', frozen: true, recoveryRequired: true, safetyRevision: 7,
+  });
+  const activationId = '018f4f92-9fb4-7e66-8c74-c6ea23b88e7f';
+  const request = new Request('https://example.test/agent/recovery/execute', {
+    method: 'POST',
+    headers: { authorization: 'Bearer control-test', 'content-type': 'application/json' },
+    body: JSON.stringify({
+      activationId,
+      sourceRunId: 'dry-run-22',
+      safetyRevision: 7,
+      confirmation: 'ESEGUI LIVE',
+      acknowledgeOneShotShadow: true,
+    }),
+  });
+  const response = await handleAgentApi(
+    request,
+    { DB: db, CONTROL_TOKEN: 'control-test' },
+    null,
+    '/agent/recovery/execute',
+  );
+  const body = await response.json();
+  assert.equal(response.status, 400);
+  assert.match(body.error, /COMPLETA PIANO/);
+  assert.equal(db.state.config.executionMode, 'shadow');
+  assert.equal(db.state.config.frozen, true);
+  assert.equal(db.state.mutationQueries.length, 0);
 });
 
 test('control API: unfreeze resta in shadow e non riattiva il live', async () => {

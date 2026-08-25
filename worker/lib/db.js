@@ -525,6 +525,87 @@ export async function armLiveIfUnchanged(db, expected) {
   }
 }
 
+/**
+ * Arma esclusivamente una recovery esplicitamente confermata. A differenza
+ * dell'attivazione Live ordinaria, lo stato di partenza deve essere proprio
+ * Shadow + Frozen + recoveryRequired. La stessa CAS rimuove il blocco soltanto
+ * quando sta per iniziare l'esecuzione del residuo selezionato.
+ */
+export async function armRecoveryLiveIfUnchanged(db, expected) {
+  const row = await db.prepare(`UPDATE config
+    SET value = json_set(
+          json_patch(value, json('{"executionMode":"live","frozen":false,"frozenReason":"","recoveryRequired":false,"recoveryReason":"","recoveryRunIds":[],"recoveryUpdatedAt":0}')),
+          '$.safetyRevision',
+          CAST(COALESCE(json_extract(value, '$.safetyRevision'), 0) AS INTEGER) + 1
+        ),
+        updated_at = ?
+    WHERE key = ?
+      AND json_valid(value)
+      AND COALESCE(json_extract(value, '$.executionMode'), 'shadow') = 'shadow'
+      AND COALESCE(json_extract(value, '$.frozen'), 0) = 1
+      AND COALESCE(json_extract(value, '$.recoveryRequired'), 0) = 1
+      AND CAST(COALESCE(json_extract(value, '$.safetyRevision'), 0) AS INTEGER) = ?
+      AND CAST(COALESCE(json_extract(value, '$.decisionRevision'), 0) AS INTEGER) = ?
+      AND COALESCE(json_extract(value, '$.activeAgentPortfolioId'), '') = ?
+      AND COALESCE(json_extract(value, '$.agentTokenFingerprint'), '') = ?
+      AND CAST(COALESCE(json_extract(value, '$.agentTokenVerifiedAt'), 0) AS INTEGER) = ?
+    RETURNING value`)
+    .bind(
+      Date.now(),
+      CONFIG_KEY,
+      Math.max(0, Math.trunc(Number(expected.safetyRevision) || 0)),
+      Math.max(0, Math.trunc(Number(expected.decisionRevision) || 0)),
+      String(expected.activeAgentPortfolioId ?? ''),
+      String(expected.agentTokenFingerprint ?? ''),
+      Math.max(0, Math.trunc(Number(expected.agentTokenVerifiedAt) || 0)),
+    )
+    .first();
+  if (!row?.value) return null;
+  try {
+    return deepMerge(DEFAULT_CONFIG, JSON.parse(row.value));
+  } catch {
+    throw new Error('D1 ha restituito uno stato Live di recovery non valido');
+  }
+}
+
+/** Torna in Shadow al termine della recovery one-shot, con la stessa fence. */
+export async function finishRecoveryToShadowIfUnchanged(db, expected) {
+  const row = await db.prepare(`UPDATE config
+    SET value = json_set(
+          json_patch(value, json('{"executionMode":"shadow","frozen":false,"frozenReason":"","recoveryRequired":false,"recoveryReason":"","recoveryRunIds":[],"recoveryUpdatedAt":0}')),
+          '$.safetyRevision',
+          CAST(COALESCE(json_extract(value, '$.safetyRevision'), 0) AS INTEGER) + 1
+        ),
+        updated_at = ?
+    WHERE key = ?
+      AND json_valid(value)
+      AND COALESCE(json_extract(value, '$.executionMode'), 'shadow') = 'live'
+      AND COALESCE(json_extract(value, '$.frozen'), 0) = 0
+      AND COALESCE(json_extract(value, '$.recoveryRequired'), 0) = 0
+      AND CAST(COALESCE(json_extract(value, '$.safetyRevision'), 0) AS INTEGER) = ?
+      AND CAST(COALESCE(json_extract(value, '$.decisionRevision'), 0) AS INTEGER) = ?
+      AND COALESCE(json_extract(value, '$.activeAgentPortfolioId'), '') = ?
+      AND COALESCE(json_extract(value, '$.agentTokenFingerprint'), '') = ?
+      AND CAST(COALESCE(json_extract(value, '$.agentTokenVerifiedAt'), 0) AS INTEGER) = ?
+    RETURNING value`)
+    .bind(
+      Date.now(),
+      CONFIG_KEY,
+      Math.max(0, Math.trunc(Number(expected.safetyRevision) || 0)),
+      Math.max(0, Math.trunc(Number(expected.decisionRevision) || 0)),
+      String(expected.activeAgentPortfolioId ?? ''),
+      String(expected.agentTokenFingerprint ?? ''),
+      Math.max(0, Math.trunc(Number(expected.agentTokenVerifiedAt) || 0)),
+    )
+    .first();
+  if (!row?.value) return null;
+  try {
+    return deepMerge(DEFAULT_CONFIG, JSON.parse(row.value));
+  } catch {
+    throw new Error('D1 ha restituito uno stato Shadow di recovery non valido');
+  }
+}
+
 export async function audit(db, runId, level, stage, message, data) {
   await db.prepare('INSERT INTO audit (run_id, at, level, stage, message, data_json) VALUES (?, ?, ?, ?, ?, ?)')
     .bind(runId ?? null, Date.now(), level, stage, String(message).slice(0, 2000), data === undefined ? null : JSON.stringify(data).slice(0, 20000))
@@ -716,6 +797,39 @@ export async function listStalePreArmActivations(db, { excludeActivationId = '',
 export async function listRuns(db, limit = 30) {
   const { results } = await db.prepare('SELECT * FROM runs ORDER BY started_at DESC LIMIT ?').bind(limit).all();
   return results ?? [];
+}
+
+/** Piani recenti selezionabili durante una recovery, senza N+1 query D1. */
+export async function listRecoveryPlanCandidates(db, limit = 12) {
+  const { results } = await db.prepare(`SELECT
+      r.id, r.started_at, r.finished_at, r.status, r.execution_mode,
+      p.model, p.confidence, p.parsed_json,
+      v.plan_json,
+      s.equity_usd AS snapshot_equity_usd,
+      s.cash_usd AS snapshot_cash_usd,
+      s.positions_json AS snapshot_positions_json,
+      a.decision_revision AS artifact_decision_revision,
+      a.decision_hash AS artifact_decision_hash,
+      a.binding_hash AS artifact_binding_hash
+    FROM runs r
+    JOIN proposals p ON p.run_id = r.id AND p.parsed_json IS NOT NULL
+    JOIN validations v ON v.run_id = r.id AND v.ok = 1
+    LEFT JOIN snapshots s ON s.run_id = r.id
+    LEFT JOIN decision_artifacts a ON a.source_run_id = r.id
+    WHERE r.kind = 'rebalance'
+      AND r.execution_mode IN ('dry-run', 'live')
+      AND r.status IN ('ok', 'blocked', 'frozen')
+      AND r.finished_at IS NOT NULL
+    ORDER BY r.started_at DESC
+    LIMIT ?`)
+    .bind(Math.min(Math.max(Number(limit) || 12, 1), 30))
+    .all();
+  const parse = (value) => { try { return value ? JSON.parse(value) : null; } catch { return null; } };
+  return (results ?? []).map((row) => ({
+    ...row,
+    proposal: parse(row.parsed_json),
+    plan: parse(row.plan_json),
+  }));
 }
 
 export async function saveDecisionArtifact(db, artifact) {

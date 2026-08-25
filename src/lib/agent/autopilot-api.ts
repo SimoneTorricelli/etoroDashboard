@@ -15,6 +15,8 @@ export type RunKind = 'heartbeat' | 'snapshot' | 'rebalance' | 'manual';
 
 export const LIVE_CONFIRMATION = 'ESEGUI LIVE' as const;
 export const LIVE_RECOVERY_CONFIRMATION = 'HO VERIFICATO GLI ORDINI SU ETORO' as const;
+export const LIVE_RECOVERY_PREPARE_CONFIRMATION = 'VERIFICA ACQUISTI E PREPARA RIPRESA' as const;
+export const LIVE_RECOVERY_EXECUTE_CONFIRMATION = 'COMPLETA PIANO' as const;
 
 const EXECUTION_MODES = new Set<ExecutionMode>(['shadow', 'dry-run', 'live']);
 
@@ -320,6 +322,89 @@ export interface LiveActivationResult {
   };
 }
 
+export interface LiveRecoveryPreparationResult {
+  status: 'ready' | 'blocked';
+  mode?: 'shadow';
+  busy?: boolean;
+  reason?: string;
+  message?: string;
+  config: AutopilotConfig;
+  recoveryRunIds?: string[];
+  alreadyAcquired?: number;
+  unresolved?: string[];
+  warnings?: string[];
+  orderSummary?: Array<{
+    symbol: string;
+    instrumentId: number;
+    side: string;
+    state: string;
+    amountUsd: number;
+    filledUsd: number;
+    positionIds: number[];
+  }>;
+  snapshot?: {
+    takenAt: number;
+    equityUsd: number;
+    cashUsd: number;
+    positions: number;
+  };
+  candidates?: LiveRecoveryPlanCandidate[];
+  selectedSourceRunId?: string;
+}
+
+export interface LiveRecoveryResidualRow {
+    symbol: string;
+    instrumentId: number;
+    side: 'buy' | 'sell';
+    residualUsd: number;
+    actionable: boolean;
+    actualUsd: number;
+    actualWeight: number;
+    targetWeight: number;
+    targetUsd: number;
+}
+
+export interface LiveRecoveryPlanCandidate {
+  sourceRunId: string;
+  sourceType: 'dry-run' | 'live';
+  startedAt: number;
+  finishedAt: number;
+  status: string;
+  model: string | null;
+  confidence: number;
+  recommended: boolean;
+  initialConstruction: boolean;
+  targetWeights: Record<string, number>;
+  originalOrderCount: number;
+  residualOrderCount: number;
+  residualUsd: number;
+  residualPreview: LiveRecoveryResidualRow[];
+}
+
+export interface LiveRecoveryExecutionResult {
+  activationId: string;
+  runId: string | null;
+  status: LiveActivationStatus;
+  mode: ExecutionMode | null;
+  recovery: true;
+  recoveryCompleted: boolean;
+  recoverySourceRunId: string;
+  busy?: boolean;
+  replayed?: boolean;
+  safetyPersisted?: boolean;
+  reason?: string | null;
+  error?: string | null;
+  persistenceWarning?: string;
+  plan?: { orderCount: number; turnoverPct: number; confidence: number } | null;
+  execution?: LiveActivationResult['execution'];
+  reconciliation?: {
+    ok: boolean;
+    worstDivergence: number;
+    attempts: number;
+    rows: Array<{ symbol: string; expectedWeight: number; actualWeight: number; divergence: number }>;
+  } | null;
+}
+
 export interface PlanOrder {
   seq: number;
   symbol: string;
@@ -342,7 +427,7 @@ export interface RunBundle {
   proposal: { model: string | null; parsed: { targetWeights: Record<string, number>; confidence: number; rationale: string; risks: string[]; watch: string[]; repairs?: Array<{ code: string; originalTotal: number; message: string }> } | null; error: string | null; attempts: LlmAttempt[] } | null;
   validation: { ok: boolean; violations: Array<{ code: string; message: string; severity: string }>; plan: { orders: PlanOrder[]; targets: Record<string, number>; turnoverPct: number } | null } | null;
   orders: Array<{ symbol: string; side: string; amount_usd: number; state: string; message: string | null }>;
-  logs: Array<{ at: number; level: string; stage: string; message: string }>;
+  logs: Array<{ at: number; level: string; stage: string; message: string; data?: unknown }>;
   improvement: { sourceRunId: string; sourceModel: string | null; sourceConfidence: number | null } | null;
 }
 
@@ -722,6 +807,40 @@ function validateLiveActivationPayload(value: unknown, expectedActivationId: str
   return value as unknown as LiveActivationResult;
 }
 
+function validateRecoveryExecutionPayload(
+  value: unknown,
+  expectedActivationId: string,
+  expectedSourceRunId: string,
+): LiveRecoveryExecutionResult {
+  const path = '/agent/recovery/execute';
+  if (!isRecord(value)) invalidApiPayload(path, 'era atteso un oggetto JSON');
+  if (value.activationId !== expectedActivationId) invalidApiPayload(path, 'activationId assente o diverso dalla richiesta');
+  if (value.recoverySourceRunId !== expectedSourceRunId) invalidApiPayload(path, 'piano sorgente assente o diverso dalla richiesta');
+  if (value.recovery !== true) invalidApiPayload(path, 'la risposta non identifica una recovery');
+  if (typeof value.recoveryCompleted !== 'boolean') invalidApiPayload(path, 'recoveryCompleted deve essere booleano');
+  if (!LIVE_ACTIVATION_STATUSES.has(value.status as LiveActivationStatus)) invalidApiPayload(path, 'stato recovery sconosciuto');
+  if (!(value.mode === null || EXECUTION_MODES.has(value.mode as ExecutionMode))) invalidApiPayload(path, 'modalità finale sconosciuta');
+  if (!(value.runId === null || (typeof value.runId === 'string' && value.runId.trim()))) {
+    invalidApiPayload(path, 'runId deve essere una stringa non vuota oppure null');
+  }
+  if (value.status === 'ok') {
+    if (value.mode !== 'shadow') invalidApiPayload(path, 'una recovery riuscita deve terminare in Shadow');
+    if (value.recoveryCompleted !== true) invalidApiPayload(path, 'una recovery riuscita non risulta completata');
+    if (typeof value.runId !== 'string') invalidApiPayload(path, 'runId manca per la recovery riuscita');
+  }
+  if (value.status === 'frozen' && typeof value.safetyPersisted !== 'boolean') {
+    invalidApiPayload(path, 'un fail-safe frozen deve dichiarare safetyPersisted');
+  }
+  if ('busy' in value && typeof value.busy !== 'boolean') invalidApiPayload(path, 'busy deve essere booleano');
+  if (value.busy === true && value.status !== 'blocked') invalidApiPayload(path, 'busy richiede lo stato blocked');
+  for (const field of ['reason', 'error'] as const) {
+    if (field in value && value[field] !== null && typeof value[field] !== 'string') {
+      invalidApiPayload(path, `${field} deve essere una stringa oppure null`);
+    }
+  }
+  return value as unknown as LiveRecoveryExecutionResult;
+}
+
 function isJsonContentType(value: string | null): boolean {
   const mediaType = String(value ?? '').split(';', 1)[0].trim().toLowerCase();
   return mediaType === 'application/json' || mediaType.endsWith('+json');
@@ -839,6 +958,25 @@ export const autopilot = {
   ),
   freeze: (reason: string) => call<{ config: AutopilotConfig }>('/agent/freeze', { method: 'POST', body: JSON.stringify({ reason }) }),
   safeStop: (reason: string) => call<{ config: AutopilotConfig }>('/agent/safe-stop', { method: 'POST', body: JSON.stringify({ reason }) }),
+  prepareRecovery: (request: { safetyRevision: number; confirmation: typeof LIVE_RECOVERY_PREPARE_CONFIRMATION }) =>
+    call<LiveRecoveryPreparationResult>('/agent/recovery/prepare', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    }),
+  executeRecovery: async (request: {
+    activationId: string;
+    sourceRunId: string;
+    safetyRevision: number;
+    confirmation: typeof LIVE_RECOVERY_EXECUTE_CONFIRMATION;
+    acknowledgeOneShotShadow: true;
+  }) => validateRecoveryExecutionPayload(
+    await call<unknown>('/agent/recovery/execute', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    }),
+    request.activationId,
+    request.sourceRunId,
+  ),
   unfreeze: (request: { safetyRevision: number; confirmation?: typeof LIVE_RECOVERY_CONFIRMATION }) =>
     call<{ config: AutopilotConfig }>('/agent/unfreeze', {
       method: 'POST',

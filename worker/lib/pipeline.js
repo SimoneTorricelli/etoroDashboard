@@ -19,19 +19,19 @@ import { notify } from './notify.js';
 import { PROFILES, describeProfile } from './profiles.js';
 import { hasVerifiedAgentBinding, resolveCredentials, missingRequired, saveCredentials } from './vault.js';
 import {
-  acquirePipelineLock, armLiveIfUnchanged, audit, cacheUniverse, countOpportunisticThisWeek, countOrdersToday, equityHistory,
+  acquirePipelineLock, armLiveIfUnchanged, armRecoveryLiveIfUnchanged, audit, cacheUniverse, countOpportunisticThisWeek, countOrdersToday, equityHistory,
   claimLatestDecisionArtifact, findLiveRecoveryBarrier, finishLiveActivation, finishRun, finishRunIfLiveFence,
-  getLiveActivation, getRunBundle,
-  latestDryRunWithArtifact, listStalePreArmActivations, listWatcherEvents, loadConfig, loadLedger, loadUniverseCache,
+  finishRecoveryToShadowIfUnchanged, getLiveActivation, getRunBundle,
+  latestDryRunWithArtifact, listRecoveryPlanCandidates, listStalePreArmActivations, listWatcherEvents, loadConfig, loadLedger, loadUniverseCache,
   recordEquity, reserveLiveActivation,
   mutateSafetyConfig, recordLedgerTrade, releasePipelineLock, renewPipelineLock, saveConfig,
   releaseDecisionArtifactClaim, releaseDecisionArtifactClaimsByRun,
   saveDecisionArtifact, saveFeatures, saveProposal, saveSnapshot, saveValidation, saveWatcherEvent,
-  setLiveActivationSource, startRun, syncLedger, updateLiveActivationStatus,
+  setLiveActivationSource, startRun, syncLedger, updateLiveActivationStatus, upsertOrder,
 } from './db.js';
 import {
   LIVE_DRY_RUN_TTL_MS, buildDecisionContext, classifyDryRunForReuse, compactLiveActivationResult,
-  comparePortfolioForReuse, proposalHash,
+  comparePortfolioForReuse, proposalHash, summarizeExecution,
 } from './live-plan.js';
 
 const KV_CANDLES_BUNDLE = 'candles:v2:bundle';
@@ -41,6 +41,7 @@ const UNIVERSE_RESOLVE_BATCH = 12;
 const UNRESOLVED_RETRY_MS = 24 * 60 * 60 * 1000;
 
 const roundMoney = (value) => Math.round(Number(value) * 100) / 100;
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * Mantiene ID e posizioni del conto operativo Agent, ma converte tutti gli
@@ -124,6 +125,141 @@ export function resolveVerifiedAgentMirror(config, portfolios) {
     fail(`binding mirror eToro cambiato (${configuredMirrorId} → ${remoteMirrorId}): rigenera e verifica il token prima di continuare`);
   }
   return remote;
+}
+
+function aggregateRecoveryPositions(snapshot) {
+  const positions = new Map();
+  for (const position of snapshot?.positions ?? []) {
+    const instrumentId = Number(position.instrumentId);
+    if (!Number.isFinite(instrumentId) || instrumentId <= 0) continue;
+    positions.set(instrumentId, (positions.get(instrumentId) ?? 0) + (Number(position.valueUsd) || 0));
+  }
+  return positions;
+}
+
+/** Due letture devono mostrare la stessa composizione e importi compatibili. */
+export function recoverySnapshotsStable(first, second) {
+  const firstEquity = Number(first?.equityUsd) || 0;
+  const secondEquity = Number(second?.equityUsd) || 0;
+  if (firstEquity <= 0 || secondEquity <= 0) return { stable: false, reason: 'equity non disponibile' };
+  const firstPositions = aggregateRecoveryPositions(first);
+  const secondPositions = aggregateRecoveryPositions(second);
+  const firstIds = [...firstPositions.keys()].sort((a, b) => a - b);
+  const secondIds = [...secondPositions.keys()].sort((a, b) => a - b);
+  if (firstIds.length !== secondIds.length || firstIds.some((id, index) => id !== secondIds[index])) {
+    return { stable: false, reason: 'le posizioni eToro stanno ancora cambiando' };
+  }
+  for (const instrumentId of firstIds) {
+    const left = firstPositions.get(instrumentId) ?? 0;
+    const right = secondPositions.get(instrumentId) ?? 0;
+    if (Math.abs(left - right) > Math.max(1, Math.max(left, right) * 0.02)) {
+      return { stable: false, reason: `il valore dello strumento ${instrumentId} non è ancora stabile` };
+    }
+  }
+  if (Math.abs((Number(first.cashUsd) || 0) - (Number(second.cashUsd) || 0)) > Math.max(1, secondEquity * 0.002)) {
+    return { stable: false, reason: 'la liquidità eToro sta ancora aggiornandosi' };
+  }
+  return { stable: true, reason: '' };
+}
+
+async function readRecoveryAgentSnapshot(client, config, remote) {
+  const [virtualSnapshot, realMirrorSnapshot] = await Promise.all([
+    client.portfolio(client.agentToken),
+    client.mirrorPortfolio(String(remote.mirrorId)),
+  ]);
+  const snapshot = scaleAgentSnapshotToReal(virtualSnapshot, realMirrorSnapshot);
+  snapshot.agentPortfolioId = remote.id;
+  return { snapshot, virtualSnapshot };
+}
+
+function storedOrderRecord(row, patch = {}) {
+  return {
+    id: row.id,
+    runId: row.run_id ?? row.runId,
+    seq: Number(row.seq),
+    symbol: row.symbol,
+    instrumentId: Number(row.instrument_id ?? row.instrumentId),
+    side: row.side,
+    amountUsd: Number(row.amount_usd ?? row.amountUsd),
+    positionId: row.position_id ?? row.positionId ?? null,
+    mode: row.mode,
+    state: row.state,
+    etoroOrderId: row.etoro_order_id ?? row.etoroOrderId ?? null,
+    positionIds: row.positionIds ?? [],
+    filledUsd: Number(row.filled_usd ?? row.filledUsd) || 0,
+    message: row.message ?? null,
+    ...patch,
+  };
+}
+
+export function recoveryResidualPreview(bundle, snapshot, config) {
+  const plan = bundle?.validation?.plan;
+  if (!plan?.targets || !Array.isArray(plan.deltas)) return [];
+  const actual = aggregateRecoveryPositions(snapshot);
+  const equity = Math.max(0.01, Number(snapshot.equityUsd) || 0.01);
+  return plan.deltas
+    .filter((delta) => Number(plan.targets[delta.symbol] ?? delta.targetWeight) > 0 || (actual.get(Number(delta.instrumentId)) ?? 0) > 0)
+    .map((delta) => {
+      const targetWeight = Number(plan.targets[delta.symbol] ?? delta.targetWeight) || 0;
+      const actualUsd = roundMoney(actual.get(Number(delta.instrumentId)) ?? 0);
+      const actualWeight = actualUsd / equity;
+      const residualUsd = roundMoney((targetWeight - actualWeight) * equity);
+      return {
+        symbol: delta.symbol,
+        instrumentId: Number(delta.instrumentId),
+        side: residualUsd > 0 ? 'buy' : 'sell',
+        residualUsd: Math.abs(residualUsd),
+        actionable: Math.abs(residualUsd) >= Number(config.minOrderUsd || 0),
+        actualUsd,
+        actualWeight: Math.round(actualWeight * 10_000) / 10_000,
+        targetWeight,
+        targetUsd: roundMoney(targetWeight * equity),
+      };
+    });
+}
+
+function recoveryPlanCandidate(row, snapshot, config, recommendedRunIds, currentDecisionContext) {
+  if (!row?.proposal || !row?.plan?.targets || !Array.isArray(row.plan.deltas)) return null;
+  const recommended = recommendedRunIds.has(String(row.id));
+  // Le dry-run selezionabili devono appartenere alla stessa strategia e allo
+  // stesso Agent binding. La run Live congelata resta selezionabile perché è
+  // proprio la fonte autorevole dell'esecuzione parziale da recuperare.
+  if (!recommended && row.execution_mode !== 'dry-run') return null;
+  if (!recommended && row.execution_mode === 'dry-run') {
+    if (!row.artifact_decision_hash || !row.artifact_binding_hash) return null;
+    if (
+      Number(row.artifact_decision_revision) !== Number(currentDecisionContext.decisionRevision)
+      || row.artifact_decision_hash !== currentDecisionContext.decisionHash
+      || row.artifact_binding_hash !== currentDecisionContext.bindingHash
+    ) return null;
+  }
+  const sourceSnapshotEquity = Number(row.snapshot_equity_usd) || Number(row.plan.equityUsd) || 0;
+  const sourceSnapshotCash = Number(row.snapshot_cash_usd) || 0;
+  let sourcePositions = [];
+  try { sourcePositions = JSON.parse(row.snapshot_positions_json ?? '[]'); } catch { sourcePositions = []; }
+  const initialConstruction = sourceSnapshotEquity > 0
+    && sourceSnapshotCash >= sourceSnapshotEquity * 0.95
+    && sourcePositions.length === 0;
+  const bundle = { validation: { plan: row.plan } };
+  const residualPreview = recoveryResidualPreview(bundle, snapshot, config);
+  return {
+    sourceRunId: String(row.id),
+    sourceType: row.execution_mode,
+    startedAt: Number(row.started_at),
+    finishedAt: Number(row.finished_at),
+    status: String(row.status),
+    model: row.model == null ? null : String(row.model),
+    confidence: Number(row.confidence ?? row.proposal.confidence) || 0,
+    recommended,
+    initialConstruction,
+    targetWeights: row.plan.targets,
+    originalOrderCount: Array.isArray(row.plan.orders) ? row.plan.orders.length : 0,
+    residualOrderCount: residualPreview.filter((item) => item.actionable && item.residualUsd > 0).length,
+    residualUsd: roundMoney(residualPreview
+      .filter((item) => item.actionable)
+      .reduce((sum, item) => sum + item.residualUsd, 0)),
+    residualPreview,
+  };
 }
 
 /** Una nuova verifica dell'Agent inaugura sempre una nuova serie di capitale. */
@@ -611,6 +747,182 @@ export async function freezeLiveRun({ db, runId, credentials = {}, equityUsd = n
   return { config, safetyPersisted, status, failures, reason: safeReason };
 }
 
+/**
+ * Verifica server-side una run Live parziale e costruisce l'anteprima dei
+ * piani recuperabili. Non invia ordini, non riusa alcuna POST precedente e
+ * mantiene Shadow + Frozen fino a una seconda conferma esplicita.
+ */
+export async function prepareLiveRecovery({ env, expectedSafetyRevision }) {
+  const db = env.DB;
+  const ownerId = `live-recovery-${crypto.randomUUID()}`;
+  const lock = await acquirePipelineLock(db, ownerId);
+  if (!lock.acquired) {
+    return {
+      status: 'blocked',
+      busy: true,
+      reason: `Pipeline già occupata dalla run ${lock.ownerId ?? 'sconosciuta'}`,
+      config: await loadConfig(db),
+    };
+  }
+
+  try {
+    const config = await loadConfig(db);
+    if (!config.frozen || !config.recoveryRequired) {
+      return { status: 'blocked', reason: 'non esiste una recovery Live congelata da preparare', config };
+    }
+    if (Number(config.safetyRevision) !== Number(expectedSafetyRevision)) {
+      return { status: 'blocked', reason: 'lo stato di sicurezza è cambiato: aggiorna la dashboard', config };
+    }
+
+    const resolved = await resolveCredentials(db, env);
+    if (!hasVerifiedAgentBinding(resolved, config)) {
+      return { status: 'blocked', reason: 'Agent Portfolio non verificato: impossibile controllare gli acquisti', config };
+    }
+    const client = buildClient(resolved, config);
+    const recoveryRunIds = [...new Set((config.recoveryRunIds ?? []).map(String).filter(Boolean))];
+    if (!recoveryRunIds.length) {
+      return { status: 'blocked', reason: 'run Live da recuperare non identificata', config };
+    }
+    const bundles = await Promise.all(recoveryRunIds.map((runId) => getRunBundle(db, runId)));
+    if (bundles.some((bundle) => !bundle.run || !bundle.validation?.plan)) {
+      return { status: 'blocked', reason: 'piano originale della run Live non disponibile', config };
+    }
+
+    const orders = bundles.flatMap((bundle) => bundle.orders)
+      .filter((order) => order.mode === 'live' && !['simulated', 'skipped'].includes(order.state))
+      .map((order) => storedOrderRecord(order));
+    const verifiedOrders = [];
+    const unresolved = [];
+    const summarizeVerifiedOrders = () => verifiedOrders.map(({
+      symbol, instrumentId, side, state, amountUsd, filledUsd, positionIds,
+    }) => ({
+      symbol, instrumentId, side, state, amountUsd,
+      filledUsd: roundMoney(filledUsd),
+      positionIds: (positionIds ?? []).map(Number).filter(Boolean),
+    }));
+    for (const order of orders) {
+      if (['filled', 'rejected'].includes(order.state)) {
+        verifiedOrders.push(order);
+        continue;
+      }
+      try {
+        const lookup = await client.lookupOrder({
+          orderId: order.etoroOrderId,
+          referenceId: order.id,
+        });
+        const state = lookup.state === 'pending' ? 'sent' : lookup.state;
+        const updated = storedOrderRecord(order, {
+          state,
+          etoroOrderId: lookup.orderId || order.etoroOrderId,
+          positionIds: lookup.positionIds ?? order.positionIds,
+          filledUsd: roundMoney(lookup.filledUsd || (state === 'filled' ? order.amountUsd : order.filledUsd)),
+          message: lookup.error ? `${lookup.label} — ${lookup.error}` : lookup.label,
+        });
+        await upsertOrder(db, updated);
+        verifiedOrders.push(updated);
+        if (['sent', 'partial'].includes(state)) {
+          unresolved.push(`${order.symbol}: ${state === 'sent' ? 'ordine ancora in elaborazione' : 'esecuzione parziale'}`);
+        }
+      } catch (error) {
+        unresolved.push(`${order.symbol}: esito non verificabile (${error instanceof Error ? error.message : String(error)})`);
+      }
+    }
+
+    if (unresolved.length) {
+      await audit(db, recoveryRunIds[0], 'warn', 'live-recovery-prepare', 'Recovery ancora bloccata: ordini non terminali', unresolved);
+      return {
+        status: 'blocked',
+        reason: 'Alcuni ordini non hanno ancora un esito terminale. Nessun nuovo ordine è stato inviato.',
+        unresolved,
+        config,
+        orderSummary: summarizeVerifiedOrders(),
+      };
+    }
+
+    const remote = resolveVerifiedAgentMirror(config, await client.agentPortfolios());
+    const first = await readRecoveryAgentSnapshot(client, config, remote);
+    await delay(2_500);
+    const second = await readRecoveryAgentSnapshot(client, config, remote);
+    const stability = recoverySnapshotsStable(first.snapshot, second.snapshot);
+    const visiblePositionIds = new Set((second.virtualSnapshot.positions ?? []).map((position) => Number(position.positionId)).filter(Boolean));
+    const visibleInstruments = new Set((second.virtualSnapshot.positions ?? []).map((position) => Number(position.instrumentId)).filter(Boolean));
+    const missingFilledBuys = verifiedOrders.filter((order) => {
+      if (order.side !== 'buy' || order.state !== 'filled') return false;
+      const positionIds = (order.positionIds ?? []).map(Number).filter(Boolean);
+      return positionIds.length
+        ? !positionIds.some((positionId) => visiblePositionIds.has(positionId))
+        : !visibleInstruments.has(Number(order.instrumentId));
+    });
+    if (!stability.stable || missingFilledBuys.length) {
+      const reasons = [
+        ...(!stability.stable ? [stability.reason] : []),
+        ...missingFilledBuys.map((order) => `${order.symbol}: acquisto filled non ancora visibile nel portfolio`),
+      ];
+      await audit(db, recoveryRunIds[0], 'warn', 'live-recovery-prepare', 'Recovery ancora bloccata: mirror non stabilizzato', reasons);
+      return {
+        status: 'blocked',
+        reason: 'Il mirror eToro non è ancora stabilizzato. Riprova fra poco: l’agente resta congelato.',
+        unresolved: reasons,
+        config,
+        orderSummary: summarizeVerifiedOrders(),
+      };
+    }
+
+    const [candidateRows, decisionContext] = await Promise.all([
+      listRecoveryPlanCandidates(db, 20),
+      buildDecisionContext(config),
+    ]);
+    const recommendedRunIds = new Set(recoveryRunIds);
+    const candidates = candidateRows
+      .map((row) => recoveryPlanCandidate(row, second.snapshot, config, recommendedRunIds, decisionContext))
+      .filter(Boolean)
+      .sort((left, right) => Number(right.recommended) - Number(left.recommended) || right.startedAt - left.startedAt);
+    if (!candidates.length) {
+      return {
+        status: 'blocked',
+        reason: 'nessun piano validato e compatibile è disponibile per completare la recovery',
+        config,
+        orderSummary: summarizeVerifiedOrders(),
+      };
+    }
+    const warnings = [];
+    try {
+      await audit(db, recoveryRunIds[0], 'warn', 'live-recovery-ready', 'Acquisti verificati; piani disponibili per il completamento del residuo', {
+        recoveryRunIds,
+        verifiedOrders: summarizeVerifiedOrders(),
+        candidates: candidates.map(({ sourceRunId, sourceType, recommended, residualOrderCount, residualUsd }) => ({
+          sourceRunId, sourceType, recommended, residualOrderCount, residualUsd,
+        })),
+        equityUsd: second.snapshot.equityUsd,
+        positions: second.snapshot.positions.length,
+        warnings,
+      });
+    } catch (error) {
+      warnings.push(`audit: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return {
+      status: 'ready',
+      mode: 'shadow',
+      config,
+      recoveryRunIds,
+      alreadyAcquired: verifiedOrders.filter((order) => order.side === 'buy' && order.state === 'filled').length,
+      orderSummary: summarizeVerifiedOrders(),
+      snapshot: {
+        takenAt: second.snapshot.takenAt,
+        equityUsd: second.snapshot.equityUsd,
+        cashUsd: second.snapshot.cashUsd,
+        positions: second.snapshot.positions.length,
+      },
+      candidates,
+      selectedSourceRunId: candidates.find((item) => item.recommended)?.sourceRunId ?? candidates[0].sourceRunId,
+      warnings,
+      message: 'Nessun ordine inviato e l’agente resta congelato. Scegli il piano: il Worker rileggerà il portfolio e calcolerà soltanto il residuo prima della conferma finale.',
+    };
+  } finally {
+    try { await releasePipelineLock(db, ownerId); } catch { /* il lease scade comunque */ }
+  }
+}
+
 /** Ultima verifica autoritativa prima di dichiarare una run Live riuscita. */
 async function enforceFinalLiveFence({ db, runId, config, credentials, equityUsd, stage, data = null }) {
   const fence = await readLiveSafetyFence(db, config);
@@ -686,6 +998,54 @@ async function commitLiveRunSuccess({ db, runId, config, credentials, equityUsd,
   };
 }
 
+/**
+ * La recovery non abilita la schedulazione Live permanente: dopo il residuo
+ * torna in Shadow con una CAS sullo stesso fence usato dall'esecutore.
+ */
+async function completeRecoveryOneShot({ db, runId, config, credentials, equityUsd, data = null }) {
+  const shadow = await finishRecoveryToShadowIfUnchanged(db, config);
+  if (shadow) {
+    const finished = await finishRun(db, runId, 'ok', equityUsd);
+    if (!finished) throw new Error('run di recovery non terminalizzata dopo il ritorno in Shadow');
+    try {
+      await audit(db, runId, 'warn', 'live-recovery-complete', 'Residuo completato; modalità riportata automaticamente in Shadow', data ?? undefined);
+    } catch { /* Shadow è già autorevole; l'audit resta best-effort */ }
+    return { status: 'ok', mode: 'shadow', config: shadow };
+  }
+
+  const current = await loadConfig(db).catch(() => null);
+  if (current?.executionMode === 'shadow') {
+    const status = current.frozen ? 'frozen' : 'ok';
+    await finishRun(db, runId, status, equityUsd, current.frozen ? current.frozenReason : null);
+    return {
+      status,
+      mode: 'shadow',
+      config: current,
+      ...(current.frozen ? {
+        safetyPersisted: true,
+        reason: current.frozenReason || 'recovery interrotta da uno stop concorrente',
+      } : {}),
+    };
+  }
+
+  const safety = await freezeLiveRun({
+    db,
+    runId,
+    credentials,
+    equityUsd,
+    reason: 'impossibile confermare il ritorno in Shadow dopo la recovery; verifica eToro',
+    stage: 'live-recovery-final-fence',
+    data,
+  });
+  return {
+    status: safety.status,
+    mode: safety.config?.executionMode ?? null,
+    safetyPersisted: safety.safetyPersisted,
+    reason: safety.reason,
+    safety,
+  };
+}
+
 // ---------------------------------------------------------------- pipeline
 
 function createRunId(kind) {
@@ -750,6 +1110,7 @@ function replayLiveActivation(row, currentConfig = null) {
   if (row.response_json) {
     try {
       const parsed = JSON.parse(row.response_json);
+      if (parsed?.recovery === true) return { ...parsed, replayed: true };
       const stoppedAfterResult = currentConfig
         && (parsed.status === 'ok' || parsed.mode === 'live')
         && (
@@ -1187,9 +1548,189 @@ export async function activateLiveAndRun({ env, activationId }) {
   }
 }
 
+function compactRecoveryExecutionResult(activationId, sourceRunId, result) {
+  return {
+    ...compactLiveActivationResult(activationId, result),
+    recovery: true,
+    recoveryCompleted: result?.recoveryCompleted === true,
+    recoverySourceRunId: sourceRunId,
+    decisionSource: 'recovery-plan',
+    reconciliation: result?.reconciliation ? {
+      ok: Boolean(result.reconciliation.ok),
+      worstDivergence: Number(result.reconciliation.worstDivergence) || 0,
+      attempts: Number(result.reconciliation.attempts) || 0,
+      rows: result.reconciliation.rows ?? [],
+    } : null,
+    execution: summarizeExecution(result),
+  };
+}
+
+/**
+ * Completa una recovery usando esattamente i target del piano scelto. È
+ * idempotente per activationId e torna automaticamente in Shadow.
+ */
+export async function executeLiveRecovery({ env, activationId, sourceRunId, expectedSafetyRevision }) {
+  const db = env.DB;
+  const previous = await getLiveActivation(db, activationId);
+  if (previous?.response_json) return replayLiveActivation(previous, await loadConfig(db));
+
+  const runId = previous?.run_id ?? createRunId('rebalance');
+  let lock;
+  try {
+    lock = await acquirePipelineLock(db, runId);
+  } catch (error) {
+    return {
+      activationId, runId: null, status: 'blocked', mode: 'shadow', recovery: true,
+      recoveryCompleted: false, recoverySourceRunId: sourceRunId, busy: true,
+      reason: `lock pipeline non disponibile: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+  if (!lock.acquired) {
+    return {
+      activationId, runId: null, status: 'blocked', mode: 'shadow', recovery: true,
+      recoveryCompleted: false, recoverySourceRunId: sourceRunId, busy: true,
+      reason: `Pipeline già occupata dalla run ${lock.ownerId ?? 'sconosciuta'}`,
+      activeRunId: lock.ownerId,
+      leaseUntil: lock.leaseUntil,
+    };
+  }
+
+  let resolved = null;
+  try {
+    const current = await loadConfig(db);
+    resolved = await resolveCredentials(db, env).catch(() => null);
+    const duplicate = await getLiveActivation(db, activationId);
+    if (duplicate) {
+      if (duplicate.response_json) return replayLiveActivation(duplicate, current);
+      if (['arming-live', 'executing-live'].includes(String(duplicate.status))) {
+        const safety = await freezeLiveRun({
+          db,
+          runId: duplicate.run_id,
+          credentials: resolved?.values ?? {},
+          reason: 'una precedente ripresa Live si è interrotta senza esito terminale; verifica eToro prima di riprovare',
+          stage: 'live-recovery-replay-barrier',
+        });
+        const response = compactRecoveryExecutionResult(activationId, sourceRunId, {
+          runId: duplicate.run_id,
+          status: safety.status,
+          mode: safety.config?.executionMode ?? null,
+          safetyPersisted: safety.safetyPersisted,
+          reason: safety.reason,
+        });
+        if (safety.safetyPersisted) {
+          await finishLiveActivation(db, activationId, response.status, response, response.reason);
+        }
+        return response;
+      }
+      const reason = 'la precedente richiesta di ripresa si è interrotta prima dell’armamento; nessun nuovo ordine risulta avviato';
+      const response = compactRecoveryExecutionResult(activationId, sourceRunId, {
+        runId: duplicate.run_id,
+        status: 'blocked',
+        mode: current.executionMode,
+        reason,
+      });
+      await finishRun(db, duplicate.run_id, 'blocked', null, reason);
+      await finishLiveActivation(db, activationId, 'blocked', response, reason);
+      return response;
+    }
+
+    if (
+      current.executionMode !== 'shadow'
+      || !current.frozen
+      || !current.recoveryRequired
+    ) {
+      return {
+        activationId, runId: null, status: 'blocked', mode: current.executionMode,
+        recovery: true, recoveryCompleted: false, recoverySourceRunId: sourceRunId,
+        reason: 'la recovery non è più nello stato Shadow + Frozen richiesto',
+      };
+    }
+    if (Number(current.safetyRevision) !== Number(expectedSafetyRevision)) {
+      return {
+        activationId, runId: null, status: 'blocked', mode: current.executionMode,
+        recovery: true, recoveryCompleted: false, recoverySourceRunId: sourceRunId,
+        reason: 'lo stato di sicurezza è cambiato dopo l’anteprima: aggiorna prima di confermare',
+      };
+    }
+    if (!resolved || !hasVerifiedAgentBinding(resolved, current)) {
+      return {
+        activationId, runId: null, status: 'blocked', mode: current.executionMode,
+        recovery: true, recoveryCompleted: false, recoverySourceRunId: sourceRunId,
+        reason: 'Agent Portfolio non verificato: nessun nuovo ordine può essere inviato',
+      };
+    }
+
+    const [candidateRows, decisionContext] = await Promise.all([
+      listRecoveryPlanCandidates(db, 30),
+      buildDecisionContext(current),
+    ]);
+    const selected = candidateRows.find((row) => String(row.id) === String(sourceRunId));
+    const selectedIsRecoveryRun = (current.recoveryRunIds ?? []).map(String).includes(String(sourceRunId));
+    const compatibleDryRun = selected?.execution_mode === 'dry-run'
+      && Number(selected.artifact_decision_revision) === Number(decisionContext.decisionRevision)
+      && selected.artifact_decision_hash === decisionContext.decisionHash
+      && selected.artifact_binding_hash === decisionContext.bindingHash;
+    if (!selected || (!selectedIsRecoveryRun && !compatibleDryRun)) {
+      return {
+        activationId, runId: null, status: 'blocked', mode: current.executionMode,
+        recovery: true, recoveryCompleted: false, recoverySourceRunId: sourceRunId,
+        reason: 'il piano scelto non è più disponibile o compatibile con strategia e Agent Portfolio correnti',
+      };
+    }
+
+    const reservation = await reserveLiveActivation(db, activationId, runId);
+    if (!reservation.created) return replayLiveActivation(reservation.row, current);
+    await setLiveActivationSource(db, activationId, sourceRunId);
+    await audit(db, null, 'warn', 'live-recovery-execute', 'Completamento one-shot del piano selezionato richiesto', {
+      activationId, runId, sourceRunId,
+    });
+
+    let result;
+    try {
+      result = await runPipelineWithLock({
+        env,
+        kind: 'rebalance',
+        modeOverride: 'live',
+        runId,
+        delayedLiveArm: true,
+        liveActivationId: activationId,
+        recoverySourceRunId: sourceRunId,
+        recoveryExpectedSafetyRevision: expectedSafetyRevision,
+        recoveryOneShot: true,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      try { await finishRun(db, runId, 'error', null, message); } catch { /* best-effort */ }
+      result = { runId, status: 'error', mode: null, error: message };
+    }
+
+    let response = compactRecoveryExecutionResult(activationId, sourceRunId, result);
+    if (result.safetyPersisted === false) {
+      response.persistenceWarning = 'Shadow + Frozen non confermati: non ripetere la recovery e verifica subito eToro.';
+    } else {
+      const completion = await finishLiveActivation(
+        db,
+        activationId,
+        response.status,
+        response,
+        response.error ?? response.reason ?? null,
+      );
+      if (!completion.written && completion.row?.response_json) {
+        response = replayLiveActivation(completion.row, await loadConfig(db));
+      } else if (!completion.written) {
+        response.persistenceWarning = 'Esito della recovery non persistito: non ripetere automaticamente l’operazione.';
+      }
+    }
+    return response;
+  } finally {
+    try { await releasePipelineLock(db, runId); } catch { /* il lease scade comunque */ }
+  }
+}
+
 async function runPipelineWithLock({
   env, kind, modeOverride, improveFromRunId = '', retryFromRunId = '', runId,
   delayedLiveArm = false, reuseLatestDryRun = false, liveActivationId = '',
+  recoverySourceRunId = '', recoveryExpectedSafetyRevision = null, recoveryOneShot = false,
 }) {
   const db = env.DB;
   const renewLease = async (stage) => {
@@ -1207,6 +1748,7 @@ async function runPipelineWithLock({
     );
   }
   const mode = modeOverride ?? config.executionMode;
+  const recoveryMode = Boolean(recoverySourceRunId);
   let persistentMode = config.executionMode;
   const baseProfile = PROFILES[config.strategyProfile] ?? PROFILES.balanced;
   const profile = config.strategySpec ? {
@@ -1221,6 +1763,7 @@ async function runPipelineWithLock({
   await audit(db, runId, 'info', 'start', `Run ${kind} avviata in modalità ${mode} · profilo ${profile.label}`);
   const sourceRunId = improveFromRunId || retryFromRunId;
   const previousBundle = sourceRunId ? await getRunBundle(db, sourceRunId) : null;
+  const recoveryBundle = recoveryMode ? await getRunBundle(db, recoverySourceRunId) : null;
   const revisionContext = improveFromRunId
     ? buildPlanRevisionContext(previousBundle)
     : retryFromRunId ? buildFailedProposalRetryContext(previousBundle) : '';
@@ -1243,6 +1786,12 @@ async function runPipelineWithLock({
     await audit(db, runId, 'error', 'start', error);
     await finishRun(db, runId, 'blocked', null, error);
     return { runId, status: 'blocked', error };
+  }
+  if (recoveryMode && mode !== 'live') {
+    const error = 'una recovery può essere eseguita soltanto come ciclo Live one-shot';
+    await audit(db, runId, 'error', 'live-recovery', error);
+    await finishRun(db, runId, 'blocked', null, error);
+    return { runId, status: 'blocked', mode: config.executionMode, error };
   }
 
   let equityUsd = null;
@@ -1486,7 +2035,13 @@ async function runPipelineWithLock({
       : renderFeaturesPrompt(features, config);
     const ledgerNotes = describeLedger(ledger, config);
 
-    const allowedSymbols = dynamic ? shortlistSymbols : [...universe.keys()];
+    const recoveryTargetSymbols = recoveryMode
+      ? Object.keys(recoveryBundle?.validation?.plan?.targets ?? {}).filter((symbol) => symbol !== 'CASH')
+      : [];
+    const allowedSymbols = [...new Set([
+      ...(dynamic ? shortlistSymbols : [...universe.keys()]),
+      ...recoveryTargetSymbols,
+    ])];
     const decisionContext = await buildDecisionContext(config);
     const askFreshBrain = (fallbackFrom = null) => askBrain({
       config,
@@ -1503,7 +2058,40 @@ async function runPipelineWithLock({
     });
 
     let brain = null;
-    if (mode === 'live' && reuseLatestDryRun) {
+    if (recoveryMode) {
+      if (
+        !recoveryBundle?.run
+        || !recoveryBundle?.validation?.ok
+        || !recoveryBundle.validation.plan?.targets
+        || !recoveryBundle?.proposal?.parsed
+      ) {
+        throw new Error(`il piano ${recoverySourceRunId} non è più disponibile o validato`);
+      }
+      const missingTargets = recoveryTargetSymbols.filter((symbol) => !features.instruments.some((item) => item.symbol === symbol));
+      if (missingTargets.length) {
+        throw new Error(`strumenti del piano originale non più risolvibili su eToro: ${missingTargets.join(', ')}`);
+      }
+      const normalized = normalizeProposal({
+        ...recoveryBundle.proposal.parsed,
+        targetWeights: recoveryBundle.validation.plan.targets,
+      }, allowedSymbols);
+      if (!normalized.ok) throw new Error(`piano originale non più normalizzabile: ${normalized.error}`);
+      brain = {
+        ok: true,
+        model: recoveryBundle.proposal.model,
+        attempts: recoveryBundle.proposal.attempts ?? [],
+        rawText: recoveryBundle.proposal.raw_text ?? '',
+        promptChars: recoveryBundle.proposal.prompt_chars ?? null,
+        parsed: normalized.value,
+      };
+      decisionSource = 'recovery-plan';
+      reusedDryRunId = recoverySourceRunId;
+      await audit(db, runId, 'warn', 'live-recovery-plan', `Ripresa esatta del piano ${recoverySourceRunId}; nessuna nuova analisi AI`, {
+        sourceRunId: recoverySourceRunId,
+        sourceMode: recoveryBundle.run.execution_mode,
+        targets: brain.parsed.targetWeights,
+      });
+    } else if (mode === 'live' && reuseLatestDryRun) {
       const candidate = await latestDryRunWithArtifact(db);
       const classification = classifyDryRunForReuse(candidate, decisionContext);
       if (classification.reusable) {
@@ -1580,18 +2168,25 @@ async function runPipelineWithLock({
         reuseFallbackReason,
       };
     }
-    await audit(db, runId, 'info', 'brain', `${decisionSource === 'reused-dry-run' ? 'Proposta riusata da' : 'Proposta da'} ${brain.model} (confidence ${brain.parsed.confidence})`, { targets: brain.parsed.targetWeights });
+    await audit(db, runId, 'info', 'brain', `${decisionSource === 'recovery-plan' ? 'Piano recuperato da' : decisionSource === 'reused-dry-run' ? 'Proposta riusata da' : 'Proposta da'} ${brain.model} (confidence ${brain.parsed.confidence})`, { targets: brain.parsed.targetWeights });
 
     // --- 7. Validazione ----------------------------------------------------
     const ordersToday = await countOrdersToday(db);
+    const sourceSnapshotEquity = Number(recoveryBundle?.snapshot?.equity_usd) || 0;
+    const sourceSnapshotCash = Number(recoveryBundle?.snapshot?.cash_usd) || 0;
+    const recoveryInitialConstruction = recoveryMode
+      && sourceSnapshotEquity > 0
+      && sourceSnapshotCash >= sourceSnapshotEquity * 0.95
+      && (recoveryBundle?.snapshot?.positions ?? []).length === 0;
     const validateBrain = (proposal) => validateProposal({
       proposal,
       features,
-      config,
+      config: recoveryMode ? { ...config, frozen: false, frozenReason: '' } : config,
       ordersToday,
       ledger,
       scores,
       completionSymbols: allowedSymbols,
+      initialConstructionOverride: recoveryInitialConstruction,
     });
     let validation = validateBrain(brain.parsed);
     await saveValidation(db, runId, validation);
@@ -1676,13 +2271,24 @@ async function runPipelineWithLock({
       const latestContext = await buildDecisionContext(latestConfig);
       const latestResolved = await resolveCredentials(db, env);
       let armBlockReason = '';
-      if (latestConfig.frozen) {
+      if (recoveryMode && (
+        latestConfig.executionMode !== 'shadow'
+        || !latestConfig.frozen
+        || !latestConfig.recoveryRequired
+      )) {
+        armBlockReason = 'lo stato non è più Shadow + Frozen con recovery richiesta';
+      } else if (
+        recoveryMode
+        && Number(latestConfig.safetyRevision) !== Number(recoveryExpectedSafetyRevision)
+      ) {
+        armBlockReason = 'lo stato di sicurezza è cambiato dopo l’anteprima';
+      } else if (!recoveryMode && latestConfig.frozen) {
         armBlockReason = `Autopilot congelato: ${latestConfig.frozenReason || 'freeze attivo'}`;
-      } else if (latestConfig.recoveryRequired) {
+      } else if (!recoveryMode && latestConfig.recoveryRequired) {
         armBlockReason = `Recovery Live richiesta: ${latestConfig.recoveryReason || 'verifica eToro necessaria'}`;
-      } else if (latestConfig.executionMode !== persistentMode) {
+      } else if (!recoveryMode && latestConfig.executionMode !== persistentMode) {
         armBlockReason = `modalità modificata durante l’analisi (${persistentMode} → ${latestConfig.executionMode})`;
-      } else if (Number(latestConfig.safetyRevision) !== Number(config.safetyRevision)) {
+      } else if (!recoveryMode && Number(latestConfig.safetyRevision) !== Number(config.safetyRevision)) {
         armBlockReason = 'stato di sicurezza modificato durante l’analisi';
       } else if (
         latestContext.decisionRevision !== decisionContext.decisionRevision
@@ -1766,18 +2372,23 @@ async function runPipelineWithLock({
       // l'UPDATE ma prima che il Worker ne legga la risposta: da questo punto
       // il catch deve quindi congelare in modo conservativo.
       livePhaseEntered = true;
-      const armed = await armLiveIfUnchanged(db, {
+      const armExpected = {
         executionMode: persistentMode,
-        safetyRevision: config.safetyRevision,
+        safetyRevision: recoveryMode ? recoveryExpectedSafetyRevision : config.safetyRevision,
         decisionRevision: decisionContext.decisionRevision,
         activeAgentPortfolioId: config.activeAgentPortfolioId,
         agentTokenFingerprint: config.agentTokenFingerprint,
         agentTokenVerifiedAt: config.agentTokenVerifiedAt,
-      });
+      };
+      const armed = recoveryMode
+        ? await armRecoveryLiveIfUnchanged(db, armExpected)
+        : await armLiveIfUnchanged(db, armExpected);
       if (!armed) {
         livePhaseEntered = false;
         await releasePendingDryRun();
-        const reason = 'stato cambiato mentre il Live veniva attivato; nessun ordine inviato';
+        const reason = recoveryMode
+          ? 'stato cambiato mentre la recovery veniva armata; nessun nuovo ordine inviato'
+          : 'stato cambiato mentre il Live veniva attivato; nessun ordine inviato';
         await audit(db, runId, 'warn', 'live-activation', reason);
         await finishRun(db, runId, 'blocked', equityUsd, reason);
         return {
@@ -1797,7 +2408,9 @@ async function runPipelineWithLock({
       // Shadow + Frozen, anche se nessuna POST eToro è ancora partita.
       if (liveActivationId) await updateLiveActivationStatus(db, liveActivationId, 'executing-live');
       try {
-        await audit(db, runId, 'warn', 'live-activation', 'Modalità Live attivata; il piano appena rivalidato passa all’esecutore');
+        await audit(db, runId, 'warn', 'live-activation', recoveryMode
+          ? 'Recovery armata in Live esclusivamente per completare il residuo del piano selezionato'
+          : 'Modalità Live attivata; il piano appena rivalidato passa all’esecutore');
       } catch (error) {
         console.error(JSON.stringify({
           message: 'audit attivazione Live fallito',
@@ -1832,24 +2445,30 @@ async function runPipelineWithLock({
       }
       await audit(db, runId, 'info', 'executor', 'Nessuna azione: allocazione già entro le bande e la disciplina di rotazione');
       if (mode === 'live') {
-        const commitFailure = await commitLiveRunSuccess({
-          db,
-          runId,
-          config,
-          credentials,
-          equityUsd,
-          stage: 'live-final-no-orders',
-          data: { action: 'none' },
-        });
-        if (commitFailure) {
+        const completion = recoveryMode && recoveryOneShot
+          ? await completeRecoveryOneShot({
+            db, runId, config, credentials, equityUsd,
+            data: { action: 'none', sourceRunId: recoverySourceRunId },
+          })
+          : await commitLiveRunSuccess({
+            db,
+            runId,
+            config,
+            credentials,
+            equityUsd,
+            stage: 'live-final-no-orders',
+            data: { action: 'none' },
+          });
+        if (completion && (recoveryMode || completion.status !== 'ok')) {
           return {
             runId,
-            ...commitFailure,
+            ...completion,
             action: 'none',
             plan: validation.plan,
             decisionSource,
             reusedDryRunId,
             reuseFallbackReason,
+            ...(recoveryMode ? { recoveryCompleted: completion.status === 'ok', recoverySourceRunId } : {}),
           };
         }
       } else {
@@ -1957,7 +2576,14 @@ async function runPipelineWithLock({
     if (mode === 'live' && execution.executed) {
       await renewLease('riconciliazione');
       reconciliation = await reconcile({ client, plan: validation.plan, config, portfolioUserKey });
-      await audit(db, runId, reconciliation.ok ? 'info' : 'error', 'reconcile', `Divergenza massima ${(reconciliation.worstDivergence * 100).toFixed(2)}%`, reconciliation.rows);
+      await audit(
+        db,
+        runId,
+        reconciliation.ok ? 'info' : 'error',
+        'reconcile',
+        `Divergenza massima ${(reconciliation.worstDivergence * 100).toFixed(2)}% dopo ${reconciliation.attempts ?? 1} letture`,
+        reconciliation.rows,
+      );
       if (!reconciliation.ok) {
         liveFailSafeReason = `riconciliazione fuori tolleranza (${(reconciliation.worstDivergence * 100).toFixed(2)}%)`;
       }
@@ -2031,25 +2657,31 @@ async function runPipelineWithLock({
     }
 
     if (mode === 'live') {
-      const commitFailure = await commitLiveRunSuccess({
-        db,
-        runId,
-        config,
-        credentials,
-        equityUsd,
-        stage: 'live-final-fence',
-        data: { execution, reconciliation },
-      });
-      if (commitFailure) {
+      const completion = recoveryMode && recoveryOneShot
+        ? await completeRecoveryOneShot({
+          db, runId, config, credentials, equityUsd,
+          data: { execution, reconciliation, sourceRunId: recoverySourceRunId },
+        })
+        : await commitLiveRunSuccess({
+          db,
+          runId,
+          config,
+          credentials,
+          equityUsd,
+          stage: 'live-final-fence',
+          data: { execution, reconciliation },
+        });
+      if (completion && (recoveryMode || completion.status !== 'ok')) {
         return {
           runId,
-          ...commitFailure,
+          ...completion,
           plan: validation.plan,
           execution,
           reconciliation,
           decisionSource,
           reusedDryRunId,
           reuseFallbackReason,
+          ...(recoveryMode ? { recoveryCompleted: completion.status === 'ok', recoverySourceRunId } : {}),
         };
       }
     } else {

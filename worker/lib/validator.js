@@ -216,7 +216,10 @@ export function clampWeights(targetWeights, features, config, violations) {
 /**
  * @returns {{ok: boolean, violations: Array, plan: object}}
  */
-export function validateProposal({ proposal, features, config, ordersToday = 0, ledger = new Map(), scores = new Map(), completionSymbols = null }) {
+export function validateProposal({
+  proposal, features, config, ordersToday = 0, ledger = new Map(), scores = new Map(),
+  completionSymbols = null, initialConstructionOverride = false,
+}) {
   const violations = [];
   const equityUsd = features.portfolio.equityUsd;
   const bySymbol = new Map(features.instruments.map((item) => [item.symbol, item]));
@@ -336,8 +339,10 @@ export function validateProposal({ proposal, features, config, ordersToday = 0, 
 
   // Cap di turnover: scala proporzionalmente l'intero piano.
   const turnoverUsd = candidates.reduce((sum, item) => sum + Math.abs(item.deltaUsd), 0);
-  const initialConstruction = Number(features.portfolio.openPositions) === 0
-    && Number(features.portfolio.cashWeight) >= 0.95;
+  const initialConstruction = initialConstructionOverride || (
+    Number(features.portfolio.openPositions) === 0
+    && Number(features.portfolio.cashWeight) >= 0.95
+  );
   // Il turnover scelto dall'utente limita i ribilanciamenti successivi. La
   // costruzione iniziale può invece raggiungere il deployment esplicitamente
   // richiesto, altrimenti servirebbero cicli artificiali lasciando cassa ferma.

@@ -301,8 +301,25 @@ async function verifyOrders({ db, client, results, executionScale = 1 }) {
  * Rilegge il portafoglio reale e confronta i pesi con i target attesi.
  * Una divergenza oltre soglia è un segnale di esecuzione non allineata.
  */
-export async function reconcile({ client, plan, config, portfolioUserKey }) {
-  const snapshot = await client.portfolio(portfolioUserKey);
+export async function reconcile({
+  client, plan, config, portfolioUserKey,
+  maxAttempts = 4,
+  retryDelaysMs = [0, 1_500, 3_500, 7_000],
+}) {
+  const attemptsLimit = Math.max(1, Math.min(6, Number(maxAttempts) || 4));
+  let best = null;
+  for (let attempt = 0; attempt < attemptsLimit; attempt += 1) {
+    if (Number(retryDelaysMs[attempt]) > 0) await sleep(Number(retryDelaysMs[attempt]));
+    const snapshot = await client.portfolio(portfolioUserKey);
+    const result = reconcileSnapshot({ snapshot, plan, config, attempt: attempt + 1 });
+    if (!best || result.worstDivergence < best.worstDivergence) best = result;
+    if (result.ok) return { ...result, attempts: attempt + 1 };
+  }
+  return { ...best, attempts: attemptsLimit };
+}
+
+/** Confronto puro, separato dal polling per rendere verificabile il calcolo. */
+export function reconcileSnapshot({ snapshot, plan, config, attempt = 1 }) {
   const equity = snapshot.equityUsd || 1;
   const plannedEquity = plan.equityUsd || equity;
   const byInstrument = new Map();
@@ -328,6 +345,7 @@ export async function reconcile({ client, plan, config, portfolioUserKey }) {
   const worst = rows.reduce((max, row) => Math.max(max, row.divergence), 0);
   return {
     checkedAt: Date.now(),
+    attempt,
     equityUsd: snapshot.equityUsd,
     rows,
     worstDivergence: worst,

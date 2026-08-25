@@ -40,9 +40,10 @@ import {
 import { cn } from '@/lib/utils';
 import {
   autopilot, getBaseUrl, getControlToken, isTokenRemembered, setBaseUrl, setControlToken,
-  AutopilotError, LIVE_CONFIRMATION, LIVE_RECOVERY_CONFIRMATION,
+  AutopilotError, LIVE_CONFIRMATION, LIVE_RECOVERY_EXECUTE_CONFIRMATION, LIVE_RECOVERY_PREPARE_CONFIRMATION,
   type AutopilotState, type ExecutionMode, type RunBundle, type RunSummary,
-  type GuidedStrategyBundle, type LlmAttempt, type StrategyCollaboration, type StrategyTraceEvent,
+  type GuidedStrategyBundle, type LiveRecoveryPlanCandidate, type LiveRecoveryPreparationResult,
+  type LlmAttempt, type StrategyCollaboration, type StrategyTraceEvent,
 } from '@/lib/agent/autopilot-api';
 import {
   buildLlmTechnicalReport, copyJsonToClipboard, llmAttemptDebugFacts,
@@ -70,6 +71,21 @@ function allocationRows(weights: Record<string, number>) {
     remaining -= 1;
   }
   return rows.sort((a, b) => a.index - b.index).map(({ symbol, units }) => ({ symbol, percentage: units / 10 }));
+}
+
+function reconciliationRows(logs: RunBundle['logs'] | undefined) {
+  const entry = [...(logs ?? [])].reverse().find((log) => log.stage === 'reconcile' && Array.isArray(log.data));
+  if (!entry || !Array.isArray(entry.data)) return [];
+  return entry.data.flatMap((row) => {
+    if (!row || typeof row !== 'object') return [];
+    const value = row as Record<string, unknown>;
+    const symbol = typeof value.symbol === 'string' ? value.symbol : '';
+    const expectedWeight = Number(value.expectedWeight);
+    const actualWeight = Number(value.actualWeight);
+    const divergence = Number(value.divergence);
+    if (!symbol || ![expectedWeight, actualWeight, divergence].every(Number.isFinite)) return [];
+    return [{ symbol, expectedWeight, actualWeight, divergence }];
+  }).sort((left, right) => right.divergence - left.divergence);
 }
 
 function explainProposalError(error = '') {
@@ -228,6 +244,12 @@ export default function Autopilot() {
   const [livePersistenceAcknowledged, setLivePersistenceAcknowledged] = useState(false);
   const [liveActivationId, setLiveActivationId] = useState('');
   const [activatingLive, setActivatingLive] = useState(false);
+  const [recoveryPreview, setRecoveryPreview] = useState<LiveRecoveryPreparationResult | null>(null);
+  const [recoveryDialogOpen, setRecoveryDialogOpen] = useState(false);
+  const [selectedRecoveryRunId, setSelectedRecoveryRunId] = useState('');
+  const [recoveryConfirmation, setRecoveryConfirmation] = useState('');
+  const [recoveryAcknowledged, setRecoveryAcknowledged] = useState(false);
+  const [executingRecovery, setExecutingRecovery] = useState(false);
   const [remember, setRemember] = useState(() => (
     isTokenRemembered()
     || (typeof window !== 'undefined' && window.matchMedia('(max-width: 767px)').matches)
@@ -451,6 +473,98 @@ export default function Autopilot() {
     }
   };
 
+  const prepareRecovery = async () => {
+    setLoading(true);
+    try {
+      if (!verifiedWorkerOrigin || getBaseUrl() !== verifiedWorkerOrigin) {
+        throw new Error('Connessione Worker non verificata: aggiorna lo stato prima di preparare la ripresa.');
+      }
+      const safetyRevision = Number(config?.safetyRevision);
+      if (!Number.isInteger(safetyRevision) || safetyRevision < 0) {
+        throw new Error('Revisione di sicurezza assente: aggiorna lo stato prima di preparare la ripresa.');
+      }
+      const result = await autopilot.prepareRecovery({
+        safetyRevision,
+        confirmation: LIVE_RECOVERY_PREPARE_CONFIRMATION,
+      });
+      refreshSequence.current += 1;
+      setState((current) => current ? { ...current, config: result.config } : current);
+      if (result.status === 'ready') {
+        const selected = result.selectedSourceRunId ?? result.candidates?.[0]?.sourceRunId ?? '';
+        setRecoveryPreview(result);
+        setSelectedRecoveryRunId(selected);
+        setRecoveryConfirmation('');
+        setRecoveryAcknowledged(false);
+        setRecoveryDialogOpen(true);
+        toast.success(`Verifica completata: ${result.alreadyAcquired ?? 0} acquisti già riconosciuti`, {
+          description: 'Nessun ordine inviato. L’agente resta congelato finché non scegli e confermi il piano da completare.',
+          duration: 12_000,
+        });
+      } else {
+        toast.warning(result.reason ?? 'Recovery non ancora pronta', {
+          description: result.unresolved?.slice(0, 4).join(' · ') || 'L’agente resta congelato e nessun ordine viene inviato.',
+          duration: 15_000,
+        });
+      }
+      await refresh();
+    } catch (caught) {
+      toast.error(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const executeRecovery = async () => {
+    if (
+      !recoveryPreview
+      || !selectedRecoveryRunId
+      || recoveryConfirmation !== LIVE_RECOVERY_EXECUTE_CONFIRMATION
+      || !recoveryAcknowledged
+    ) return;
+    if (typeof crypto === 'undefined' || typeof crypto.randomUUID !== 'function') {
+      toast.error('Questo browser non può creare un identificatore sicuro per la recovery.');
+      return;
+    }
+    setExecutingRecovery(true);
+    setLoading(true);
+    try {
+      const safetyRevision = Number(recoveryPreview.config.safetyRevision);
+      if (!Number.isInteger(safetyRevision) || safetyRevision < 0) {
+        throw new Error('Revisione di sicurezza assente: ripeti la verifica degli acquisti.');
+      }
+      const result = await autopilot.executeRecovery({
+        activationId: crypto.randomUUID(),
+        sourceRunId: selectedRecoveryRunId,
+        safetyRevision,
+        confirmation: LIVE_RECOVERY_EXECUTE_CONFIRMATION,
+        acknowledgeOneShotShadow: true,
+      });
+      const detailMessage = result.error ?? result.reason ?? '';
+      if (result.safetyPersisted === false) {
+        toast.error('ALLARME CRITICO: arresto non confermato. Verifica subito eToro e non ripetere la recovery.', { duration: Infinity });
+      } else if (result.status === 'ok' && result.recoveryCompleted) {
+        toast.success('Piano completato sui dati aggiornati. Gli acquisti già presenti non sono stati ripetuti e l’Autopilot è tornato in Shadow.');
+        setRecoveryDialogOpen(false);
+        setRecoveryPreview(null);
+      } else if (result.status === 'frozen') {
+        toast.error(`Recovery fermata e agente congelato: ${detailMessage || 'verifica la run eToro'}`);
+      } else {
+        toast.warning(`Recovery non completata: ${detailMessage || 'apri il dettaglio della run'}`);
+      }
+      if (result.persistenceWarning) toast.warning(result.persistenceWarning, { duration: 20_000 });
+      await refresh();
+      if (result.runId) {
+        setActiveTab('storico');
+        await openRun(result.runId);
+      }
+    } catch (caught) {
+      toast.error(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setExecutingRecovery(false);
+      setLoading(false);
+    }
+  };
+
   const openRun = async (id: string) => {
     try { setDetail(await autopilot.run(id)); } catch (caught) { toast.error(caught instanceof Error ? caught.message : String(caught)); }
   };
@@ -572,6 +686,9 @@ export default function Autopilot() {
   const safelyStopped = frozen && mode === 'shadow';
   const dryRunForLive = state?.liveActivation?.dryRun ?? null;
   const willReuseDryRun = Boolean(dryRunForLive?.reusable);
+  const selectedRecoveryCandidate: LiveRecoveryPlanCandidate | null = recoveryPreview?.candidates
+    ?.find((candidate) => candidate.sourceRunId === selectedRecoveryRunId) ?? null;
+  const detailReconciliationRows = reconciliationRows(detail?.logs);
   const workerOrigin = getBaseUrl()
     || (typeof window !== 'undefined' ? window.location.origin : 'stessa origine');
   const realRuns = config?.realCapitalTrackingStartedAt
@@ -988,23 +1105,27 @@ export default function Autopilot() {
                         <p className="text-xs text-text-1">
                           {frozen
                             ? config?.recoveryRequired
-                              ? 'Recovery richiesta: verifica ordini e posizioni direttamente su eToro. Il pulsante di sblocco vale come conferma esplicita e lascia l’agente in Shadow.'
+                              ? 'Recovery richiesta: il Worker controllerà gli ordini già inviati e due letture del portfolio. Poi potrai scegliere il piano originale, vedere il residuo per asset e confermare soltanto gli ordini mancanti.'
                               : 'Nessuna nuova run può generare ordini. Verifica comunque su eToro quelli già accettati o in volo prima di riattivare.'
                             : 'Blocca subito nuovi invii. Gli ordini già accettati o in volo potrebbero non essere annullabili e vanno verificati su eToro.'}
                         </p>
                       </div>
                       {frozen ? (
-                        <Button variant="outline" size="sm" disabled={loading} onClick={() => void guarded('Agente riattivato in Shadow', () => {
-                          const safetyRevision = Number(config?.safetyRevision);
-                          if (!Number.isInteger(safetyRevision) || safetyRevision < 0) {
-                            return Promise.reject(new Error('Revisione di sicurezza assente: aggiorna lo stato prima di sbloccare.'));
+                        <Button variant="outline" size="sm" disabled={loading} onClick={() => {
+                          if (config?.recoveryRequired) {
+                            void prepareRecovery();
+                            return;
                           }
-                          return autopilot.unfreeze({
-                            safetyRevision,
-                            ...(config?.recoveryRequired ? { confirmation: LIVE_RECOVERY_CONFIRMATION } : {}),
+                          void guarded('Agente riattivato in Shadow', () => {
+                            const safetyRevision = Number(config?.safetyRevision);
+                            if (!Number.isInteger(safetyRevision) || safetyRevision < 0) {
+                              return Promise.reject(new Error('Revisione di sicurezza assente: aggiorna lo stato prima di sbloccare.'));
+                            }
+                            return autopilot.unfreeze({ safetyRevision });
                           });
-                        })}>
-                          <Unlock className="size-4" /> {config?.recoveryRequired ? 'Ho verificato eToro · sblocca' : 'Sblocca in Shadow'}
+                        }}>
+                          {loading ? <RefreshCw className="size-4 animate-spin" /> : <Unlock className="size-4" />}
+                          {config?.recoveryRequired ? 'Verifica acquisti · scegli piano' : 'Sblocca in Shadow'}
                         </Button>
                       ) : (
                         <Button variant="destructive" size="sm" disabled={safeStopping} onClick={() => void safeStop()}>
@@ -1280,28 +1401,59 @@ export default function Autopilot() {
                         </TabsContent>
 
                         <TabsContent value="ordini" className="pt-4">
-                          {detail.orders.length === 0 ? (
-                            <p className="text-sm text-text-1">Nessun ordine generato: l’allocazione era già entro le bande di tolleranza.</p>
-                          ) : (
-                            <Table>
-                              <TableHeader>
-                                <TableRow><TableHead>Strumento</TableHead><TableHead>Lato</TableHead><TableHead className="text-right">Importo</TableHead><TableHead>Stato</TableHead><TableHead>Nota</TableHead></TableRow>
-                              </TableHeader>
-                              <TableBody>
-                                {detail.orders.map((order, index) => (
-                                  <TableRow key={`${order.symbol}-${index}`}>
-                                    <TableCell className="font-medium text-text-0">{order.symbol}</TableCell>
-                                    <TableCell className={order.side === 'buy' ? 'text-gain' : 'text-loss'}>{order.side === 'buy' ? 'ACQUISTA' : 'VENDI'}</TableCell>
-                                    <TableCell className="text-right tabular-nums text-text-0">
-                                      {fmtUsd(order.amount_usd)} <span className="block text-[10px] text-text-2">capitale reale</span>
-                                    </TableCell>
-                                    <TableCell><Badge variant="outline">{order.state}</Badge></TableCell>
-                                    <TableCell className="max-w-[280px] truncate text-xs text-text-1">{order.message}</TableCell>
-                                  </TableRow>
-                                ))}
-                              </TableBody>
-                            </Table>
-                          )}
+                          <div className="space-y-5">
+                            {detail.orders.length === 0 ? (
+                              <p className="text-sm text-text-1">Nessun ordine generato: l’allocazione era già entro le bande di tolleranza.</p>
+                            ) : (
+                              <Table>
+                                <TableHeader>
+                                  <TableRow><TableHead>Strumento</TableHead><TableHead>Lato</TableHead><TableHead className="text-right">Importo</TableHead><TableHead>Stato</TableHead><TableHead>Nota</TableHead></TableRow>
+                                </TableHeader>
+                                <TableBody>
+                                  {detail.orders.map((order, index) => (
+                                    <TableRow key={`${order.symbol}-${index}`}>
+                                      <TableCell className="font-medium text-text-0">{order.symbol}</TableCell>
+                                      <TableCell className={order.side === 'buy' ? 'text-gain' : 'text-loss'}>{order.side === 'buy' ? 'ACQUISTA' : 'VENDI'}</TableCell>
+                                      <TableCell className="text-right tabular-nums text-text-0">
+                                        {fmtUsd(order.amount_usd)} <span className="block text-[10px] text-text-2">capitale reale</span>
+                                      </TableCell>
+                                      <TableCell><Badge variant="outline">{order.state}</Badge></TableCell>
+                                      <TableCell className="max-w-[280px] truncate text-xs text-text-1">{order.message}</TableCell>
+                                    </TableRow>
+                                  ))}
+                                </TableBody>
+                              </Table>
+                            )}
+
+                            {detailReconciliationRows.length > 0 ? (
+                              <div className="rounded-xl border border-hairline bg-bg-2/40 p-3">
+                                <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                                  <div>
+                                    <p className="text-sm font-medium text-text-0">Origine della divergenza</p>
+                                    <p className="text-xs text-text-1">Confronto fra peso atteso dopo gli ordini e ultima lettura eToro.</p>
+                                  </div>
+                                  <Badge variant={detailReconciliationRows[0].divergence > Number(config?.reconcileTolerancePct ?? 0.05) ? 'destructive' : 'outline'}>
+                                    massimo {fmtPct(detailReconciliationRows[0].divergence, 2)} · {detailReconciliationRows[0].symbol}
+                                  </Badge>
+                                </div>
+                                <Table>
+                                  <TableHeader>
+                                    <TableRow><TableHead>Strumento</TableHead><TableHead className="text-right">Atteso</TableHead><TableHead className="text-right">Letto su eToro</TableHead><TableHead className="text-right">Scarto</TableHead></TableRow>
+                                  </TableHeader>
+                                  <TableBody>
+                                    {detailReconciliationRows.map((row) => (
+                                      <TableRow key={row.symbol}>
+                                        <TableCell className="font-medium text-text-0">{row.symbol}</TableCell>
+                                        <TableCell className="text-right tabular-nums">{fmtPct(row.expectedWeight, 2)}</TableCell>
+                                        <TableCell className="text-right tabular-nums">{fmtPct(row.actualWeight, 2)}</TableCell>
+                                        <TableCell className={cn('text-right tabular-nums', row.divergence > Number(config?.reconcileTolerancePct ?? 0.05) ? 'text-loss' : 'text-text-0')}>{fmtPct(row.divergence, 2)}</TableCell>
+                                      </TableRow>
+                                    ))}
+                                  </TableBody>
+                                </Table>
+                              </div>
+                            ) : null}
+                          </div>
                         </TabsContent>
 
                         <TabsContent value="mercato" className="space-y-3 pt-4">
@@ -1349,6 +1501,161 @@ export default function Autopilot() {
           </motion.div>
         </>
       )}
+
+      <AlertDialog open={recoveryDialogOpen} onOpenChange={(open) => {
+        if (executingRecovery && !open) return;
+        setRecoveryDialogOpen(open);
+        if (!open) {
+          setRecoveryConfirmation('');
+          setRecoveryAcknowledged(false);
+        }
+      }}>
+        <AlertDialogContent className="max-h-[calc(100dvh-2rem)] overflow-y-auto sm:max-w-3xl">
+          <AlertDialogHeader>
+            <AlertDialogTitle className="flex items-center gap-2 text-text-0">
+              <ShieldAlert className="size-5 text-warn" /> Verifica e completa il piano originale
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              L’anteprima non ha inviato ordini e l’agente è ancora congelato. Scegli quale piano validato raggiungere: al momento della conferma il Worker rilegge eToro e compra o vende soltanto il delta ancora mancante.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+
+          {recoveryPreview?.orderSummary?.length ? (
+            <div className="rounded-xl border border-gain/25 bg-gain/5 p-3">
+              <p className="text-sm font-medium text-text-0">Ordini della run interrotta verificati su eToro</p>
+              <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                {recoveryPreview.orderSummary.map((order, index) => (
+                  <div key={`${order.symbol}-${index}`} className="flex items-center justify-between gap-3 rounded-lg border border-hairline bg-bg-1/70 px-3 py-2 text-xs">
+                    <span className="font-medium text-text-0">{order.symbol} · {order.side === 'buy' ? 'acquisto' : 'vendita'}</span>
+                    <span className="text-right tabular-nums text-text-1">
+                      richiesto {fmtUsd(order.amountUsd)} · eseguito {fmtUsd(order.filledUsd)}
+                      <span className="ml-1 block text-[10px] uppercase">{order.state}</span>
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
+
+          <div className="space-y-2">
+            <Label className="text-text-0">Piano da completare</Label>
+            <div className="grid gap-2">
+              {(recoveryPreview?.candidates ?? []).map((candidate) => {
+                const selected = candidate.sourceRunId === selectedRecoveryRunId;
+                return (
+                  <button
+                    key={candidate.sourceRunId}
+                    type="button"
+                    disabled={executingRecovery}
+                    onClick={() => setSelectedRecoveryRunId(candidate.sourceRunId)}
+                    className={cn(
+                      'rounded-xl border p-3 text-left transition-colors',
+                      selected ? 'border-agent bg-agent/10' : 'border-hairline bg-bg-2/40 hover:border-hairline-strong',
+                    )}
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="flex flex-wrap items-center gap-2 text-sm font-medium text-text-0">
+                        {candidate.sourceType === 'live' ? 'Piano Live interrotto' : 'Bilanciamento dry-run'} · {fmtDate(candidate.finishedAt)}
+                        {candidate.recommended ? <Badge className="bg-agent/15 text-agent hover:bg-agent/15">Consigliato</Badge> : null}
+                      </span>
+                      <span className="text-xs tabular-nums text-text-1">{candidate.residualOrderCount} residui · {fmtUsd(candidate.residualUsd)}</span>
+                    </div>
+                    <p className="mt-1 truncate text-xs text-text-1">{candidate.model ?? 'modello non registrato'} · affidabilità {fmtPct(candidate.confidence)}</p>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {selectedRecoveryCandidate ? (
+            <div className="rounded-xl border border-hairline bg-bg-2/40 p-3">
+              <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <p className="text-sm font-medium text-text-0">Obiettivo, già presente e residuo</p>
+                  <p className="text-xs text-text-1">Gli importi sono una fotografia: prima degli invii saranno ricalcolati sul portfolio reale aggiornato.</p>
+                </div>
+                <Badge variant="outline">capitale {fmtUsd(recoveryPreview?.snapshot?.equityUsd)}</Badge>
+              </div>
+              <div className="max-h-72 overflow-auto">
+                <Table>
+                  <TableHeader>
+                    <TableRow><TableHead>Asset</TableHead><TableHead className="text-right">Obiettivo</TableHead><TableHead className="text-right">Già presente</TableHead><TableHead className="text-right">Da completare</TableHead></TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {selectedRecoveryCandidate.residualPreview.map((row) => (
+                      <TableRow key={row.symbol}>
+                        <TableCell className="font-medium text-text-0">{row.symbol}</TableCell>
+                        <TableCell className="text-right tabular-nums">{fmtPct(row.targetWeight, 1)}<span className="block text-[10px] text-text-2">{fmtUsd(row.targetUsd)}</span></TableCell>
+                        <TableCell className="text-right tabular-nums">{fmtPct(row.actualWeight, 1)}<span className="block text-[10px] text-text-2">{fmtUsd(row.actualUsd)}</span></TableCell>
+                        <TableCell className={cn('text-right tabular-nums', row.actionable ? row.side === 'buy' ? 'text-gain' : 'text-loss' : 'text-text-2')}>
+                          {row.actionable ? `${row.side === 'buy' ? '+' : '−'}${fmtUsd(row.residualUsd)}` : 'completo'}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+            </div>
+          ) : null}
+
+          <Alert>
+            <ShieldAlert className="size-4" />
+            <AlertTitle>Recovery one-shot</AlertTitle>
+            <AlertDescription>
+              Non viene chiesta una nuova decisione all’AI. Gli ordini già riconosciuti riducono il residuo; gli ordini ambigui bloccano tutto. Dopo una riconciliazione riuscita la modalità torna automaticamente in Shadow.
+            </AlertDescription>
+          </Alert>
+
+          <div className="grid gap-2">
+            <Label htmlFor="recovery-confirmation" className="text-text-0">
+              Digita manualmente <code className="rounded bg-bg-2 px-1.5 py-0.5 text-loss">{LIVE_RECOVERY_EXECUTE_CONFIRMATION}</code>
+            </Label>
+            <Input
+              id="recovery-confirmation"
+              value={recoveryConfirmation}
+              onChange={(event) => setRecoveryConfirmation(event.target.value)}
+              onPaste={(event) => event.preventDefault()}
+              autoComplete="off"
+              spellCheck={false}
+              disabled={executingRecovery}
+              placeholder={LIVE_RECOVERY_EXECUTE_CONFIRMATION}
+              className="font-mono"
+            />
+          </div>
+
+          <div className="flex items-start gap-2.5 rounded-xl border border-warn/30 bg-warn/5 p-3 text-sm leading-relaxed text-text-0">
+            <Checkbox
+              id="recovery-one-shot-confirmation"
+              checked={recoveryAcknowledged}
+              onCheckedChange={(value) => setRecoveryAcknowledged(value === true)}
+              disabled={executingRecovery}
+              className="mt-0.5"
+            />
+            <Label htmlFor="recovery-one-shot-confirmation" className="cursor-pointer font-normal leading-relaxed">
+              Confermo il piano selezionato e capisco che verranno inviati ordini reali soltanto per il residuo ricalcolato; al termine l’Autopilot tornerà in Shadow.
+            </Label>
+          </div>
+
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={executingRecovery}>Lascia congelato</AlertDialogCancel>
+            <Button
+              type="button"
+              variant="destructive"
+              className="h-auto min-h-9 whitespace-normal py-2"
+              disabled={
+                executingRecovery
+                || !selectedRecoveryCandidate
+                || recoveryConfirmation !== LIVE_RECOVERY_EXECUTE_CONFIRMATION
+                || !recoveryAcknowledged
+              }
+              onClick={() => void executeRecovery()}
+            >
+              {executingRecovery ? <RefreshCw className="size-4 animate-spin" /> : <Radio className="size-4" />}
+              {executingRecovery ? 'Verifica e completamento in corso…' : 'Completa soltanto il residuo'}
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <AlertDialog open={confirmLive} onOpenChange={setLiveDialogOpen}>
         <AlertDialogContent className="max-h-[calc(100dvh-2rem)] overflow-y-auto sm:max-w-xl">

@@ -259,6 +259,85 @@ test('unfreeze invia revision esatta e conferma esplicita dopo la verifica eToro
   assert.deepEqual(JSON.parse(requests[0].init.body), payload);
 });
 
+test('prepareRecovery verifica gli acquisti senza inviare un comando Live', async () => {
+  const requests = [];
+  globalThis.fetch = async (input, init = {}) => {
+    requests.push({ url: String(input), init });
+    return jsonResponse({
+      status: 'ready',
+      mode: 'shadow',
+      config: { executionMode: 'shadow', frozen: true, recoveryRequired: true, safetyRevision: 18 },
+      alreadyAcquired: 4,
+      selectedSourceRunId: 'live-run-1',
+      candidates: [],
+    });
+  };
+  const payload = {
+    safetyRevision: 18,
+    confirmation: 'VERIFICA ACQUISTI E PREPARA RIPRESA',
+  };
+
+  const result = await autopilot.prepareRecovery(payload);
+
+  assert.equal(result.status, 'ready');
+  assert.equal(result.mode, 'shadow');
+  assert.equal(result.alreadyAcquired, 4);
+  assert.equal(requests[0].url, 'https://worker.example/agent/recovery/prepare');
+  assert.equal(requests[0].init.method, 'POST');
+  assert.deepEqual(JSON.parse(requests[0].init.body), payload);
+  assert.ok(!requests[0].url.includes('activate-and-run'));
+});
+
+test('executeRecovery invia piano scelto, revision e conferma one-shot', async () => {
+  const requests = [];
+  globalThis.fetch = async (input, init = {}) => {
+    requests.push({ url: String(input), init });
+    return jsonResponse({
+      activationId: liveActivationId,
+      runId: 'recovery-run-1',
+      status: 'ok',
+      mode: 'shadow',
+      recovery: true,
+      recoveryCompleted: true,
+      recoverySourceRunId: 'dry-run-22',
+    });
+  };
+  const payload = {
+    activationId: liveActivationId,
+    sourceRunId: 'dry-run-22',
+    safetyRevision: 18,
+    confirmation: 'COMPLETA PIANO',
+    acknowledgeOneShotShadow: true,
+  };
+
+  const result = await autopilot.executeRecovery(payload);
+
+  assert.equal(result.recoveryCompleted, true);
+  assert.equal(result.mode, 'shadow');
+  assert.equal(requests[0].url, 'https://worker.example/agent/recovery/execute');
+  assert.equal(requests[0].init.method, 'POST');
+  assert.deepEqual(JSON.parse(requests[0].init.body), payload);
+});
+
+test('executeRecovery rifiuta un falso successo che non termina in Shadow', async () => {
+  globalThis.fetch = async () => jsonResponse({
+    activationId: liveActivationId,
+    runId: 'recovery-run-1',
+    status: 'ok',
+    mode: 'live',
+    recovery: true,
+    recoveryCompleted: true,
+    recoverySourceRunId: 'dry-run-22',
+  });
+  await assert.rejects(() => autopilot.executeRecovery({
+    activationId: liveActivationId,
+    sourceRunId: 'dry-run-22',
+    safetyRevision: 18,
+    confirmation: 'COMPLETA PIANO',
+    acknowledgeOneShotShadow: true,
+  }), /deve terminare in Shadow/);
+});
+
 test('activateLive rifiuta fail-closed payload 2xx incoerenti o malformati', async (t) => {
   const payload = {
     activationId: liveActivationId,

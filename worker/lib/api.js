@@ -3,7 +3,7 @@
  * `CONTROL_TOKEN`; il passaggio a modalità `live` richiede una conferma
  * esplicita aggiuntiva.
  */
-import { activateLiveAndRun, runPipeline } from './pipeline.js';
+import { activateLiveAndRun, executeLiveRecovery, prepareLiveRecovery, runPipeline } from './pipeline.js';
 import { extractJson, listFreeModels } from './brain.js';
 import { buildStrategyActivationNotification, notify, notifyTest } from './notify.js';
 import {
@@ -28,6 +28,7 @@ import {
 import {
   buildDecisionContext, classifyDryRunForReuse, isDecisionConfigPatch,
   LIVE_CONFIRMATION, LIVE_DRY_RUN_TTL_MS, LIVE_RECOVERY_CONFIRMATION,
+  LIVE_RECOVERY_EXECUTE_CONFIRMATION, LIVE_RECOVERY_PREPARE_CONFIRMATION,
 } from './live-plan.js';
 
 /** Confronto a tempo costante: evita di rivelare il token per timing. */
@@ -1203,6 +1204,45 @@ export async function handleAgentApi(request, env, ctx, pathname) {
     });
     await audit(db, null, 'warn', 'config', `Arresto in sicurezza: ${reason}`);
     return json({ ok: true, config });
+  }
+  if (route === 'recovery/prepare' && method === 'POST') {
+    const current = await loadConfig(db);
+    const expectedSafetyRevision = Number(body.safetyRevision);
+    if (!Number.isInteger(expectedSafetyRevision) || expectedSafetyRevision < 0) {
+      return json({ error: 'safetyRevision corrente obbligatoria per preparare la recovery', config: current }, 409);
+    }
+    if (body.confirmation !== LIVE_RECOVERY_PREPARE_CONFIRMATION) {
+      return json({ error: `serve confirmation = "${LIVE_RECOVERY_PREPARE_CONFIRMATION}"`, config: current }, 400);
+    }
+    const result = await prepareLiveRecovery({ env, expectedSafetyRevision });
+    return json(result, result.busy ? 409 : 200);
+  }
+  if (route === 'recovery/execute' && method === 'POST') {
+    const activationId = String(body.activationId ?? '').trim();
+    const sourceRunId = String(body.sourceRunId ?? '').trim();
+    const expectedSafetyRevision = Number(body.safetyRevision);
+    if (!/^[a-f0-9-]{20,80}$/i.test(activationId)) {
+      return json({ error: 'activationId non valido' }, 400);
+    }
+    if (!sourceRunId || sourceRunId.length > 200) {
+      return json({ error: 'sourceRunId del piano obbligatorio' }, 400);
+    }
+    if (!Number.isInteger(expectedSafetyRevision) || expectedSafetyRevision < 0) {
+      return json({ error: 'safetyRevision corrente obbligatoria per completare la recovery' }, 409);
+    }
+    if (body.confirmation !== LIVE_RECOVERY_EXECUTE_CONFIRMATION) {
+      return json({ error: `serve confirmation = "${LIVE_RECOVERY_EXECUTE_CONFIRMATION}"` }, 400);
+    }
+    if (body.acknowledgeOneShotShadow !== true) {
+      return json({ error: 'acknowledgeOneShotShadow deve essere true' }, 400);
+    }
+    const result = await executeLiveRecovery({
+      env,
+      activationId,
+      sourceRunId,
+      expectedSafetyRevision,
+    });
+    return json(result, result.busy ? 409 : 200);
   }
   if (route === 'freeze' && method === 'POST') {
     const reason = String(body.reason ?? 'freeze manuale').slice(0, 300);
