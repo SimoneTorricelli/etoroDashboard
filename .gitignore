@@ -1,3 +1,21 @@
 node_modules
 dist
 .DS_Store
+
+# Build e cache locali di Wrangler/Cloudflare
+.wrangler
+.mf
+worker-configuration.d.ts
+
+# Variabili locali: contengono credenziali, non devono mai finire nel repo
+.dev.vars
+.dev.vars.*
+.env
+.env.*
+!.env.example
+
+# Log e output di tool
+*.log
+npm-debug.log*
+.eslintcache
+coverage
