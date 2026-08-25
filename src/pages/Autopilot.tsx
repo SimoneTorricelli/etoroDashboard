@@ -221,7 +221,7 @@ export default function Autopilot() {
     void autopilot.agentPortfolios()
       .then(({ portfolios }) => {
         if (cancelled) return;
-        const activeId = state?.config.activeAgentPortfolioId;
+        const activeId = state?.config?.activeAgentPortfolioId;
         const verified = Boolean(state?.agentBindingVerified);
         setOnboardingPortfolios(portfolios.map((portfolio) => ({
           id: portfolio.id,
@@ -234,7 +234,7 @@ export default function Autopilot() {
         if (!cancelled) setOnboardingPortfolios(undefined);
       });
     return () => { cancelled = true; };
-  }, [onboardingOpen, state?.config.activeAgentPortfolioId, state?.agentBindingVerified]);
+  }, [onboardingOpen, state?.config?.activeAgentPortfolioId, state?.agentBindingVerified]);
 
   const guarded = async (label: string, task: () => Promise<unknown>) => {
     setLoading(true);
@@ -284,7 +284,7 @@ export default function Autopilot() {
     if (!getControlToken()) throw new Error('Collega prima il Worker con il CONTROL_TOKEN. La bozza locale non è stata attivata.');
     const selected = onboardingPortfolios?.find((portfolio) => portfolio.id === answers.portfolioId);
     const isVerified = selected?.status === 'connected'
-      || (state?.config.activeAgentPortfolioId === answers.portfolioId && Boolean(state.agentBindingVerified));
+      || (state?.config?.activeAgentPortfolioId === answers.portfolioId && Boolean(state?.agentBindingVerified));
     if (!isVerified) {
       const generated = await autopilot.generateAgentToken(answers.portfolioId, selected?.name);
       toast.success(`Token ${generated.hint} verificato sul portfolio selezionato.`);
@@ -359,21 +359,21 @@ export default function Autopilot() {
   if (onboardingOpen) {
     const showReview = reviewingSavedStrategy || onboardingQuery === 'review';
     const previewAnswers = DEFAULT_STRATEGY_ONBOARDING_ANSWERS;
-    const savedAnswers = state?.config.guidedOnboardingAnswers as Partial<StrategyOnboardingAnswers> | null | undefined;
+    const savedAnswers = state?.config?.guidedOnboardingAnswers as Partial<StrategyOnboardingAnswers> | null | undefined;
     const initialAnswers = {
       ...previewAnswers,
       ...(reviewingSavedStrategy ? savedAnswers : null),
       budgetEur: reviewingSavedStrategy
-        ? savedAnswers?.budgetEur ?? state?.config.budgetEur ?? previewAnswers.budgetEur
-        : state?.config.budgetEur ?? previewAnswers.budgetEur,
+        ? savedAnswers?.budgetEur ?? state?.config?.budgetEur ?? previewAnswers.budgetEur
+        : state?.config?.budgetEur ?? previewAnswers.budgetEur,
       strategyName: reviewingSavedStrategy
-        ? savedAnswers?.strategyName ?? state?.config.strategyName ?? previewAnswers.strategyName
-        : state?.config.strategyName || previewAnswers.strategyName,
+        ? savedAnswers?.strategyName ?? state?.config?.strategyName ?? previewAnswers.strategyName
+        : state?.config?.strategyName || previewAnswers.strategyName,
       portfolioId: reviewingSavedStrategy
-        ? savedAnswers?.portfolioId ?? state?.config.activeAgentPortfolioId ?? previewAnswers.portfolioId
-        : state?.config.activeAgentPortfolioId || previewAnswers.portfolioId,
+        ? savedAnswers?.portfolioId ?? state?.config?.activeAgentPortfolioId ?? previewAnswers.portfolioId
+        : state?.config?.activeAgentPortfolioId || previewAnswers.portfolioId,
     };
-    const savedDraft = state?.config.strategyDraft as StrategyOnboardingDraft | null | undefined;
+    const savedDraft = state?.config?.strategyDraft as StrategyOnboardingDraft | null | undefined;
     return (
       <div className="fixed inset-y-0 left-0 right-0 z-50 overflow-y-auto bg-[#faf9f5] md:left-16 xl:left-[232px]">
         <Toaster position="top-right" richColors />
@@ -394,7 +394,7 @@ export default function Autopilot() {
           onGenerate={generateGuidedStrategy}
           onActivate={activateGuidedStrategy}
           generationTrace={strategyTrace}
-          collaboration={strategyBundle?.collaboration ?? state?.config.strategyCollaboration ?? null}
+          collaboration={strategyBundle?.collaboration ?? state?.config?.strategyCollaboration ?? null}
           readOnly={reviewingSavedStrategy && Boolean(savedDraft)}
         />
       </div>

@@ -157,6 +157,7 @@ export function ActiveStrategyDashboard({
               ))}
             </ul>
           </div>
+          {draft.allocationNote ? <p className="mt-3 text-xs leading-relaxed text-text-1">{draft.allocationNote}</p> : null}
         </article>
 
         <article className="asd-panel asd-scenario-panel">

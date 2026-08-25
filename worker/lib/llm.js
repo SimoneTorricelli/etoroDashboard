@@ -11,6 +11,71 @@ const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
 const PROVIDER_FALLBACK_ORDER = ['workers-ai', 'gemini', 'groq', 'openrouter'];
 
 /**
+ * Modelli OpenRouter gratuiti scelti per ragionamento e, quando disponibile,
+ * output strutturato. I modelli musicali, di safety, coding-only o percettivi
+ * non sono adatti a decidere o revisionare una policy di portafoglio.
+ */
+export const OPENROUTER_REASONING_MODELS = [
+  'nvidia/nemotron-3-ultra-550b-a55b:free',
+  'z-ai/glm-5.2:free',
+  'nvidia/nemotron-3-super-120b-a12b:free',
+  'minimax/minimax-m3:free',
+  'google/gemma-4-31b-it:free',
+  'minimax/minimax-m2.7:free',
+];
+
+const REASONING_MODEL_SET = new Set(OPENROUTER_REASONING_MODELS);
+const STRUCTURED_MODEL_SET = new Set([
+  'z-ai/glm-5.2:free',
+  'nvidia/nemotron-3-super-120b-a12b:free',
+  'minimax/minimax-m3:free',
+  'google/gemma-4-31b-it:free',
+  'minimax/minimax-m2.7:free',
+  'stealth/ox-alpha',
+]);
+const MODEL_FIT = new Map([
+  ['nvidia/nemotron-3-ultra-550b-a55b:free', 'Guida e revisione complessa'],
+  ['z-ai/glm-5.2:free', 'Verifica numerica e JSON'],
+  ['nvidia/nemotron-3-super-120b-a12b:free', 'Revisione multi-step'],
+  ['minimax/minimax-m3:free', 'Sintesi e fallback'],
+  ['google/gemma-4-31b-it:free', 'Revisione strutturata'],
+  ['minimax/minimax-m2.7:free', 'Fallback operativo'],
+]);
+
+export function isFreeOpenRouterModel(model) {
+  const id = String(model ?? '').trim();
+  return id === 'openrouter/free' || id.endsWith(':free') || id === 'stealth/ox-alpha';
+}
+
+export function modelVendor(entry) {
+  const model = String(entry?.model ?? '').replace(/^@cf\//, '');
+  return model.split('/')[0] || String(entry?.provider ?? 'unknown');
+}
+
+const REVIEW_MODEL_SCORE = new Map([
+  ['nvidia/nemotron-3-ultra-550b-a55b:free', 100],
+  ['z-ai/glm-5.2:free', 98],
+  ['@cf/openai/gpt-oss-120b', 97],
+  ['nvidia/nemotron-3-super-120b-a12b:free', 96],
+  ['@cf/nvidia/nemotron-3-120b-a12b', 95],
+  ['minimax/minimax-m3:free', 92],
+  ['google/gemma-4-31b-it:free', 90],
+  ['@cf/qwen/qwen3-30b-a3b-fp8', 88],
+  ['minimax/minimax-m2.7:free', 84],
+]);
+
+/** Revisori: reasoning forte prima, poi laboratori diversi dal modello guida. */
+export function prioritizeReviewPlan(plan, leadAttempt = null) {
+  const leadVendor = modelVendor(leadAttempt);
+  return [...plan].sort((left, right) => {
+    const leftSameVendor = leadVendor && modelVendor(left) === leadVendor ? 1 : 0;
+    const rightSameVendor = leadVendor && modelVendor(right) === leadVendor ? 1 : 0;
+    if (leftSameVendor !== rightSameVendor) return leftSameVendor - rightSameVendor;
+    return (REVIEW_MODEL_SCORE.get(right.model) ?? 0) - (REVIEW_MODEL_SCORE.get(left.model) ?? 0);
+  });
+}
+
+/**
  * Modelli testuali di Workers AI adatti a ragionamento strutturato.
  * Il prefisso `@cf/` è la convenzione dei modelli ospitati da Cloudflare.
  */
@@ -36,7 +101,7 @@ export const PROVIDERS = {
     needsKey: 'openrouterApiKey',
     // Fallback ufficiale di OpenRouter: se l'utente non ha scelto un modello
     // specifico, il router seleziona un modello gratuito compatibile con JSON.
-    defaultModels: ['openrouter/free'],
+    defaultModels: [...OPENROUTER_REASONING_MODELS, 'openrouter/free'],
   },
   gemini: {
     id: 'gemini',
@@ -101,7 +166,8 @@ async function callOpenRouter({ apiKey, model, messages, temperature, maxTokens,
       messages,
       temperature,
       max_tokens: maxTokens,
-      ...(jsonMode ? { response_format: { type: 'json_object' } } : {}),
+      ...(REASONING_MODEL_SET.has(model) ? { reasoning: { effort: 'medium', exclude: true } } : {}),
+      ...(jsonMode && STRUCTURED_MODEL_SET.has(model) ? { response_format: { type: 'json_object' } } : {}),
     }),
   });
   const text = await response.text();
@@ -204,7 +270,8 @@ export function buildAttemptPlan({ config, credentials, env }) {
       ? config.llmModels[providerId]
       : [];
     const models = providerId === 'openrouter'
-      ? [...new Set([...configuredModels, ...(provider.defaultModels ?? [])].filter(Boolean))]
+      ? [...new Set([...(provider.defaultModels ?? []), ...configuredModels]
+        .filter((model) => model && isFreeOpenRouterModel(model)))]
       : [...new Set([...(provider.defaultModels ?? []), ...configuredModels].filter(Boolean))];
     if (models.length) routes.push({ provider: providerId, models });
   }
@@ -261,14 +328,23 @@ export async function listFreeModels(apiKey) {
       // Senza questo filtro finiscono in lista modelli di immagini, audio o musica.
       const modality = String(model?.architecture?.modality ?? '');
       const outputs = model?.architecture?.output_modalities ?? [];
-      const textOut = modality.endsWith('->text') || (Array.isArray(outputs) && outputs.includes('text'));
+      const textOut = Array.isArray(outputs) && outputs.length
+        ? outputs.length === 1 && outputs[0] === 'text'
+        : modality.endsWith('->text');
       const textIn = !modality || modality.startsWith('text');
-      return textOut && textIn;
+      return textOut && textIn && !String(model?.id ?? '').includes('content-safety');
     })
     .map((model) => ({
       id: model.id,
       name: model.name,
       contextLength: model.context_length ?? null,
+      recommendedRank: OPENROUTER_REASONING_MODELS.indexOf(model.id) >= 0
+        ? OPENROUTER_REASONING_MODELS.indexOf(model.id) + 1
+        : null,
+      fit: MODEL_FIT.get(model.id) ?? null,
+      reasoning: Array.isArray(model.supported_parameters) && (model.supported_parameters.includes('reasoning') || model.supported_parameters.includes('reasoning_effort')),
+      structuredOutput: Array.isArray(model.supported_parameters) && (model.supported_parameters.includes('response_format') || model.supported_parameters.includes('structured_outputs')),
     }))
-    .sort((a, b) => (b.contextLength ?? 0) - (a.contextLength ?? 0));
+    .sort((a, b) => (a.recommendedRank ?? Number.MAX_SAFE_INTEGER) - (b.recommendedRank ?? Number.MAX_SAFE_INTEGER)
+      || (b.contextLength ?? 0) - (a.contextLength ?? 0));
 }

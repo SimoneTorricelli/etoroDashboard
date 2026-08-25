@@ -171,6 +171,8 @@ export function buildFeatures({ snapshot, universe, candles, external, config, e
     bySymbol.set(symbol, {
       symbol,
       class: meta.class,
+      sector: meta.sector ?? null,
+      themes: Array.isArray(meta.themes) ? [...meta.themes] : [],
       exposureGroup: meta.exposureGroup ?? exposureGroupFor(symbol),
       instrumentId: meta.instrumentId,
       weight: round(valueUsd / equityUsd, 4),
@@ -206,6 +208,14 @@ export function buildFeatures({ snapshot, universe, candles, external, config, e
   }
   byClass.cash = cashWeight;
 
+  // È una scomposizione diretta dei ticker catalogati, non un look-through
+  // delle partecipazioni interne agli ETF broad-market.
+  const bySector = {};
+  for (const item of instruments) {
+    if (!item.sector || item.weight <= 0) continue;
+    bySector[item.sector] = round((bySector[item.sector] ?? 0) + item.weight, 4);
+  }
+
   const weights = instruments.map((item) => item.weight).filter((value) => value > 0);
   const herfindahl = round(weights.reduce((sum, value) => sum + value ** 2, 0), 4);
 
@@ -232,6 +242,7 @@ export function buildFeatures({ snapshot, universe, candles, external, config, e
     eurUsd: external?.eurUsd?.rate ?? config.fallbackEurUsd,
     portfolio,
     allocationByClass: byClass,
+    allocationBySector: bySector,
     instruments,
     regime: marketRegime(external),
     crypto: external?.crypto ?? null,
@@ -261,6 +272,10 @@ export function renderFeaturesPrompt(features, config, { includeInstruments = tr
   lines.push(`PORTAFOGLIO REALE GESTITO fascia_capitale=${bandFloor}-${bandCeil} EUR cash=${(features.allocationByClass.cash * 100).toFixed(1)}% investito=${investedPct.toFixed(1)}% posizioni=${p.openPositions}`);
   lines.push(`STORICO equity 1w=${p.equityRet1w ?? 'n/d'}% 1m=${p.equityRet1m ?? 'n/d'}% maxDD=${p.equityMaxDd ?? 'n/d'}% concentrazione_HHI=${p.concentrationHhi} pos_efficaci=${p.effectivePositions ?? 'n/d'}`);
   lines.push(`CLASSI ${Object.entries(features.allocationByClass).map(([key, value]) => `${key}=${(value * 100).toFixed(1)}%`).join(' ')}`);
+  const sectorEntries = Object.entries(features.allocationBySector ?? {});
+  if (sectorEntries.length) {
+    lines.push(`SETTORI_DIRETTI ${sectorEntries.map(([key, value]) => `${key}=${(value * 100).toFixed(1)}%`).join(' ')} (ETF broad-market esclusi: no look-through)`);
+  }
 
   const r = features.regime;
   lines.push(`REGIME ${r.label} (score ${r.score}) VIX=${r.vix ?? 'n/d'} SPX_vs_SMA200=${r.spxVsSma200 ?? 'n/d'}% SPX_vs_SMA50=${r.spxVsSma50 ?? 'n/d'}% curva_10y2y=${r.yieldCurveBp ?? 'n/d'}bp news_net=${r.newsNet}`);
@@ -272,11 +287,12 @@ export function renderFeaturesPrompt(features, config, { includeInstruments = tr
 
   if (includeInstruments) {
     lines.push('');
-    lines.push('STRUMENTI  peso%  max%  1m%    3m%    12m%   vol30  RSI  vsSMA50  vsSMA200  mom   corrSPY  pnl%');
+    lines.push('STRUMENTI  settore        peso%  max%  1m%    3m%    12m%   vol30  RSI  vsSMA50  vsSMA200  mom   corrSPY  pnl%');
     for (const item of features.instruments) {
       const cell = (value, width, suffix = '') => `${value == null ? 'n/d' : value}${suffix}`.padEnd(width);
       lines.push([
         item.symbol.padEnd(10),
+        String(item.sector ?? 'broad/altro').padEnd(14).slice(0, 14),
         cell((item.weight * 100).toFixed(1), 6),
         cell((item.maxWeight * 100).toFixed(0), 5),
         cell(item.ret1m, 6),

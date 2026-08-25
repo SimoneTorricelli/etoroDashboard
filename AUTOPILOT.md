@@ -96,7 +96,7 @@ interna all'executor e viene applicata soltanto al momento dell'invio a eToro.
 | `schema.sql` | Schema D1 per migrazione manuale |
 | `lib/strategy.js` | Contratto versionato onboarding → StrategySpec + scenari deterministici |
 | `lib/universe-policy.js` | Catalogo tassonomico e policy dell’universo dinamico |
-| `selftest.mjs` e `*-selftest.mjs` | 77 test deterministici e di regressione |
+| `selftest.mjs` e `*-selftest.mjs` | 103 test deterministici e di regressione |
 
 ### Frontend — `src/`
 
@@ -175,6 +175,14 @@ al nuovo tentativo. Le somme moderatamente errate sono riparate in modo
 deterministico e visibile: un totale sotto il 100% completa la differenza in
 cassa; un totale sopra il 100% viene riscalato proporzionalmente. Errori estremi,
 simboli non ammessi e strutture non JSON restano bloccanti.
+
+Le revisioni della StrategySpec ricevono i limiti effettivi dell'onboarding
+prima di iniziare: eventuali riduzioni, per esempio `18% → 12%` sul singolo
+asset, compaiono nella traccia. Un controllo deterministico scarta inoltre una
+revisione che contiene confronti percentuali falsi. Il ribilanciamento applica
+anche il tetto settoriale aggregato ai ticker con settore catalogato; gli ETF
+broad-market restano esplicitamente fuori dal look-through finché non sono
+disponibili dati affidabili sulle partecipazioni interne.
 
 ---
 
@@ -279,7 +287,7 @@ primo che risponde con una proposta valida.
 
 | Provider | Chiave | Costo | Note |
 |---|---|---|---|
-| **Cloudflare Workers AI** | nessuna | incluso nel piano Workers | Binding interno: non consuma subrequest |
+| **Cloudflare Workers AI** | nessuna | entro l’allocazione gratuita del piano | Binding interno: non consuma subrequest |
 | Google Gemini | gratuita | free tier generoso | `aistudio.google.com` |
 | Groq | gratuita | free tier a rate limit | `console.groq.com` |
 | OpenRouter | gratuita | catalogo in contrazione | riserva |
@@ -287,6 +295,14 @@ primo che risponde con una proposta valida.
 **Perché non solo OpenRouter:** durante lo sviluppo si è visto che le varianti
 `:free` vengono ritirate progressivamente (`"This model is unavailable for
 free"`). Costruire su un catalogo che si svuota non è sostenibile.
+
+OpenRouter accetta soltanto endpoint a prezzo zero. La priorità automatica
+attuale è: **Nemotron 3 Ultra → GLM 5.2 → Nemotron 3 Super → MiniMax M3 →
+Gemma 4 31B → MiniMax M2.7 → router free**. Sui modelli compatibili viene
+abilitato reasoning `medium`: lascia spazio sufficiente all'output JSON senza
+rinunciare al controllo multi-step. I revisori vengono ordinati anche per
+laboratorio, così due risposte dello stesso vendor non vengono trattate come
+vera validazione indipendente.
 
 ### Ottimizzazione del prompt
 
@@ -433,9 +449,9 @@ Telegram e webhook generico, entrambi opzionali e non bloccanti.
 
 ## 14. Test
 
-96 test complessivi, tutti senza rete reale:
+103 test complessivi, tutti senza rete reale:
 
-- 57 in `worker/selftest.mjs` per feature, capitale reale, parsing Responses API GPT-OSS, riparazione dei pesi, retry AI, guardrail, revisione multi-provider, esposizioni equivalenti, asset statici, watcher, executor e
+- 64 in `worker/selftest.mjs` per feature, capitale reale, parsing Responses API GPT-OSS, riparazione dei pesi, retry AI, catalogo gratuito, guardrail settoriali, revisione aritmetica multi-provider, esposizioni equivalenti, asset statici, watcher, executor e
   riconciliazione
 - 18 in `worker/strategy-selftest.mjs` per onboarding, consenso e StrategySpec
 - 11 in `worker/universe-policy-selftest.mjs` per universo dinamico e sell-only
@@ -453,7 +469,7 @@ watcher.
 ```bash
 npm run dev             # dashboard in locale
 npm run build           # build di produzione
-npm run test:worker     # 38 test del motore deterministico
+npm run test:worker     # 64 test del motore deterministico
 npm run worker:dev      # Worker in locale
 npm run db:migrate      # schema su D1 remoto
 npm run deploy          # build + deploy su Cloudflare

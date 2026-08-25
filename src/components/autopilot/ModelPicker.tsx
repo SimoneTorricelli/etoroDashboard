@@ -18,6 +18,10 @@ interface FreeModel {
   id: string;
   name: string;
   contextLength: number | null;
+  recommendedRank?: number | null;
+  fit?: string | null;
+  reasoning?: boolean;
+  structuredOutput?: boolean;
 }
 
 interface Props {
@@ -128,6 +132,11 @@ export function ModelPicker({ providers, models, onChange }: Props) {
                 {list.length === 0 && (
                   <p className="text-[11px] text-text-2">Nessun modello indicato: verranno usati quelli predefiniti del provider.</p>
                 )}
+                {providerId === 'openrouter' && meta?.defaultModels?.length ? (
+                  <p className="text-[11px] leading-relaxed text-text-2">
+                    Priorità gratuita automatica: {meta.defaultModels.slice(0, 4).join(' → ')}.
+                  </p>
+                ) : null}
               </div>
             </div>
           );
@@ -157,10 +166,14 @@ export function ModelPicker({ providers, models, onChange }: Props) {
               return (
                 <div key={model.id} className={cn('flex items-center justify-between gap-2 rounded-md p-1.5', !added && 'hover:bg-bg-2')}>
                   <div className="min-w-0">
-                    <p className="truncate text-xs text-text-0">{model.name}</p>
+                    <p className="flex items-center gap-1.5 truncate text-xs text-text-0">
+                      <span className="truncate">{model.name}</span>
+                      {model.recommendedRank ? <Badge variant="secondary" className="shrink-0 text-[9px]">scelta {model.recommendedRank}</Badge> : null}
+                    </p>
                     <p className="truncate font-mono text-[10px] text-text-2">
                       {model.id}{model.contextLength ? ` · ${(model.contextLength / 1000).toFixed(0)}k contesto` : ''}
                     </p>
+                    {model.fit ? <p className="text-[10px] text-agent">{model.fit}{model.reasoning ? ' · reasoning' : ''}{model.structuredOutput ? ' · JSON' : ''}</p> : null}
                   </div>
                   {added ? (
                     <Badge variant="outline" className="shrink-0 text-[10px]">in uso</Badge>

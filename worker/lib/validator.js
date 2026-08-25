@@ -128,6 +128,27 @@ export function clampWeights(targetWeights, features, config, violations) {
     }
   }
 
+  const sectorCap = Number(config.maxSectorWeightPct) || 1;
+  const sectorTotals = {};
+  for (const [symbol, weight] of Object.entries(weights)) {
+    if (symbol === 'CASH') continue;
+    const sector = bySymbol.get(symbol)?.sector;
+    if (sector) sectorTotals[sector] = (sectorTotals[sector] ?? 0) + weight;
+  }
+  for (const [sector, total] of Object.entries(sectorTotals)) {
+    if (total <= sectorCap || total === 0) continue;
+    const factor = sectorCap / total;
+    violations.push(violation(
+      'sector_cap',
+      `settore ${sector}: esposizione diretta ${(total * 100).toFixed(1)}% ridotta al tetto ${(sectorCap * 100).toFixed(0)}%`,
+      'clamped',
+      { sector, directExposureOnly: true },
+    ));
+    for (const [symbol, weight] of Object.entries(weights)) {
+      if (symbol !== 'CASH' && bySymbol.get(symbol)?.sector === sector) weights[symbol] = weight * factor;
+    }
+  }
+
   const invested = Object.entries(weights).reduce((sum, [symbol, weight]) => sum + (symbol === 'CASH' ? 0 : weight), 0);
   let cash = round(1 - invested, 4);
 
@@ -146,10 +167,13 @@ export function clampWeights(targetWeights, features, config, violations) {
     // il piano viene bloccato invece di lasciare cassa non intenzionale.
     let excess = cash - config.maxCashPct;
     const classCurrent = {};
+    const sectorCurrent = {};
     for (const [symbol, weight] of Object.entries(weights)) {
       if (symbol === 'CASH') continue;
-      const klass = bySymbol.get(symbol)?.class ?? 'other';
+      const meta = bySymbol.get(symbol);
+      const klass = meta?.class ?? 'other';
       classCurrent[klass] = (classCurrent[klass] ?? 0) + weight;
+      if (meta?.sector) sectorCurrent[meta.sector] = (sectorCurrent[meta.sector] ?? 0) + weight;
     }
     for (let pass = 0; pass < 4 && excess > 0.0001; pass += 1) {
       const capacities = Object.entries(weights)
@@ -159,7 +183,8 @@ export function clampWeights(targetWeights, features, config, violations) {
           const klass = meta?.class ?? 'other';
           const symbolRoom = Math.max(0, (meta?.maxWeight ?? 0) - weight);
           const classRoom = Math.max(0, (classCaps[klass] ?? 1) - (classCurrent[klass] ?? 0));
-          return { symbol, klass, room: Math.min(symbolRoom, classRoom) };
+          const sectorRoom = meta?.sector ? Math.max(0, sectorCap - (sectorCurrent[meta.sector] ?? 0)) : 1;
+          return { symbol, klass, sector: meta?.sector ?? null, room: Math.min(symbolRoom, classRoom, sectorRoom) };
         })
         .filter((item) => item.room > 0.0001);
       if (!capacities.length) break;
@@ -169,6 +194,7 @@ export function clampWeights(targetWeights, features, config, violations) {
         const addition = Math.min(item.room, share);
         weights[item.symbol] += addition;
         classCurrent[item.klass] = (classCurrent[item.klass] ?? 0) + addition;
+        if (item.sector) sectorCurrent[item.sector] = (sectorCurrent[item.sector] ?? 0) + addition;
         filled += addition;
       }
       if (filled <= 0.0001) break;

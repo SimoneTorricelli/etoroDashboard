@@ -145,6 +145,8 @@ export const DEFAULT_CONFIG = {
   minRebalanceBandAbs: 0.03,    // scostamento assoluto minimo per agire
   minRebalanceBandRel: 0.15,    // scostamento relativo minimo per agire
   maxWeightPerClass: { etf: 0.80, bond: 0.40, commodity: 0.25, crypto: 0.20, cash: 1.0 },
+  /** Tetto aggregato sulle esposizioni con settore esplicito nel catalogo. */
+  maxSectorWeightPct: 0.30,
   minCashPct: 0.05,
   maxCashPct: 0.60,
   /** Quota che la strategia mira a mantenere investita in condizioni normali. */

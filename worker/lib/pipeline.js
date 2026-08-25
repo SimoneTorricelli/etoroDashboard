@@ -88,9 +88,11 @@ export function scaleAgentSnapshotToReal(virtualSnapshot, realMirrorSnapshot) {
   };
 }
 
-/** Capacità massima investibile della shortlist entro cap per asset e classe. */
+/** Capacità massima investibile della shortlist entro cap per asset, classe e settore. */
 export function shortlistDeploymentCapacity(shortlist, config) {
   const classUsed = {};
+  const sectorUsed = {};
+  const sectorCap = Number(config.maxSectorWeightPct) || 1;
   let total = 0;
   const maxPositions = Math.max(1, Number(config.maxHoldings) || shortlist.length);
   const bestByExposure = new Map();
@@ -106,15 +108,20 @@ export function shortlistDeploymentCapacity(shortlist, config) {
       const roomFor = (item) => Math.min(
         Number(item.maxWeight) || 0,
         Math.max(0, Number(config.maxWeightPerClass?.[item.class ?? 'other'] ?? 1) - (classUsed[item.class ?? 'other'] ?? 0)),
+        item.sector ? Math.max(0, sectorCap - (sectorUsed[item.sector] ?? 0)) : 1,
       );
       return roomFor(b) - roomFor(a);
     });
     const item = remaining.shift();
     const klass = item.class ?? 'other';
     const classCap = Number(config.maxWeightPerClass?.[klass] ?? 1);
-    const room = Math.max(0, classCap - (classUsed[klass] ?? 0));
+    const room = Math.min(
+      Math.max(0, classCap - (classUsed[klass] ?? 0)),
+      item.sector ? Math.max(0, sectorCap - (sectorUsed[item.sector] ?? 0)) : 1,
+    );
     const allocation = Math.min(Number(item.maxWeight) || 0, room);
     classUsed[klass] = (classUsed[klass] ?? 0) + allocation;
+    if (item.sector) sectorUsed[item.sector] = (sectorUsed[item.sector] ?? 0) + allocation;
     total += allocation;
   }
   return Math.min(1, total);

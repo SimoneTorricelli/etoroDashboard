@@ -13,7 +13,7 @@ import {
 import { runDiagnostics } from './diagnose.js';
 import { EtoroClient } from './etoro.js';
 import { applyProfile, listProfiles } from './profiles.js';
-import { PROVIDERS, buildAttemptPlan, callModel } from './llm.js';
+import { PROVIDERS, buildAttemptPlan, callModel, prioritizeReviewPlan } from './llm.js';
 import {
   buildDeterministicScenarioSummary, buildSafeStrategySpec, buildStrategyPrompt, checkStrategyFeasibility,
   createDefaultOnboardingAnswers, normalizeAiStrategySpec, normalizeOnboardingAnswers,
@@ -86,6 +86,7 @@ const NUMERIC_BOUNDS = {
   stabilizationBars: [0, 10],
   watcherMinConfidence: [0, 1],
   targetDeploymentPct: [0.5, 1],
+  maxSectorWeightPct: [0.01, 1],
 };
 
 /** Ripulisce la patch di configurazione: chiavi ignote e valori fuori range vengono scartati. */
@@ -341,6 +342,7 @@ function strategyPreview(spec, guided, scenario) {
     strategyName: spec.name,
     summary: spec.objective.description,
     allocations,
+    allocationNote: 'Le percentuali sono sleeve strategiche, non una scomposizione look-through degli ETF. Il tetto settoriale operativo aggrega separatamente i ticker con settore noto.',
     scenario: {
       horizonMonths: scenario.horizonMonths,
       favorablePct: scenario.percentiles.p90ChangePct,
@@ -447,6 +449,37 @@ function normalizeReview(raw, reviewer) {
   };
 }
 
+/**
+ * Veto deterministico sulle comparazioni percentuali esplicite dei revisori.
+ * Non pretende di verificare ogni frase finanziaria: intercetta però errori
+ * banali come "18% è superiore a 30%" prima che diventino un'approvazione.
+ */
+export function validateReviewArithmetic(review) {
+  if (!review) return [];
+  const statements = [review.summary, ...review.strengths, ...review.concerns, ...review.requiredChanges]
+    .flatMap((text) => String(text ?? '').split(/(?<=[.!?;])\s+|\n+/))
+    .map((text) => text.trim())
+    .filter(Boolean);
+  const errors = [];
+  const comparison = /(\d+(?:[.,]\d+)?)\s*%([^%]{0,180}?)\b(superiore|maggiore|più\s+alt[oa]|inferiore|minore|più\s+bass[oa]|uguale|pari)\b([^%]{0,180}?)(\d+(?:[.,]\d+)?)\s*%/i;
+  for (const statement of statements) {
+    const match = statement.match(comparison);
+    if (!match) continue;
+    const left = Number(match[1].replace(',', '.'));
+    const relation = match[3].toLowerCase();
+    const right = Number(match[5].replace(',', '.'));
+    const relationPrefix = match[2].toLowerCase().slice(-24);
+    if (/\bnon\b/.test(relationPrefix)) continue;
+    const valid = relation.includes('superiore') || relation.includes('maggiore') || relation.includes('alto')
+      ? left > right
+      : relation.includes('inferiore') || relation.includes('minore') || relation.includes('basso')
+        ? left < right
+        : Math.abs(left - right) < 0.0001;
+    if (!valid) errors.push(`Confronto numerico falso: ${left}% ${match[3]} ${right}%. Revisione scartata.`);
+  }
+  return errors;
+}
+
 function buildReviewMessages(answers, spec) {
   return [
     {
@@ -455,6 +488,8 @@ function buildReviewMessages(answers, spec) {
         'Sei un revisore indipendente di policy di portafoglio.',
         'Valuta la StrategySpec rispetto al consenso dell’onboarding, diversificazione, rischio, liquidità ed eseguibilità con il budget.',
         'Non mostrare ragionamenti interni o chain-of-thought: restituisci soltanto un verdetto sintetico e verificabile.',
+        'La StrategySpec contiene già i limiti effettivi scelti dall’utente: non citare valori di versioni precedenti o impliciti.',
+        'Prima del verdetto ricontrolla ogni confronto numerico; comparazioni percentuali false fanno scartare l’intera revisione.',
         'Non proporre ticker, ordini, leva, short o promesse di rendimento.',
         'Rispondi con JSON puro: {"verdict":"approve|revise","summary":"...","strengths":["..."],"concerns":["..."],"requiredChanges":["..."],"confidence":0.0}.',
       ].join('\n'),
@@ -516,6 +551,27 @@ function sanitizeStrategyCollaboration(raw) {
     reviews,
     trace,
   };
+}
+
+export function applyGuidedGuardrailsWithChanges(spec, guided) {
+  const before = {
+    asset: Number(spec?.diversification?.maxInstrumentWeightPct),
+    sector: Number(spec?.diversification?.maxSectorWeightPct),
+    turnover: Number(spec?.execution?.maxTurnoverPct),
+    drawdown: Number(spec?.risk?.maxDrawdownPct),
+  };
+  const value = applyGuidedGuardrails(spec, guided);
+  const after = {
+    asset: Number(value.diversification.maxInstrumentWeightPct),
+    sector: Number(value.diversification.maxSectorWeightPct),
+    turnover: Number(value.execution.maxTurnoverPct),
+    drawdown: Number(value.risk.maxDrawdownPct),
+  };
+  const labels = { asset: 'Tetto per asset', sector: 'Tetto per settore', turnover: 'Turnover massimo', drawdown: 'Drawdown massimo' };
+  const changes = Object.keys(before)
+    .filter((key) => Number.isFinite(before[key]) && Number.isFinite(after[key]) && Math.abs(before[key] - after[key]) > 0.005)
+    .map((key) => `${labels[key]}: ${before[key]}% → ${after[key]}% per rispettare la scelta dell’onboarding.`);
+  return { value, changes };
 }
 
 async function generateGuidedStrategy({ rawAnswers, config, credentials, env, onTrace = () => {} }) {
@@ -592,11 +648,21 @@ async function generateGuidedStrategy({ rawAnswers, config, credentials, env, on
     });
   }
 
+
+  // I revisori devono vedere esattamente i limiti che saranno salvati ed
+  // eseguiti. In precedenza vedevano il preset (es. 18%) mentre il limite
+  // onboarding (es. 12%) veniva applicato soltanto dopo le revisioni.
+  const initialGuardrailSync = applyGuidedGuardrailsWithChanges(spec, guided);
+  spec = initialGuardrailSync.value;
+  emit('deterministic', 'passed', 'Limiti effettivi sincronizzati', initialGuardrailSync.changes.length
+    ? 'I limiti scelti nell’onboarding sono stati applicati prima di consegnare la policy ai revisori.'
+    : 'La StrategySpec era già allineata ai limiti scelti nell’onboarding.', {
+    details: initialGuardrailSync.changes,
+    handoff: ['StrategySpec effettiva', 'Tetti eseguibili', 'Revisione indipendente'],
+  });
+
   const remaining = plan.filter((attempt) => !leadAttempt || attempt.provider !== leadAttempt.provider || attempt.model !== leadAttempt.model);
-  const diverse = [
-    ...remaining.filter((attempt, index, all) => all.findIndex((item) => item.provider === attempt.provider) === index),
-    ...remaining.filter((attempt, index, all) => all.findIndex((item) => item.provider === attempt.provider) !== index),
-  ];
+  const diverse = prioritizeReviewPlan(remaining, leadAttempt);
   const reviewerModels = [];
   const reviewedRoutes = new Set();
   for (const attempt of diverse.slice(0, 6)) {
@@ -612,6 +678,14 @@ async function generateGuidedStrategy({ rawAnswers, config, credentials, env, on
       const review = normalizeReview(response.content, resolvedReviewer);
       if (!review) {
         emit('review', 'failed', 'Revisione non leggibile', 'Il responso non aveva il formato richiesto; viene provato un altro modello.', { model: reviewer });
+        continue;
+      }
+      const arithmeticErrors = validateReviewArithmetic(review);
+      if (arithmeticErrors.length) {
+        emit('review', 'failed', 'Revisione contraddittoria scartata', 'Il revisore ha prodotto un confronto numerico falso; il responso non entra nel consenso.', {
+          model: resolvedReviewer,
+          details: arithmeticErrors,
+        });
         continue;
       }
       reviews.push(review);
@@ -644,10 +718,14 @@ async function generateGuidedStrategy({ rawAnswers, config, credentials, env, on
         const resolvedSynthesisModel = `${synthesisAttempt.provider}/${response.resolvedModel ?? synthesisAttempt.model}`;
         const normalized = normalizeAiStrategySpec(response.content, answers);
         if (normalized.ok) {
-          spec = normalized.value;
+          const synthesisGuardrailSync = applyGuidedGuardrailsWithChanges(normalized.value, guided);
+          spec = synthesisGuardrailSync.value;
           source = 'ai';
           finalModel = resolvedSynthesisModel;
-          emit('synthesis', 'passed', 'Revisioni integrate', 'La versione consolidata rispetta ancora schema e consenso dell’onboarding.', { model: resolvedSynthesisModel });
+          emit('synthesis', 'passed', 'Revisioni integrate', 'La versione consolidata rispetta ancora schema, consenso e limiti effettivi dell’onboarding.', {
+            model: resolvedSynthesisModel,
+            details: synthesisGuardrailSync.changes,
+          });
         } else {
           emit('synthesis', 'warning', 'Sintesi scartata', 'La versione consolidata ampliava o rompeva un vincolo: resta valida la proposta precedente.', { model: synthesisModel });
         }
@@ -940,6 +1018,7 @@ export async function handleAgentApi(request, env, ctx, pathname) {
         maxOrderPctOfCapital: spec.execution.maxOrderPctOfCapital / 100,
         maxTurnoverPct: spec.execution.maxTurnoverPct / 100,
         maxWeightPerClass: classCaps,
+        maxSectorWeightPct: spec.diversification.maxSectorWeightPct / 100,
         minCashPct: spec.capital.cashFloorPct / 100,
         maxCashPct: spec.capital.cashCeilingPct / 100,
         drawdownStopPct: spec.risk.maxDrawdownPct / 100,

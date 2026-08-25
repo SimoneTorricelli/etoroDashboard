@@ -7,7 +7,7 @@
  */
 import assert from 'node:assert/strict';
 import { buildFeatures, renderFeaturesPrompt, rsi, maxDrawdown, annualizedVol } from './lib/features.js';
-import { collapseEquivalentTargets, validateProposal } from './lib/validator.js';
+import { clampWeights, collapseEquivalentTargets, validateProposal } from './lib/validator.js';
 import { extractJson, normalizeProposal, prioritizeAlternativeProvider } from './lib/brain.js';
 import { DEFAULT_CONFIG } from './lib/db.js';
 import { PROFILES, applyProfile, describeProfile, listProfiles } from './lib/profiles.js';
@@ -15,11 +15,13 @@ import { checkChurnRules, filterMarginalSubstitutions, isWorthTheCost } from './
 import { buildShortlist, scoreInstrument } from './lib/screening.js';
 import { decideWatcherAction, detectAnomalies, isStabilized, relevantHeadlines } from './lib/watcher.js';
 import { executePlan, reconcile } from './lib/executor.js';
-import { buildAttemptPlan, callModel, extractModelText } from './lib/llm.js';
+import { buildAttemptPlan, callModel, extractModelText, listFreeModels, prioritizeReviewPlan } from './lib/llm.js';
 import { buildCandleRefreshQueue, buildFailedProposalRetryContext, scaleAgentSnapshotToReal, shortlistDeploymentCapacity } from './lib/pipeline.js';
 import { buildStrategyActivationNotification } from './lib/notify.js';
 import { EtoroClient } from './lib/etoro.js';
 import { serveStaticAsset } from './index.js';
+import { applyGuidedGuardrailsWithChanges, validateReviewArithmetic } from './lib/api.js';
+import { buildSafeStrategySpec, createDefaultOnboardingAnswers } from './lib/strategy.js';
 
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -40,7 +42,7 @@ function syntheticSeries(start, days, drift, noiseSeed = 1) {
 }
 
 const universe = new Map([
-  ['SPY', { symbol: 'SPY', class: 'etf', maxWeight: 0.4, instrumentId: 1001, name: 'SPY' }],
+  ['SPY', { symbol: 'SPY', class: 'etf', sector: null, maxWeight: 0.4, instrumentId: 1001, name: 'SPY' }],
   ['GLD', { symbol: 'GLD', class: 'commodity', maxWeight: 0.25, instrumentId: 1002, name: 'GLD' }],
   ['BTC', { symbol: 'BTC', class: 'crypto', maxWeight: 0.15, instrumentId: 1003, name: 'BTC' }],
 ]);
@@ -88,6 +90,10 @@ test('feature: pesi e classi sommano correttamente', () => {
   assert.equal(features.instruments.length, 3);
 });
 
+test('feature: aggrega soltanto le esposizioni settoriali dirette', () => {
+  assert.deepEqual(features.allocationBySector, {});
+});
+
 test('prompt compatto sotto i 6000 caratteri', () => {
   const prompt = renderFeaturesPrompt(features, config);
   assert.ok(prompt.length < 6000, `prompt di ${prompt.length} caratteri`);
@@ -126,6 +132,102 @@ test('router AI: OpenRouter resta un fallback anche senza modello scelto', () =>
     env: { AI: {} },
   });
   assert.ok(plan.some((entry) => entry.provider === 'openrouter' && entry.model === 'openrouter/free'));
+});
+
+test('router AI: usa solo endpoint OpenRouter gratuiti e mette i reasoning model prima', () => {
+  const plan = buildAttemptPlan({
+    config: {
+      ...DEFAULT_CONFIG,
+      llmProviders: ['openrouter'],
+      llmFallbackAcrossProviders: false,
+      llmModels: { openrouter: ['anthropic/claude-paid', 'thinkingmachines/inkling:free'] },
+    },
+    credentials: { openrouterApiKey: 'x' },
+    env: {},
+  });
+  assert.equal(plan[0].model, 'nvidia/nemotron-3-ultra-550b-a55b:free');
+  assert.ok(!plan.some((entry) => entry.model === 'anthropic/claude-paid'));
+  assert.ok(plan.some((entry) => entry.model === 'thinkingmachines/inkling:free'));
+});
+
+test('router AI: i revisori privilegiano reasoning forte e laboratori diversi', () => {
+  const plan = [
+    { provider: 'workers-ai', model: '@cf/openai/gpt-oss-120b' },
+    { provider: 'openrouter', model: 'nvidia/nemotron-3-ultra-550b-a55b:free' },
+    { provider: 'openrouter', model: 'z-ai/glm-5.2:free' },
+    { provider: 'openrouter', model: 'nvidia/nemotron-3-super-120b-a12b:free' },
+  ];
+  const ordered = prioritizeReviewPlan(plan, { provider: 'workers-ai', model: '@cf/openai/gpt-oss-120b' });
+  assert.deepEqual(ordered.slice(0, 2).map((entry) => entry.model), [
+    'nvidia/nemotron-3-ultra-550b-a55b:free',
+    'z-ai/glm-5.2:free',
+  ]);
+});
+
+test('catalogo AI: esclude musica e safety anche quando il prezzo token è zero', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({ data: [
+    { id: 'nvidia/nemotron-3-ultra-550b-a55b:free', name: 'Ultra', context_length: 1_000_000, pricing: { prompt: '0', completion: '0' }, architecture: { modality: 'text->text', output_modalities: ['text'] }, supported_parameters: ['reasoning'] },
+    { id: 'google/lyria-3-pro-preview', name: 'Lyria', context_length: 1_000_000, pricing: { prompt: '0', completion: '0' }, architecture: { modality: 'text+image->text+audio', output_modalities: ['text', 'audio'] }, supported_parameters: [] },
+    { id: 'nvidia/nemotron-3.5-content-safety:free', name: 'Safety', context_length: 128_000, pricing: { prompt: '0', completion: '0' }, architecture: { modality: 'text->text', output_modalities: ['text'] }, supported_parameters: ['reasoning'] },
+  ] }), { status: 200 });
+  try {
+    const models = await listFreeModels('x');
+    assert.deepEqual(models.map((model) => model.id), ['nvidia/nemotron-3-ultra-550b-a55b:free']);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('revisione strategia: un confronto percentuale falso viene scartato', () => {
+  const errors = validateReviewArithmetic({
+    summary: 'Il peso massimo per strumento (18%) è leggermente superiore al peso massimo per settore (30%).',
+    strengths: [], concerns: [], requiredChanges: [],
+  });
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /18%.*30%/);
+  assert.equal(validateReviewArithmetic({
+    summary: 'Il tetto settoriale del 30% è superiore al tetto per asset del 18%.',
+    strengths: [], concerns: [], requiredChanges: [],
+  }).length, 0);
+});
+
+test('revisione strategia: i limiti onboarding sono applicati prima dei revisori e tracciati', () => {
+  const answers = createDefaultOnboardingAnswers();
+  const spec = buildSafeStrategySpec(answers);
+  const synced = applyGuidedGuardrailsWithChanges(spec, {
+    maxAssetPct: 12,
+    maxSectorPct: 24,
+    maxTurnoverPct: 20,
+    maxDrawdownPct: 16,
+  });
+  assert.equal(synced.value.diversification.maxInstrumentWeightPct, 12);
+  assert.equal(synced.value.diversification.maxSectorWeightPct, 24);
+  assert.ok(synced.changes.some((item) => item.includes('Tetto per asset')));
+});
+
+test('guardrail: il tetto settoriale aggrega i ticker con settore noto', () => {
+  const violations = [];
+  const weights = clampWeights(
+    { TECH_A: 0.24, TECH_B: 0.22, CORE: 0.51, CASH: 0.03 },
+    {
+      instruments: [
+        { symbol: 'TECH_A', class: 'stock', sector: 'technology', maxWeight: 0.30 },
+        { symbol: 'TECH_B', class: 'stock', sector: 'technology', maxWeight: 0.30 },
+        { symbol: 'CORE', class: 'etf', sector: null, maxWeight: 0.70 },
+      ],
+    },
+    {
+      maxWeightPerClass: { stock: 1, etf: 1 },
+      maxSectorWeightPct: 0.30,
+      minCashPct: 0.03,
+      maxCashPct: 0.03,
+    },
+    violations,
+  );
+  assert.ok(weights.TECH_A + weights.TECH_B <= 0.3001);
+  assert.ok(weights.CASH <= 0.0301, 'la cassa eccedente viene riallocata solo dove resta capacità settoriale');
+  assert.ok(violations.some((item) => item.code === 'sector_cap'));
 });
 
 test('Telegram: riepilogo strategia include allocazione, scenari e guardrail', () => {

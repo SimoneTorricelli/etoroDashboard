@@ -115,6 +115,7 @@ export interface StrategyOnboardingDraft {
   strategyName: string;
   summary: string;
   allocations: StrategyAllocationSlice[];
+  allocationNote?: string;
   scenario: StrategyOnboardingScenario;
   riskRangePct: number;
   guardrails: StrategyOnboardingGuardrails;
@@ -269,6 +270,7 @@ export function createStrategyOnboardingPreview(answers: StrategyOnboardingAnswe
     strategyName: answers.strategyName.trim() || 'Dinamico consapevole',
     summary: objectiveCopy[answers.objective],
     allocations: buildAllocation(answers),
+    allocationNote: 'Le percentuali sono sleeve strategiche, non una scomposizione look-through degli ETF. Il tetto settoriale operativo aggrega separatamente i ticker con settore noto.',
     scenario: {
       horizonMonths: answers.horizonMonths,
       favorablePct: Math.round(favorableBase * horizonFactor),
@@ -953,6 +955,7 @@ export function StrategyOnboarding({
                     ))}
                   </ul>
                 </div>
+                {draft.allocationNote ? <p className="mt-3 text-xs leading-relaxed text-text-1">{draft.allocationNote}</p> : null}
               </section>
 
               <section className="so-preview-section so-scenario-section">

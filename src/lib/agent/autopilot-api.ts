@@ -110,6 +110,7 @@ export interface AutopilotConfig {
   minRebalanceBandAbs: number;
   minRebalanceBandRel: number;
   maxWeightPerClass: Record<string, number>;
+  maxSectorWeightPct?: number;
   minCashPct: number;
   maxCashPct: number;
   targetDeploymentPct?: number;
@@ -457,7 +458,7 @@ export const autopilot = {
       method: 'POST',
       body: JSON.stringify(mode === 'live' ? { kind, mode, confirm: 'ATTIVA ORDINI REALI' } : { kind, mode }),
     }),
-  freeModels: () => call<{ models: Array<{ id: string; name: string; contextLength: number | null }>; providers: LlmProvider[] }>('/agent/models'),
+  freeModels: () => call<{ models: Array<{ id: string; name: string; contextLength: number | null; recommendedRank?: number | null; fit?: string | null; reasoning?: boolean; structuredOutput?: boolean }>; providers: LlmProvider[] }>('/agent/models'),
   credentials: () => call<{ credentials: CredentialStatus[] }>('/agent/credentials'),
   saveCredentials: (patch: Partial<Record<CredentialKey, string>>) =>
     call<{ credentials: CredentialStatus[]; applied: string[]; rejected: string[] }>('/agent/credentials', { method: 'PUT', body: JSON.stringify(patch) }),
