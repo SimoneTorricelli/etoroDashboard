@@ -248,7 +248,7 @@ export default function Autopilot() {
 
           <motion.div {...stagger(4)} className="col-span-12">
             <Tabs defaultValue="panoramica">
-              <TabsList>
+              <TabsList className="w-full justify-start overflow-x-auto">
                 <TabsTrigger value="panoramica">Panoramica</TabsTrigger>
                 <TabsTrigger value="guida">Come funziona</TabsTrigger>
                 <TabsTrigger value="strategia">Strategia e limiti</TabsTrigger>
@@ -388,7 +388,7 @@ export default function Autopilot() {
                       Ogni riga conserva input, proposta del modello, guardrail scattati e ordini. Clicca per il dettaglio completo.
                     </CardDescription>
                   </CardHeader>
-                  <CardContent className="p-0">
+                  <CardContent className="overflow-x-auto p-0">
                     <Table>
                       <TableHeader>
                         <TableRow>
@@ -432,7 +432,7 @@ export default function Autopilot() {
                     </CardHeader>
                     <CardContent>
                       <Tabs defaultValue="proposta">
-                        <TabsList>
+                        <TabsList className="w-full justify-start overflow-x-auto">
                           <TabsTrigger value="proposta">Proposta AI</TabsTrigger>
                           <TabsTrigger value="guardrail">Guardrail</TabsTrigger>
                           <TabsTrigger value="ordini">Ordini</TabsTrigger>
