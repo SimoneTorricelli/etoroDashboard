@@ -658,8 +658,8 @@ export async function armLiveIfUnchanged(db, expected) {
 /**
  * Arma esclusivamente una recovery esplicitamente confermata. A differenza
  * dell'attivazione Live ordinaria, lo stato di partenza deve essere proprio
- * Shadow + Frozen + recoveryRequired. La stessa CAS rimuove il blocco soltanto
- * quando sta per iniziare l'esecuzione del residuo selezionato.
+ * Shadow + Frozen + recoveryRequired. La stessa CAS è usata sia prima del
+ * residuo selezionato sia dalla presa d'atto manuale che non avvia alcuna run.
  */
 export async function armRecoveryLiveIfUnchanged(db, expected) {
   const row = await db.prepare(`UPDATE config

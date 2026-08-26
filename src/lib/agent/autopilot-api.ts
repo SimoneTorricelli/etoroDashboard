@@ -17,6 +17,7 @@ export const LIVE_CONFIRMATION = 'ESEGUI LIVE' as const;
 export const LIVE_RECOVERY_CONFIRMATION = 'HO VERIFICATO GLI ORDINI SU ETORO' as const;
 export const LIVE_RECOVERY_PREPARE_CONFIRMATION = 'VERIFICA ACQUISTI E PREPARA RIPRESA' as const;
 export const LIVE_RECOVERY_EXECUTE_CONFIRMATION = 'COMPLETA PIANO' as const;
+export const LIVE_RECOVERY_FORCE_CONFIRMATION = 'TUTTO OK FORZA LIVE' as const;
 
 const EXECUTION_MODES = new Set<ExecutionMode>(['shadow', 'dry-run', 'live']);
 
@@ -403,6 +404,15 @@ export interface LiveRecoveryExecutionResult {
     attempts: number;
     rows: Array<{ symbol: string; expectedWeight: number; actualWeight: number; divergence: number }>;
   } | null;
+}
+
+export interface LiveRecoveryForceResult {
+  ok: true;
+  forced: true;
+  mode: 'live';
+  runStarted: false;
+  ordersSent: 0;
+  config: AutopilotConfig;
 }
 
 export interface PlanOrder {
@@ -841,6 +851,29 @@ function validateRecoveryExecutionPayload(
   return value as unknown as LiveRecoveryExecutionResult;
 }
 
+function validateRecoveryForcePayload(value: unknown): LiveRecoveryForceResult {
+  const path = '/agent/recovery/force-live';
+  if (!isRecord(value)) invalidApiPayload(path, 'era atteso un oggetto JSON');
+  if (value.ok !== true || value.forced !== true || value.mode !== 'live') {
+    invalidApiPayload(path, 'la modalità Live forzata non è stata confermata');
+  }
+  if (value.runStarted !== false || value.ordersSent !== 0) {
+    invalidApiPayload(path, 'la risposta non garantisce che nessuna run e nessun ordine siano partiti');
+  }
+  if (!isRecord(value.config)) invalidApiPayload(path, 'manca la configurazione aggiornata');
+  if (
+    value.config.executionMode !== 'live'
+    || value.config.frozen !== false
+    || value.config.recoveryRequired !== false
+  ) {
+    invalidApiPayload(path, 'lo stato finale non è Live, sbloccato e senza recovery');
+  }
+  if (!Number.isInteger(Number(value.config.safetyRevision)) || Number(value.config.safetyRevision) < 0) {
+    invalidApiPayload(path, 'manca la revisione di sicurezza finale');
+  }
+  return value as unknown as LiveRecoveryForceResult;
+}
+
 function isJsonContentType(value: string | null): boolean {
   const mediaType = String(value ?? '').split(';', 1)[0].trim().toLowerCase();
   return mediaType === 'application/json' || mediaType.endsWith('+json');
@@ -977,6 +1010,15 @@ export const autopilot = {
     request.activationId,
     request.sourceRunId,
   ),
+  forceRecoveryLive: async (request: {
+    safetyRevision: number;
+    confirmation: typeof LIVE_RECOVERY_FORCE_CONFIRMATION;
+    acknowledgeManualEtoroVerification: true;
+    acknowledgeScheduledLive: true;
+  }) => validateRecoveryForcePayload(await call<unknown>('/agent/recovery/force-live', {
+    method: 'POST',
+    body: JSON.stringify(request),
+  })),
   unfreeze: (request: { safetyRevision: number; confirmation?: typeof LIVE_RECOVERY_CONFIRMATION }) =>
     call<{ config: AutopilotConfig }>('/agent/unfreeze', {
       method: 'POST',

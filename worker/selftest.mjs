@@ -29,6 +29,7 @@ import {
   comparePortfolioForReuse,
   isDecisionConfigPatch,
   LIVE_RECOVERY_CONFIRMATION,
+  LIVE_RECOVERY_FORCE_CONFIRMATION,
 } from './lib/live-plan.js';
 import {
   buildAttemptPlan, callModel, extractModelText, listFreeModels, prioritizeReviewPlan,
@@ -2272,6 +2273,29 @@ test('recovery persistente: arma solo da Shadow + Frozen e conclude mantenendo i
   assert.equal(db.state.config.safetyRevision, 13);
 });
 
+test('recovery manuale: la CAS attiva Live senza creare run o ordini', async () => {
+  const db = createSafetyDb({
+    executionMode: 'shadow',
+    frozen: true,
+    frozenReason: 'verifica automatica non conclusa',
+    recoveryRequired: true,
+    recoveryReason: 'ordini verificati manualmente',
+    recoveryRunIds: ['live-parziale'],
+    safetyRevision: 20,
+    decisionRevision: 5,
+    activeAgentPortfolioId: 'portfolio-live',
+    agentTokenFingerprint: 'token-fingerprint',
+    agentTokenVerifiedAt: 789,
+  });
+  const armed = await armRecoveryLiveIfUnchanged(db, { ...db.state.config });
+  assert.equal(armed.executionMode, 'live');
+  assert.equal(armed.frozen, false);
+  assert.equal(armed.recoveryRequired, false);
+  assert.deepEqual(armed.recoveryRunIds, []);
+  assert.equal(db.state.runStarts, 0);
+  assert.equal(db.state.orders.size, 0);
+});
+
 test('recovery scollegata: riassocia la run con CAS e invalida anteprime concorrenti', async () => {
   const db = createSafetyDb({
     executionMode: 'shadow',
@@ -2483,6 +2507,35 @@ test('control API: completare il residuo richiede piano, conferma Live persisten
   assert.equal(db.state.config.executionMode, 'shadow');
   assert.equal(db.state.config.frozen, true);
   assert.equal(db.state.mutationQueries.length, 0);
+});
+
+test('control API: forzare il Live richiede presa d’atto manuale e consenso alle run future', async () => {
+  const db = createSafetyDb({
+    executionMode: 'shadow', frozen: true, recoveryRequired: true, safetyRevision: 7, onboardingComplete: true,
+  });
+  const request = new Request('https://example.test/agent/recovery/force-live', {
+    method: 'POST',
+    headers: { authorization: 'Bearer control-test', 'content-type': 'application/json' },
+    body: JSON.stringify({
+      safetyRevision: 7,
+      confirmation: LIVE_RECOVERY_FORCE_CONFIRMATION,
+      acknowledgeManualEtoroVerification: true,
+      acknowledgeScheduledLive: false,
+    }),
+  });
+  const response = await handleAgentApi(
+    request,
+    { DB: db, CONTROL_TOKEN: 'control-test' },
+    null,
+    '/agent/recovery/force-live',
+  );
+  const body = await response.json();
+  assert.equal(response.status, 400);
+  assert.match(body.error, /entrambe le conferme/);
+  assert.equal(db.state.config.executionMode, 'shadow');
+  assert.equal(db.state.config.frozen, true);
+  assert.equal(db.state.runStarts, 0);
+  assert.equal(db.state.orders.size, 0);
 });
 
 test('control API: la vecchia conferma di ritorno Shadow non può lasciare Live senza consenso', async () => {

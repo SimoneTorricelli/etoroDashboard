@@ -40,7 +40,8 @@ import {
 import { cn } from '@/lib/utils';
 import {
   autopilot, getBaseUrl, getControlToken, isTokenRemembered, setBaseUrl, setControlToken,
-  AutopilotError, LIVE_CONFIRMATION, LIVE_RECOVERY_EXECUTE_CONFIRMATION, LIVE_RECOVERY_PREPARE_CONFIRMATION,
+  AutopilotError, LIVE_CONFIRMATION, LIVE_RECOVERY_EXECUTE_CONFIRMATION, LIVE_RECOVERY_FORCE_CONFIRMATION,
+  LIVE_RECOVERY_PREPARE_CONFIRMATION,
   type AutopilotState, type ExecutionMode, type RunBundle, type RunSummary,
   type GuidedStrategyBundle, type LiveRecoveryPlanCandidate, type LiveRecoveryPreparationResult,
   type LlmAttempt, type StrategyCollaboration, type StrategyTraceEvent,
@@ -162,7 +163,7 @@ function CopyTechnicalReportButton({ attempts, runId }: { attempts: LlmAttempt[]
 const MODES: Array<{ id: ExecutionMode; icon: typeof Eye; title: string; short: string; tone: string }> = [
   { id: 'shadow', icon: Eye, title: 'Shadow', short: 'Propone e basta. Nessun ordine viene costruito.', tone: 'text-text-0' },
   { id: 'dry-run', icon: FlaskConical, title: 'Dry-run', short: 'Costruisce gli ordini e li valida su eToro, ma non li invia.', tone: 'text-warn' },
-  { id: 'live', icon: Radio, title: 'Live', short: 'All’attivazione esegue subito un ciclo reale e resta attiva per quelli futuri.', tone: 'text-loss' },
+  { id: 'live', icon: Radio, title: 'Live', short: 'Le run schedulate possono inviare ordini reali; l’attivazione standard esegue anche subito un ciclo.', tone: 'text-loss' },
 ];
 
 const STATUS_LABEL: Record<string, { text: string; className: string }> = {
@@ -250,6 +251,10 @@ export default function Autopilot() {
   const [recoveryConfirmation, setRecoveryConfirmation] = useState('');
   const [recoveryAcknowledged, setRecoveryAcknowledged] = useState(false);
   const [executingRecovery, setExecutingRecovery] = useState(false);
+  const [forceLiveDialogOpen, setForceLiveDialogOpen] = useState(false);
+  const [forceLiveConfirmation, setForceLiveConfirmation] = useState('');
+  const [forceLiveAcknowledged, setForceLiveAcknowledged] = useState(false);
+  const [forcingLive, setForcingLive] = useState(false);
   const [remember, setRemember] = useState(() => (
     isTokenRemembered()
     || (typeof window !== 'undefined' && window.matchMedia('(max-width: 767px)').matches)
@@ -513,6 +518,48 @@ export default function Autopilot() {
     } catch (caught) {
       toast.error(caught instanceof Error ? caught.message : String(caught));
     } finally {
+      setLoading(false);
+    }
+  };
+
+  const forceRecoveryLive = async () => {
+    if (forceLiveConfirmation !== LIVE_RECOVERY_FORCE_CONFIRMATION || !forceLiveAcknowledged) return;
+    setForcingLive(true);
+    setLoading(true);
+    try {
+      if (!verifiedWorkerOrigin || getBaseUrl() !== verifiedWorkerOrigin) {
+        throw new Error('Connessione Worker non verificata: aggiorna lo stato prima di forzare il Live.');
+      }
+      const safetyRevision = Number(config?.safetyRevision);
+      if (!Number.isInteger(safetyRevision) || safetyRevision < 0) {
+        throw new Error('Revisione di sicurezza assente: aggiorna lo stato prima di forzare il Live.');
+      }
+      const result = await autopilot.forceRecoveryLive({
+        safetyRevision,
+        confirmation: LIVE_RECOVERY_FORCE_CONFIRMATION,
+        acknowledgeManualEtoroVerification: true,
+        acknowledgeScheduledLive: true,
+      });
+      refreshSequence.current += 1;
+      setState((current) => current ? { ...current, config: result.config } : current);
+      setRecoveryPreview(null);
+      setRecoveryDialogOpen(false);
+      setForceLiveDialogOpen(false);
+      setForceLiveConfirmation('');
+      setForceLiveAcknowledged(false);
+      setConnected(true);
+      setError(null);
+      setLastRefreshedAt(Date.now());
+      toast.success('Modalità Live attivata senza avviare run né inviare ordini.', {
+        description: 'Il prossimo ribilanciamento reale partirà soltanto alla cadenza configurata.',
+        duration: 12_000,
+      });
+      void refresh({ background: true });
+    } catch (caught) {
+      toast.error(caught instanceof Error ? caught.message : String(caught));
+      await refresh({ background: true });
+    } finally {
+      setForcingLive(false);
       setLoading(false);
     }
   };
@@ -1114,22 +1161,38 @@ export default function Autopilot() {
                         </p>
                       </div>
                       {frozen ? (
-                        <Button variant="outline" size="sm" disabled={loading} onClick={() => {
-                          if (config?.recoveryRequired) {
-                            void prepareRecovery();
-                            return;
-                          }
-                          void guarded('Agente riattivato in Shadow', () => {
-                            const safetyRevision = Number(config?.safetyRevision);
-                            if (!Number.isInteger(safetyRevision) || safetyRevision < 0) {
-                              return Promise.reject(new Error('Revisione di sicurezza assente: aggiorna lo stato prima di sbloccare.'));
+                        <div className="flex flex-wrap justify-end gap-2">
+                          <Button variant="outline" size="sm" disabled={loading} onClick={() => {
+                            if (config?.recoveryRequired) {
+                              void prepareRecovery();
+                              return;
                             }
-                            return autopilot.unfreeze({ safetyRevision });
-                          });
-                        }}>
-                          {loading ? <RefreshCw className="size-4 animate-spin" /> : <Unlock className="size-4" />}
-                          {config?.recoveryRequired ? 'Verifica acquisti · scegli piano' : 'Sblocca in Shadow'}
-                        </Button>
+                            void guarded('Agente riattivato in Shadow', () => {
+                              const safetyRevision = Number(config?.safetyRevision);
+                              if (!Number.isInteger(safetyRevision) || safetyRevision < 0) {
+                                return Promise.reject(new Error('Revisione di sicurezza assente: aggiorna lo stato prima di sbloccare.'));
+                              }
+                              return autopilot.unfreeze({ safetyRevision });
+                            });
+                          }}>
+                            {loading ? <RefreshCw className="size-4 animate-spin" /> : <Unlock className="size-4" />}
+                            {config?.recoveryRequired ? 'Verifica acquisti · scegli piano' : 'Sblocca in Shadow'}
+                          </Button>
+                          {config?.recoveryRequired ? (
+                            <Button
+                              variant="destructive"
+                              size="sm"
+                              disabled={loading}
+                              onClick={() => {
+                                setForceLiveConfirmation('');
+                                setForceLiveAcknowledged(false);
+                                setForceLiveDialogOpen(true);
+                              }}
+                            >
+                              <Radio className="size-4" /> Tutto ok · forza Live
+                            </Button>
+                          ) : null}
+                        </div>
                       ) : (
                         <Button variant="destructive" size="sm" disabled={safeStopping} onClick={() => void safeStop()}>
                           {safeStopping ? <RefreshCw className="size-4 animate-spin" /> : <ShieldAlert className="size-4" />} Arresta in sicurezza
@@ -1504,6 +1567,82 @@ export default function Autopilot() {
           </motion.div>
         </>
       )}
+
+      <AlertDialog open={forceLiveDialogOpen} onOpenChange={(open) => {
+        if (forcingLive && !open) return;
+        setForceLiveDialogOpen(open);
+        if (!open) {
+          setForceLiveConfirmation('');
+          setForceLiveAcknowledged(false);
+        }
+      }}>
+        <AlertDialogContent className="max-h-[calc(100dvh-2rem)] overflow-y-auto sm:max-w-xl">
+          <AlertDialogHeader>
+            <AlertDialogTitle className="flex items-center gap-2 text-loss">
+              <Radio className="size-5" /> Forzare soltanto la modalità Live?
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              Usa questa strada soltanto perché hai controllato direttamente su eToro gli acquisti della run interrotta.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+
+          <Alert>
+            <ShieldAlert className="size-4" />
+            <AlertTitle>Nessuna esecuzione adesso</AlertTitle>
+            <AlertDescription>
+              Questa conferma non avvia una run, non chiama l’AI, non interroga eToro e non invia ordini. Rimuove il freeze e rende persistente il Live; i successivi cicli reali partiranno automaticamente soltanto alla cadenza configurata, anche con il sito chiuso.
+            </AlertDescription>
+          </Alert>
+
+          <div className="grid gap-2">
+            <Label htmlFor="force-live-confirmation" className="text-text-0">
+              Digita manualmente <code className="rounded bg-bg-2 px-1.5 py-0.5 text-loss">{LIVE_RECOVERY_FORCE_CONFIRMATION}</code>
+            </Label>
+            <Input
+              id="force-live-confirmation"
+              value={forceLiveConfirmation}
+              onChange={(event) => setForceLiveConfirmation(event.target.value)}
+              onPaste={(event) => event.preventDefault()}
+              autoComplete="off"
+              spellCheck={false}
+              disabled={forcingLive}
+              placeholder={LIVE_RECOVERY_FORCE_CONFIRMATION}
+              className="font-mono"
+            />
+          </div>
+
+          <div className="flex items-start gap-2.5 rounded-xl border border-warn/30 bg-warn/5 p-3 text-sm leading-relaxed text-text-0">
+            <Checkbox
+              id="force-live-acknowledgement"
+              checked={forceLiveAcknowledged}
+              onCheckedChange={(value) => setForceLiveAcknowledged(value === true)}
+              disabled={forcingLive}
+              className="mt-0.5"
+            />
+            <Label htmlFor="force-live-acknowledgement" className="cursor-pointer font-normal leading-relaxed">
+              Confermo di avere verificato manualmente ordini e posizioni su eToro e accetto che le future run schedulate possano inviare ordini reali.
+            </Label>
+          </div>
+
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={forcingLive}>Lascia congelato</AlertDialogCancel>
+            <Button
+              type="button"
+              variant="destructive"
+              className="h-auto min-h-9 whitespace-normal py-2"
+              disabled={
+                forcingLive
+                || forceLiveConfirmation !== LIVE_RECOVERY_FORCE_CONFIRMATION
+                || !forceLiveAcknowledged
+              }
+              onClick={() => void forceRecoveryLive()}
+            >
+              {forcingLive ? <RefreshCw className="size-4 animate-spin" /> : <Radio className="size-4" />}
+              {forcingLive ? 'Attivazione Live…' : 'Attiva Live senza eseguire adesso'}
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <AlertDialog open={recoveryDialogOpen} onOpenChange={(open) => {
         if (executingRecovery && !open) return;

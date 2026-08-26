@@ -338,6 +338,63 @@ test('executeRecovery rifiuta un falso successo che non mantiene il Live', async
   }), /deve mantenere il Live attivo/);
 });
 
+test('forceRecoveryLive attiva soltanto lo stato Live e richiede zero run e zero ordini', async () => {
+  const requests = [];
+  globalThis.fetch = async (input, init = {}) => {
+    requests.push({ url: String(input), init });
+    return jsonResponse({
+      ok: true,
+      forced: true,
+      mode: 'live',
+      runStarted: false,
+      ordersSent: 0,
+      config: {
+        executionMode: 'live',
+        frozen: false,
+        recoveryRequired: false,
+        safetyRevision: 19,
+      },
+    });
+  };
+  const payload = {
+    safetyRevision: 18,
+    confirmation: 'TUTTO OK FORZA LIVE',
+    acknowledgeManualEtoroVerification: true,
+    acknowledgeScheduledLive: true,
+  };
+
+  const result = await autopilot.forceRecoveryLive(payload);
+
+  assert.equal(result.mode, 'live');
+  assert.equal(result.runStarted, false);
+  assert.equal(result.ordersSent, 0);
+  assert.equal(requests[0].url, 'https://worker.example/agent/recovery/force-live');
+  assert.equal(requests[0].init.method, 'POST');
+  assert.deepEqual(JSON.parse(requests[0].init.body), payload);
+});
+
+test('forceRecoveryLive rifiuta una risposta che potrebbe avere avviato ordini', async () => {
+  globalThis.fetch = async () => jsonResponse({
+    ok: true,
+    forced: true,
+    mode: 'live',
+    runStarted: true,
+    ordersSent: 1,
+    config: {
+      executionMode: 'live',
+      frozen: false,
+      recoveryRequired: false,
+      safetyRevision: 19,
+    },
+  });
+  await assert.rejects(() => autopilot.forceRecoveryLive({
+    safetyRevision: 18,
+    confirmation: 'TUTTO OK FORZA LIVE',
+    acknowledgeManualEtoroVerification: true,
+    acknowledgeScheduledLive: true,
+  }), /nessuna run e nessun ordine/);
+});
+
 test('activateLive rifiuta fail-closed payload 2xx incoerenti o malformati', async (t) => {
   const payload = {
     activationId: liveActivationId,

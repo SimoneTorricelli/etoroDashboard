@@ -7,7 +7,7 @@ import { activateLiveAndRun, executeLiveRecovery, prepareLiveRecovery, runPipeli
 import { extractJson, listFreeModels } from './brain.js';
 import { buildStrategyActivationNotification, notify, notifyTest } from './notify.js';
 import {
-  clearCredentials, describeCredentials, hasVerifiedAgentBinding, resolveCredentials,
+  clearCredentials, describeCredentials, hasVerifiedAgentBinding, missingRequired, resolveCredentials,
   saveCredentials, saveVerifiedAgentToken,
 } from './vault.js';
 import { runDiagnostics } from './diagnose.js';
@@ -22,13 +22,13 @@ import {
 } from './strategy.js';
 import { buildPolicyUniverse } from './universe-policy.js';
 import {
-  audit, equityHistory, getRunBundle, listRuns, listWatcherEvents, loadConfig,
+  armRecoveryLiveIfUnchanged, audit, equityHistory, getRunBundle, listRuns, listWatcherEvents, loadConfig,
   latestDryRunWithArtifact, loadLedger, mutateSafetyConfig, saveConfig, unfreezeSafetyConfig, DEFAULT_CONFIG,
 } from './db.js';
 import {
   buildDecisionContext, classifyDryRunForReuse, isDecisionConfigPatch,
   LIVE_CONFIRMATION, LIVE_DRY_RUN_TTL_MS, LIVE_RECOVERY_CONFIRMATION,
-  LIVE_RECOVERY_EXECUTE_CONFIRMATION, LIVE_RECOVERY_PREPARE_CONFIRMATION,
+  LIVE_RECOVERY_EXECUTE_CONFIRMATION, LIVE_RECOVERY_FORCE_CONFIRMATION, LIVE_RECOVERY_PREPARE_CONFIRMATION,
 } from './live-plan.js';
 
 /** Confronto a tempo costante: evita di rivelare il token per timing. */
@@ -1216,6 +1216,76 @@ export async function handleAgentApi(request, env, ctx, pathname) {
     }
     const result = await prepareLiveRecovery({ env, expectedSafetyRevision });
     return json(result, result.busy ? 409 : 200);
+  }
+  // POST /agent/recovery/force-live — presa d'atto manuale: cambia soltanto
+  // lo stato persistente. Non avvia pipeline, AI, letture eToro o ordini.
+  if (route === 'recovery/force-live' && method === 'POST') {
+    const current = await loadConfig(db);
+    const expectedSafetyRevision = Number(body.safetyRevision);
+    if (!Number.isInteger(expectedSafetyRevision) || expectedSafetyRevision < 0) {
+      return json({ error: 'safetyRevision corrente obbligatoria per forzare il Live', config: current }, 409);
+    }
+    if (body.confirmation !== LIVE_RECOVERY_FORCE_CONFIRMATION) {
+      return json({ error: `serve confirmation = "${LIVE_RECOVERY_FORCE_CONFIRMATION}"`, config: current }, 400);
+    }
+    if (body.acknowledgeManualEtoroVerification !== true || body.acknowledgeScheduledLive !== true) {
+      return json({
+        error: 'servono entrambe le conferme: verifica manuale eToro e consenso alle future run Live schedulate',
+        config: current,
+      }, 400);
+    }
+    if (current.executionMode !== 'shadow' || !current.frozen || !current.recoveryRequired) {
+      return json({
+        error: 'la presa d’atto manuale richiede lo stato Shadow + Frozen con recovery attiva',
+        config: current,
+      }, 409);
+    }
+    if (Number(current.safetyRevision) !== expectedSafetyRevision) {
+      return json({ error: 'lo stato di sicurezza è cambiato: aggiorna la dashboard e riprova', config: current }, 409);
+    }
+    if (!current.onboardingComplete) {
+      return json({ error: 'nessuna strategia attiva: il Live schedulato non può essere abilitato', config: current }, 409);
+    }
+    let resolved;
+    try {
+      resolved = await resolveCredentials(db, env);
+    } catch (error) {
+      return json({
+        error: `credenziali server non leggibili: ${error instanceof Error ? error.message : String(error)}`,
+        config: current,
+      }, 409);
+    }
+    const missing = missingRequired(resolved.values).filter((label) => label.startsWith('eToro'));
+    if (missing.length || !hasVerifiedAgentBinding(resolved, current)) {
+      return json({
+        error: missing.length
+          ? `credenziali mancanti: ${missing.join(', ')}`
+          : 'Agent Portfolio non verificato: il Live schedulato non può essere abilitato',
+        config: current,
+      }, 409);
+    }
+
+    const config = await armRecoveryLiveIfUnchanged(db, current);
+    if (!config) {
+      return json({
+        error: 'lo stato di sicurezza è cambiato durante la conferma: aggiorna la dashboard',
+        config: await loadConfig(db),
+      }, 409);
+    }
+    await audit(db, null, 'warn', 'live-recovery-force', 'Recovery accettata manualmente; Live schedulato attivato senza avviare una run', {
+      previousRecoveryRunIds: current.recoveryRunIds ?? [],
+      previousRecoveryReason: current.recoveryReason || current.frozenReason || null,
+      runStarted: false,
+      ordersSent: 0,
+    });
+    return json({
+      ok: true,
+      forced: true,
+      mode: 'live',
+      runStarted: false,
+      ordersSent: 0,
+      config,
+    });
   }
   if (route === 'recovery/execute' && method === 'POST') {
     const activationId = String(body.activationId ?? '').trim();
