@@ -72,6 +72,8 @@ export interface Position {
   invested: number;
   fees: number;
   leverage: number;
+  /** Null/undefined means the broker did not specify the product wrapper. */
+  isCFD?: boolean;
   stopLossRate?: number;
   takeProfitRate?: number;
   /** Arricchiti dallo store con le quote live: */

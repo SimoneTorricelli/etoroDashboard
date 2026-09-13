@@ -13,6 +13,7 @@ import { handleAgentApi, isAuthorized, safeEqual } from './lib/api.js';
 import { handleMcp } from './lib/mcp.js';
 import { decideKind, romeParts, runPipeline } from './lib/pipeline.js';
 import { migrate, loadConfig } from './lib/db.js';
+import { publicDividendCalendar } from './lib/income-market.js';
 
 const ETORO_BASES = {
   v1: 'https://public-api.etoro.com/api/v1',
@@ -135,6 +136,13 @@ async function proxyEtoro(request, env, url) {
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+
+    if (url.pathname === '/api/income/calendar') {
+      const cors = corsHeaders(request, env);
+      if (cors === null) return forbidden();
+      if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
+      return withHeaders(await publicDividendCalendar(request, env), cors);
+    }
 
     if (url.pathname.startsWith('/api/v1/') || url.pathname.startsWith('/api/v2/')) {
       return proxyEtoro(request, env, url);

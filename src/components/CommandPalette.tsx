@@ -21,6 +21,7 @@ const PAGES = [
   { to: '/', label: 'Panoramica', icon: LayoutDashboard },
   { to: '/mercati', label: 'Mercati', icon: CandlestickChart },
   { to: '/portfolio', label: 'Portfolio', icon: Wallet },
+  { to: '/rendite', label: 'Rendite', icon: Wallet },
   { to: '/agent', label: 'eToro Agent', icon: Bot },
   { to: '/fx', label: 'Modulo EUR/USD', icon: Repeat },
   { to: '/impostazioni', label: 'Impostazioni', icon: Settings },

@@ -806,6 +806,7 @@ export class LiveDataProvider implements DataProvider {
       invested,
       fees: Number(raw['TotalFees'] ?? raw['totalFees'] ?? raw['fees'] ?? 0),
       leverage: Number(raw['Leverage'] ?? raw['leverage'] ?? 1),
+      isCFD: typeof (raw['isCFD'] ?? raw['IsCFD']) === 'boolean' ? Boolean(raw['isCFD'] ?? raw['IsCFD']) : undefined,
       stopLossRate: raw['StopLossRate'] != null ? Number(raw['StopLossRate']) : raw['stopLossRate'] != null ? Number(raw['stopLossRate']) : undefined,
       takeProfitRate: raw['TakeProfitRate'] != null ? Number(raw['TakeProfitRate']) : raw['takeProfitRate'] != null ? Number(raw['takeProfitRate']) : undefined,
       currentValue,

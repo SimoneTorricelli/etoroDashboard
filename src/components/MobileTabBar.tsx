@@ -15,6 +15,7 @@ const TABS = [
 ];
 
 const MORE = [
+  { to: '/rendite', label: 'Rendite', icon: Wallet },
   { to: '/mercati', label: 'Mercati', icon: CandlestickChart },
   { to: '/fx', label: 'EUR/USD', icon: Repeat },
   { to: '/impostazioni', label: 'Impostazioni', icon: Settings },

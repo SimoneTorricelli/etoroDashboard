@@ -12,6 +12,7 @@ import {
 } from './vault.js';
 import { runDiagnostics } from './diagnose.js';
 import { EtoroClient } from './etoro.js';
+import { explainIncome, incomeAdviceContext } from './income-advice.js';
 import { applyProfile, listProfiles } from './profiles.js';
 import {
   PROVIDERS, buildAttemptPlan, callModel, llmErrorDebug, prioritizeReviewPlan,
@@ -871,6 +872,27 @@ export async function handleAgentApi(request, env, ctx, pathname) {
   const db = env.DB;
   const route = pathname.replace(/^\/agent\/?/, '').replace(/\/+$/, '');
   const method = request.method.toUpperCase();
+  if (route === 'income/advice' && method === 'POST') {
+    // Bound the input before parsing; accept only an allowlisted numerical summary.
+    let size = 0;
+    const reader = request.body?.getReader();
+    const chunks = [];
+    if (!reader) return json({ error: 'Riepilogo assente' }, 400);
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > 16000) { await reader.cancel(); return json({ error: 'Riepilogo troppo grande' }, 413); }
+      chunks.push(value);
+    }
+    let payload;
+    try { payload = JSON.parse(await new Blob(chunks).text()); incomeAdviceContext(payload); }
+    catch { return json({ error: 'Riepilogo rendite non valido: controlla importi, quote e aliquote' }, 400); }
+    try {
+      const [config, resolved] = await Promise.all([loadConfig(db), resolveCredentials(db, env)]);
+      return json(await explainIncome(payload, config, resolved.values, env));
+    } catch { return json({ error: 'Analisi AI non disponibile. Verifica modello e credenziali in Autopilot; i calcoli locali restano disponibili.' }, 503); }
+  }
   const body = ['POST', 'PUT', 'PATCH'].includes(method)
     ? await request.json().catch(() => ({}))
     : {};

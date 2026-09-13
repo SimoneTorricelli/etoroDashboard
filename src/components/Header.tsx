@@ -15,6 +15,7 @@ const TITLES: Record<string, string> = {
   '/': 'Panoramica',
   '/mercati': 'Mercati',
   '/portfolio': 'Portfolio',
+  '/rendite': 'Rendite',
   '/agent': 'eToro Agent',
   '/autopilot': 'Autopilot',
   '/fx': 'EUR/USD',

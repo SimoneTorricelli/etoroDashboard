@@ -965,6 +965,7 @@ async function streamStrategyDraft<TDraft>(
 }
 
 export const autopilot = {
+  incomeAdvice: (summary: Record<string, unknown>) => call<{ text: string; model: string; usage?: unknown }>('/agent/income/advice', { method: 'POST', body: JSON.stringify(summary), signal: AbortSignal.timeout(55000) }),
   state: async () => validateStatePayload(await call<unknown>('/agent/state')),
   runs: async (limit = 30) => validateRunsPayload(await call<unknown>(`/agent/runs?limit=${limit}`)),
   run: (id: string) => call<RunBundle>(`/agent/runs/${encodeURIComponent(id)}`),

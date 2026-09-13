@@ -13,6 +13,7 @@ import {
   Repeat,
   Settings,
   Wallet,
+  Coins,
   Github,
   CircleHelp,
 } from 'lucide-react';
@@ -25,6 +26,7 @@ const NAV = [
   { to: '/', label: 'Panoramica', icon: LayoutDashboard },
   { to: '/mercati', label: 'Mercati', icon: CandlestickChart },
   { to: '/portfolio', label: 'Portfolio', icon: Wallet },
+  { to: '/rendite', label: 'Rendite', icon: Coins },
   { to: '/agent', label: 'Agent', icon: Bot },
   { to: '/autopilot', label: 'Autopilot', icon: Radar },
   { to: '/fx', label: 'EUR/USD', icon: Repeat },
