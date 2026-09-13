@@ -20,7 +20,7 @@ jobs:
           cache: npm
       - run: npm ci || npm install
       - name: Test guardrail
-        run: npm run test:worker
+        run: npm run test:worker && npm run test:scheduler && npm run test:autopilot-api && npm run test:income
       - name: Build dashboard
         run: npm run build
       - name: Deploy su Cloudflare

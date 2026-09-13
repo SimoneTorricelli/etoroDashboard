@@ -5,6 +5,8 @@
  * Ospita anche il watcher orario, che vive nello stesso cron ma segue un
  * percorso separato e molto più economico.
  */
+import { claimScheduleOccurrence, scheduleKey } from './scheduler.js';
+import { romeParts } from './schedule-calendar.js';
 import { EtoroClient } from './etoro.js';
 import { collectExternalContext } from './sources.js';
 import { buildFeatures, renderFeaturesPrompt } from './features.js';
@@ -380,49 +382,7 @@ export function buildFailedProposalRetryContext(bundle) {
   ].join('\n').slice(0, 5000);
 }
 
-export function romeParts(date = new Date()) {
-  const formatter = new Intl.DateTimeFormat('en-GB', {
-    timeZone: 'Europe/Rome',
-    weekday: 'short', year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', hour12: false,
-  });
-  const parts = Object.fromEntries(formatter.formatToParts(date).map((part) => [part.type, part.value]));
-  const weekdayMap = { Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6, Sun: 7 };
-  return {
-    weekday: weekdayMap[parts.weekday] ?? 0,
-    hour: Number(parts.hour),
-    minute: Number(parts.minute),
-    day: Number(parts.day),
-    dateKey: `${parts.year}-${parts.month}-${parts.day}`,
-    // Durante il ritorno all'ora solare le 02:xx locali esistono due volte.
-    // Contrassegniamo la seconda occorrenza per evitare due run automatiche.
-    fold: (() => {
-      const previous = Object.fromEntries(formatter.formatToParts(new Date(date.getTime() - 60 * 60 * 1000)).map((part) => [part.type, part.value]));
-      return previous.year === parts.year
-        && previous.month === parts.month
-        && previous.day === parts.day
-        && previous.hour === parts.hour
-        && previous.minute === parts.minute ? 1 : 0;
-    })(),
-  };
-}
-
-/** Decide che tipo di run eseguire in base a cadenza e ora locale italiana. */
-export function decideKind(config, parts) {
-  // Il cron scatta ogni quarto d'ora. La seconda occorrenza di un orario
-  // duplicato dal ritorno all'ora solare non deve generare una seconda run.
-  if (parts.fold === 1) return null;
-  if (parts.hour === config.rebalanceHour && parts.minute === config.rebalanceMinute) {
-    if (config.cadence === 'daily' && parts.weekday <= 5) return 'rebalance';
-    if (config.cadence === 'weekly' && parts.weekday === config.rebalanceWeekday) return 'rebalance';
-    if (config.cadence === 'monthly' && parts.day === config.rebalanceDayOfMonth) return 'rebalance';
-  }
-  // Snapshot e heartbeat restano orari: i tick :15, :30 e :45 che non
-  // corrispondono a un ribilanciamento non devono avviare la pipeline.
-  if (parts.minute !== 0) return null;
-  if ((config.snapshotHours ?? []).includes(parts.hour)) return 'snapshot';
-  return 'heartbeat';
-}
+export { romeParts, decideKind } from './schedule-calendar.js';
 
 function buildClient(resolved, config) {
   const credentials = resolved.values;
@@ -1133,6 +1093,9 @@ export async function runPipeline(args) {
   }
 
   try {
+    if (args.scheduleOccurrence && !await claimScheduleOccurrence(db, args.scheduleOccurrence, runId)) {
+      return { runId: null, status: 'blocked', reason: 'occurrence_unavailable' };
+    }
     return await runPipelineWithLock({ ...args, runId });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -1801,7 +1764,7 @@ export async function executeLiveRecovery({ env, activationId, sourceRunId, expe
 }
 
 async function runPipelineWithLock({
-  env, kind, modeOverride, improveFromRunId = '', retryFromRunId = '', runId,
+  env, kind, modeOverride, improveFromRunId = '', retryFromRunId = '', runId, scheduleOccurrence,
   delayedLiveArm = false, reuseLatestDryRun = false, liveActivationId = '',
   recoverySourceRunId = '', recoveryExpectedSafetyRevision = null, recoveryPersistentLive = false,
 }) {
@@ -1833,6 +1796,10 @@ async function runPipelineWithLock({
     maxHoldings: config.strategySpec.diversification?.maxPositions ?? baseProfile.maxHoldings,
   } : baseProfile;
   await startRun(db, runId, kind, mode);
+  if (scheduleOccurrence && scheduleKey(config) !== scheduleOccurrence.configKey) {
+    await finishRun(db, runId, 'blocked', null, 'Pianificazione modificata prima dell’avvio');
+    return { runId, status: 'blocked', reason: 'schedule_changed' };
+  }
   await audit(db, runId, 'info', 'start', `Run ${kind} avviata in modalità ${mode} · profilo ${profile.label}`);
   const sourceRunId = improveFromRunId || retryFromRunId;
   const previousBundle = sourceRunId ? await getRunBundle(db, sourceRunId) : null;

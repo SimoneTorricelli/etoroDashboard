@@ -4,6 +4,65 @@ export interface IncomeDividend {
   annualPerShare: number | null; currency: string | null;
 }
 export interface CalendarResult { rows: IncomeDividend[]; asOf: number; source: string; note: string; coverage: string; }
+export interface AutomaticDividend {
+  symbol: string; annualPerShare: number; currency: string; status: 'available' | 'no_history';
+  source: string; provider: string; asOf: number; sourceUpdatedAt: string | null;
+  frequency: string | null; method: string; rows: IncomeDividend[];
+}
+export interface ReferenceFx { rates: Record<string, number>; date: string; source: string; asOf: number; }
+export interface DividendLookup { loading: boolean; data: AutomaticDividend | null; error: string; }
+function validReference(data: AutomaticDividend | null, symbol: string): data is AutomaticDividend {
+  return !!data && data.symbol === symbol && Number.isFinite(data.annualPerShare) && data.annualPerShare >= 0
+    && /^[A-Z]{3}$/.test(data.currency) && Array.isArray(data.rows) && Number.isFinite(data.asOf)
+    && data.asOf <= Date.now() + 300000 && Date.now() - data.asOf < TTL
+    && ['available', 'no_history'].includes(data.status) && typeof data.source === 'string'
+    && data.source.startsWith('https://stockanalysis.com/');
+}
+function referenceBase(settings: LiveSettings) {
+  return (import.meta.env?.DEV ? window.location.origin : settings.proxyUrl || window.location.origin).replace(/\/+$/, '');
+}
+async function referenceJson(url: string, signal: AbortSignal) {
+  const response = await fetch(url, { signal });
+  if (!response.headers.get('content-type')?.includes('application/json')) throw new Error('Il collegamento automatico richiede il Worker aggiornato.');
+  const body = await response.json();
+  if (!response.ok) throw new Error(body.error || `Fonte non disponibile (${response.status})`);
+  return body;
+}
+export async function fetchReferenceFx(settings: LiveSettings, signal: AbortSignal): Promise<ReferenceFx> {
+  const body = await referenceJson(`${referenceBase(settings)}/api/income/fx`, signal);
+  if (!body.rates || !(body.rates.USD > 0) || typeof body.date !== 'string') throw new Error('Cambi automatici non disponibili');
+  return body;
+}
+export async function fetchAutomaticDividends(
+  instruments: { symbol: string; kind: 'stock' | 'etf' }[], settings: LiveSettings, signal: AbortSignal,
+  onResult: (symbol: string, result: DividendLookup) => void, force = false,
+) {
+  const queue = [...new Map(instruments.map(i => [i.symbol, i])).values()];
+  // Two requests at a time; all held symbols are covered, with no silent 30-symbol cut.
+  async function consume() {
+    while (queue.length && !signal.aborted) {
+      const item = queue.shift()!;
+      const key = `torino.income.reference.v2:${item.kind}:${item.symbol}`;
+      try {
+        let data: AutomaticDividend | null = null;
+        if (!force) try {
+          const c = JSON.parse(localStorage.getItem(key) || 'null');
+          if (validReference(c, item.symbol)) data = c;
+        } catch { /* Optional public cache. */ }
+        if (!data) {
+          const query = new URLSearchParams({ symbol: item.symbol, kind: item.kind });
+          data = await referenceJson(`${referenceBase(settings)}/api/income/dividend?${query}`, signal);
+        }
+        if (!validReference(data, item.symbol)) throw new Error('Dati automatici non coerenti o non aggiornati');
+        try { localStorage.setItem(key, JSON.stringify(data)); } catch { /* Optional public cache. */ }
+        if (!signal.aborted) onResult(item.symbol, { data, loading: false, error: '' });
+      } catch (error) {
+        if (!signal.aborted) onResult(item.symbol, { data: null, loading: false, error: error instanceof Error ? error.message : 'Recupero temporaneamente non disponibile' });
+      }
+    }
+  }
+  await Promise.all([consume(), consume()]);
+}
 const TTL = 12 * 3600000;
 function cacheRead(key: string): CalendarResult | null {
   try { const c = JSON.parse(localStorage.getItem(key) || 'null'); return c && Array.isArray(c.rows) && typeof c.asOf === 'number' && Date.now() - c.asOf < TTL ? c : null; } catch { return null; }

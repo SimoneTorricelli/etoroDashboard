@@ -10,6 +10,7 @@ import {
   clearCredentials, describeCredentials, hasVerifiedAgentBinding, missingRequired, resolveCredentials,
   saveCredentials, saveVerifiedAgentToken,
 } from './vault.js';
+import { schedulerState } from './scheduler.js';
 import { runDiagnostics } from './diagnose.js';
 import { EtoroClient } from './etoro.js';
 import { explainIncome, incomeAdviceContext } from './income-advice.js';
@@ -71,7 +72,7 @@ const NUMERIC_BOUNDS = {
   reconcileTolerancePct: [0.005, 0.3],
   minConfidence: [0, 1],
   rebalanceWeekday: [1, 7],
-  rebalanceDayOfMonth: [1, 28],
+  rebalanceDayOfMonth: [1, 31],
   rebalanceHour: [0, 23],
   llmTemperature: [0, 1.5],
   llmMaxTokens: [256, 8000],
@@ -104,7 +105,7 @@ export function sanitizeConfigPatch(patch) {
     if (!(key in DEFAULT_CONFIG)) { rejected.push(`${key}: chiave sconosciuta`); continue; }
     if (key === 'executionMode') { rejected.push('executionMode: usa POST /agent/mode'); continue; }
     if (key === 'frozen' || key === 'frozenReason') { rejected.push(`${key}: usa /agent/freeze o /agent/unfreeze`); continue; }
-    if (['decisionRevision', 'safetyRevision', 'recoveryRequired', 'recoveryReason', 'recoveryRunIds', 'recoveryUpdatedAt'].includes(key)) {
+    if (['decisionRevision', 'scheduleRevision', 'scheduleChangedAt', 'safetyRevision', 'recoveryRequired', 'recoveryReason', 'recoveryRunIds', 'recoveryUpdatedAt'].includes(key)) {
       rejected.push(`${key}: gestito internamente dal server`);
       continue;
     }
@@ -118,10 +119,11 @@ export function sanitizeConfigPatch(patch) {
       continue;
     }
 
-    if (key === 'rebalanceMinute') {
+    if (['rebalanceMinute', 'rebalanceHour', 'rebalanceWeekday', 'rebalanceDayOfMonth', 'scheduleRecoveryMinutes'].includes(key)) {
       const numeric = Number(value);
-      if (![0, 15, 30, 45].includes(numeric)) {
-        rejected.push('rebalanceMinute: usa uno dei minuti 0, 15, 30, 45');
+      const bounds = { rebalanceMinute: [0, 59], rebalanceHour: [0, 23], rebalanceWeekday: [1, 7], rebalanceDayOfMonth: [1, 31], scheduleRecoveryMinutes: [1, 180] }[key];
+      if (value === null || typeof value === 'boolean' || String(value).trim() === '' || !Number.isInteger(numeric) || numeric < bounds[0] || numeric > bounds[1]) {
+        rejected.push(`${key}: usa un intero fra ${bounds[0]} e ${bounds[1]}`);
         continue;
       }
       out[key] = numeric;
@@ -901,11 +903,12 @@ export async function handleAgentApi(request, env, ctx, pathname) {
   if (route === 'state' && method === 'GET') {
     const storedConfig = await loadConfig(db);
     const trackingSince = Number(storedConfig.realCapitalTrackingStartedAt) || Number.MAX_SAFE_INTEGER;
-    const [runs, curve, resolved, liveActivation] = await Promise.all([
+    const [runs, curve, resolved, liveActivation, scheduler] = await Promise.all([
       listRuns(db, 12),
       equityHistory(db, 200, trackingSince),
       resolveCredentials(db, env),
       buildLiveActivationPreview(db, storedConfig),
+      schedulerState(db, storedConfig),
     ]);
     const config = hydrateGuidedReview(storedConfig);
     const last = runs[0] ?? null;
@@ -923,6 +926,7 @@ export async function handleAgentApi(request, env, ctx, pathname) {
       agentBindingVerified: hasVerifiedAgentBinding(resolved, config),
       notificationsActive: Boolean((resolved.values.telegramBotToken && resolved.values.telegramChatId) || resolved.values.notifyWebhookUrl),
       liveActivation,
+      scheduler,
     });
   }
 

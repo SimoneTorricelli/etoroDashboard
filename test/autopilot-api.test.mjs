@@ -120,6 +120,22 @@ function jsonResponse(body, status = 200) {
   });
 }
 
+test('scheduler: registro opzionale compatibile e payload malformato rifiutato', async () => {
+  setControlToken('scheduler-test-only');
+  const scheduler = {
+    checkedAt: 1000, timezone: 'Europe/Rome', initialized: true, configurationPending: false,
+    recoveryMinutes: 60, lastReceivedAt: 999, lastScheduledAt: 990, scannedThrough: 999,
+    version: 1, nextRebalance: { dueAt: 2000, localDue: '2026-09-14 09:00', kind: 'rebalance', skipReason: null },
+    recentRebalances: [], unresolved: [],
+  };
+  globalThis.fetch = async () => jsonResponse({ ...state, scheduler });
+  assert.deepEqual((await autopilot.state()).scheduler, scheduler);
+  for (const patch of [{ recentRebalances: null }, { checkedAt: 'oggi' }, { nextRebalance: {} }, { unresolved: [{ status: 'ok' }] }]) {
+    globalThis.fetch = async () => jsonResponse({ ...state, scheduler: { ...scheduler, ...patch } });
+    await assert.rejects(autopilot.state(), /registro delle scadenze/);
+  }
+});
+
 test('normalizeBaseUrl usa la stessa origin per un valore vuoto', () => {
   assert.equal(normalizeBaseUrl('', 'https://dashboard.example/autopilot?tab=x'), 'https://dashboard.example');
 });

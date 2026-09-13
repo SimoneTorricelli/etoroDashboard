@@ -11,9 +11,11 @@
  */
 import { handleAgentApi, isAuthorized, safeEqual } from './lib/api.js';
 import { handleMcp } from './lib/mcp.js';
-import { decideKind, romeParts, runPipeline } from './lib/pipeline.js';
-import { migrate, loadConfig } from './lib/db.js';
+import { runPipeline } from './lib/pipeline.js';
+import { migrate } from './lib/db.js';
+import { dispatchSchedule } from './lib/scheduler.js';
 import { publicDividendCalendar } from './lib/income-market.js';
+import { incomeReference } from './lib/income-reference.js';
 
 const ETORO_BASES = {
   v1: 'https://public-api.etoro.com/api/v1',
@@ -137,6 +139,13 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
+    if (['/api/income/dividend', '/api/income/fx'].includes(url.pathname)) {
+      const cors = corsHeaders(request, env);
+      if (cors === null) return forbidden();
+      if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
+      return withHeaders(await incomeReference(request, env), cors);
+    }
+
     if (url.pathname === '/api/income/calendar') {
       const cors = corsHeaders(request, env);
       if (cors === null) return forbidden();
@@ -178,20 +187,12 @@ export default {
     return serveStaticAsset(request, env);
   },
 
-  /**
-   * Cron ogni 15 minuti. Il tipo di run è deciso sull'ora locale Europe/Rome,
-   * così il passaggio ora legale/solare non sposta il ribilanciamento.
-   */
+  /** Dispatcher minuto per minuto; AI e pipeline soltanto per scadenze dovute. */
   async scheduled(event, env, ctx) {
     ctx.waitUntil((async () => {
       if (!env.DB) return;
       await ensureSchema(env);
-      const config = await loadConfig(env.DB);
-      const parts = romeParts(new Date(event.scheduledTime));
-      const kind = decideKind(config, parts);
-      if (kind === null) return;
-      if (kind === 'heartbeat' && config.frozen) return;
-      await runPipeline({ env, kind });
+      await dispatchSchedule({ env, scheduledAt: event.scheduledTime, run: runPipeline });
     })());
   },
 };

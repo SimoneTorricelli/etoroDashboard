@@ -110,6 +110,7 @@ export interface AutopilotConfig {
   rebalanceDayOfMonth: number;
   rebalanceHour: number;
   rebalanceMinute: number;
+  scheduleRecoveryMinutes?: number;
   snapshotHours: number[];
   budgetEur: number;
   fallbackEurUsd: number;
@@ -273,6 +274,35 @@ export interface CredentialStatus {
   hint: string;
 }
 
+export interface ScheduleOccurrence {
+  id: string;
+  kind: string;
+  due_at_utc: number;
+  local_due: string;
+  expires_at: number;
+  claimed_at: number | null;
+  finished_at: number | null;
+  attempts: number;
+  status: string;
+  reason_code: string | null;
+  reason: string | null;
+  run_id: string | null;
+  run_status: string | null;
+}
+export interface SchedulerState {
+  checkedAt: number;
+  timezone: string;
+  initialized: boolean;
+  configurationPending: boolean;
+  recoveryMinutes: number;
+  lastReceivedAt: number | null;
+  lastScheduledAt: number | null;
+  scannedThrough: number | null;
+  version: number | null;
+  nextRebalance: { dueAt: number; localDue: string; kind: string; skipReason: string | null } | null;
+  recentRebalances: ScheduleOccurrence[];
+  unresolved: ScheduleOccurrence[];
+}
 export interface AutopilotState {
   config: AutopilotConfig;
   lastRun: RunSummary | null;
@@ -286,6 +316,7 @@ export interface AutopilotState {
   notificationsActive: boolean;
   /** Assente soltanto durante un aggiornamento graduale da un Worker precedente. */
   liveActivation?: LiveActivationPreview;
+  scheduler?: SchedulerState;
 }
 
 export interface LiveActivationResult {
@@ -685,7 +716,29 @@ function validateStatePayload(value: unknown): AutopilotState {
   if (typeof value.agentBindingVerified !== 'boolean' || typeof value.notificationsActive !== 'boolean') {
     invalidApiPayload('/agent/state', 'mancano gli indicatori di collegamento Agent');
   }
+  if (value.scheduler !== undefined && !isSchedulerState(value.scheduler)) {
+    invalidApiPayload('/agent/state', 'il registro delle scadenze non è compatibile');
+  }
   return value as unknown as AutopilotState;
+}
+
+function isSchedulerState(value: unknown): value is SchedulerState {
+  if (!isRecord(value)) return false;
+  const finite = (v: unknown) => typeof v === 'number' && Number.isFinite(v);
+  const nullableTime = (v: unknown) => v === null || finite(v);
+  const nullableText = (v: unknown) => v === null || typeof v === 'string';
+  const occurrence = (v: unknown) => isRecord(v)
+    && ['id', 'kind', 'local_due', 'status'].every(k => typeof v[k] === 'string')
+    && ['due_at_utc', 'expires_at', 'attempts'].every(k => finite(v[k]))
+    && ['claimed_at', 'finished_at'].every(k => nullableTime(v[k]))
+    && ['reason', 'reason_code', 'run_id', 'run_status'].every(k => nullableText(v[k]));
+  return value.timezone === 'Europe/Rome' && finite(value.checkedAt) && finite(value.recoveryMinutes)
+    && typeof value.initialized === 'boolean' && typeof value.configurationPending === 'boolean'
+    && ['lastReceivedAt', 'lastScheduledAt', 'scannedThrough', 'version'].every(k => nullableTime(value[k]))
+    && (value.nextRebalance === null || (isRecord(value.nextRebalance)
+      && finite(value.nextRebalance.dueAt) && typeof value.nextRebalance.localDue === 'string'))
+    && Array.isArray(value.recentRebalances) && value.recentRebalances.every(occurrence)
+    && Array.isArray(value.unresolved) && value.unresolved.every(occurrence);
 }
 
 function validateRunsPayload(value: unknown): { runs: RunSummary[] } {

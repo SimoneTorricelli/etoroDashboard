@@ -44,6 +44,8 @@ Aprire **Rendite**, vedere quanto producono le posizioni attuali e il cash, aggi
 
 ## Prossime fasi in ordine
 
+Aggiornamento successivo: Simone testa Rendite e ha chiesto di iniziare il resto del piano. Il primo blocco ET-01/02/03 è descritto in [Scheduler: stato e verifica](scheduler-stato-2026-09-13.md). La pubblicazione GitHub del commit Rendite risulta fallita per secret Cloudflare mancante; il test in produzione richiede verificare il rilascio effettivo.
+
 1. Collegare la nuova pagina al conto esistente e verificare la copertura effettiva delle fonti, chiarendo “BCS”. Confrontare almeno un dividendo, un accredito cash e una reward o mancata reward con l’estratto reale.
 2. Aggiungere importatori specifici per il formato dell’estratto reale e storico giornaliero/azioni societarie. Portare ledger e regole versionate nel backend solo dopo avere definito identità conto e riconciliazione dei duplicati tra fonti.
 3. Completare motore dei calendari e buffer per prelievi regolari, scenari per singolo prodotto con scaglioni/cap/lock-up e suggerimenti AI ancorati a condizioni documentate. Includere valute ulteriori con cambi storici espliciti.
@@ -58,3 +60,5 @@ Aprire **Rendite**, vedere quanto producono le posizioni attuali e il cash, aggi
 - [eToro API, indice](https://api-portal.etoro.com/llms.txt) e [schema strumenti](https://api-portal.etoro.com/api-reference/market-data/search-for-instruments): non equivalgono a uno storico rendite completo.
 - [FMP, Dividends Company](https://site.financialmodelingprep.com/developer/docs/stable/dividends-company): endpoint `/stable/dividends?symbol=...`.
 - [Cloudflare, HTMLRewriter](https://developers.cloudflare.com/workers/runtime-apis/html-rewriter/) e [best practices Workers](https://developers.cloudflare.com/workers/best-practices/workers-best-practices/): parsing in streaming, richieste limitate e gestione esplicita degli errori.
+
+Il feedback successivo sul flusso è implementato in [Rendite — revisione](rendite-revisione-2026-09-13.md): salvataggio esplicito, dividendi automatici senza chiavi aggiuntive, contante e conti semplificati, staking coerente con l'indicazione del titolare e proiezioni con reinvestimento. Questa revisione sostituisce la compilazione manuale per strumento descritta nella prima versione.

@@ -16,7 +16,7 @@
     "enabled": true
   },
   "triggers": {
-    "crons": ["*/15 * * * *"]
+    "crons": ["* * * * *"]
   },
   "vars": {
     "ALLOWED_ORIGINS": "http://localhost:5173",

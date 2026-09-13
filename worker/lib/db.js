@@ -3,7 +3,10 @@
  * audit log e persistenza di run/proposte/ordini.
  */
 
+import { SCHEDULE_SCHEMA } from './schedule-schema.js';
+
 const SCHEMA = [
+  ...SCHEDULE_SCHEMA,
   `CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS pipeline_lock (lock_key TEXT PRIMARY KEY, owner_id TEXT NOT NULL, acquired_at INTEGER NOT NULL, lease_until INTEGER NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, kind TEXT NOT NULL, started_at INTEGER NOT NULL, finished_at INTEGER, status TEXT NOT NULL, execution_mode TEXT NOT NULL, equity_usd REAL, error TEXT)`,
@@ -71,6 +74,9 @@ export const DEFAULT_CONFIG = {
   rebalanceDayOfMonth: 1,       // solo per cadence monthly
   rebalanceHour: 9,             // ora locale Europe/Rome
   rebalanceMinute: 30,
+  scheduleRecoveryMinutes: 60, // recupero soltanto prima di avviare una run
+  scheduleRevision: 0,
+  scheduleChangedAt: 0,
   snapshotHours: [8, 14, 22],   // ore locali per lo snapshot giornaliero
 
   /** Capitale nominale gestito dall'agente, in EUR. */
@@ -293,14 +299,19 @@ function deepMerge(base, override) {
   return out;
 }
 
-export async function loadConfig(db) {
+export async function loadConfigSnapshot(db) {
   const row = await db.prepare('SELECT value FROM config WHERE key = ?').bind(CONFIG_KEY).first();
-  if (!row?.value) return { ...DEFAULT_CONFIG };
+  const raw = row?.value ?? '';
+  if (!raw) return { config: { ...DEFAULT_CONFIG }, raw };
   try {
-    return deepMerge(DEFAULT_CONFIG, JSON.parse(row.value));
+    return { config: deepMerge(DEFAULT_CONFIG, JSON.parse(raw)), raw };
   } catch {
-    return { ...DEFAULT_CONFIG };
+    return { config: { ...DEFAULT_CONFIG }, raw };
   }
+}
+
+export async function loadConfig(db) {
+  return (await loadConfigSnapshot(db)).config;
 }
 
 export async function saveConfig(db, patch, { decisionChange = false } = {}) {
@@ -319,15 +330,20 @@ export async function saveConfig(db, patch, { decisionChange = false } = {}) {
   delete safePatch.recoveryRunIds;
   delete safePatch.recoveryUpdatedAt;
   delete safePatch.decisionRevision;
+  delete safePatch.scheduleRevision;
+  delete safePatch.scheduleChangedAt;
 
   const defaultsJson = JSON.stringify(DEFAULT_CONFIG);
   const patchJson = JSON.stringify(safePatch);
   const increment = decisionChange ? 1 : 0;
+  const scheduleIncrement = ['cadence', 'rebalanceWeekday', 'rebalanceDayOfMonth', 'rebalanceHour',
+    'rebalanceMinute', 'snapshotHours', 'scheduleRecoveryMinutes'].some(key => key in safePatch) ? 1 : 0;
+  const updatedAt = Date.now();
   const insertedRevision = Math.max(0, Math.trunc(Number(DEFAULT_CONFIG.decisionRevision) || 0)) + increment;
   const row = await db.prepare(`INSERT INTO config (key, value, updated_at)
     VALUES (
       ?,
-      json_set(json_patch(json(?), json(?)), '$.decisionRevision', ?),
+      json_set(json_patch(json(?), json(?)), '$.decisionRevision', ?, '$.scheduleRevision', ?, '$.scheduleChangedAt', ?),
       ?
     )
     ON CONFLICT(key) DO UPDATE SET
@@ -340,7 +356,13 @@ export async function saveConfig(db, patch, { decisionChange = false } = {}) {
         CAST(COALESCE(json_extract(
           CASE WHEN json_valid(config.value) THEN config.value ELSE json(?) END,
           '$.decisionRevision'
-        ), 0) AS INTEGER) + ?
+        ), 0) AS INTEGER) + ?,
+        '$.scheduleRevision', CAST(COALESCE(json_extract(
+          CASE WHEN json_valid(config.value) THEN config.value ELSE '{}' END, '$.scheduleRevision'
+        ), 0) AS INTEGER) + ?,
+        '$.scheduleChangedAt', CASE WHEN ? = 1 THEN ? ELSE COALESCE(json_extract(
+          CASE WHEN json_valid(config.value) THEN config.value ELSE '{}' END, '$.scheduleChangedAt'
+        ), 0) END
       ),
       updated_at = excluded.updated_at
     RETURNING value`)
@@ -349,11 +371,16 @@ export async function saveConfig(db, patch, { decisionChange = false } = {}) {
       defaultsJson,
       patchJson,
       insertedRevision,
-      Date.now(),
+      scheduleIncrement,
+      scheduleIncrement ? updatedAt : 0,
+      updatedAt,
       defaultsJson,
       patchJson,
       defaultsJson,
       increment,
+      scheduleIncrement,
+      scheduleIncrement,
+      updatedAt,
     )
     .first();
   if (!row?.value) throw new Error('aggiornamento configurazione non confermato da D1');

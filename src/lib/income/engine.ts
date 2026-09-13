@@ -48,17 +48,19 @@ export interface IncomeLine {
   source: string;
   asOf: string;
 }
-export const STAKING_SYMBOLS = ['ADA', 'SOL', 'ETH', 'NEAR', 'POL', 'TRX', 'DOT', 'SUI', 'ATOM'];
+export const STAKING_SYMBOLS = ['ADA', 'SOL', 'ETH', 'NEAR', 'POL', 'TRX', 'DOT', 'SUI', 'ATOM', 'AVAX'];
 export const emptyYield = (): YieldInput => ({ rate: null, rateType: 'APR', taxPct: null, annualFees: 0, active: 'unknown', source: '', asOf: '', validUntil: '', cap: null, minimum: 0 });
 export const emptyDividend = (): DividendInput => ({ annualPerShare: null, currency: '', taxPct: null, source: '', asOf: '' });
 export const emptyStaking = (): StakingInput => ({ ...emptyYield(), sharePct: null, rateBasis: 'provider', eligible: false, eligibleFrom: '', minimumRewardUsd: 1 });
 export const validNumber = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n) && n >= 0;
 export const percent = (n: unknown): n is number => validNumber(n) && n <= 100;
-export function euros(amount: number | null, currency: string, eurUsd: number | null): number | null {
+export function euros(amount: number | null, currency: string, eurUsd: number | null, rates: Record<string, number> = {}): number | null {
   if (amount === null || !Number.isFinite(amount)) return null;
   if (amount === 0) return 0;
   if (currency === 'EUR') return amount;
   if (currency === 'USD' && eurUsd !== null && eurUsd > 0 && Number.isFinite(eurUsd)) return amount / eurUsd;
+  const rate = currency === 'GBX' ? (rates.GBP ?? 0) * 100 : rates[currency];
+  if (rate > 0 && Number.isFinite(rate)) return amount / rate;
   return null;
 }
 export function payoutRate(rate: number, type: 'APR' | 'APY'): number {
@@ -82,11 +84,11 @@ export function positionCapital(positions: Position[]): number | null {
   if (positions.some(p => !validNumber(p.currentValue))) return null;
   return positions.reduce((s, p) => s + p.currentValue!, 0);
 }
-export function dividendLine(symbol: string, positions: Position[], rule: DividendInput, fx: number | null): IncomeLine {
+export function dividendLine(symbol: string, positions: Position[], rule: DividendInput, fx: number | null, rates: Record<string, number> = {}): IncomeLine {
   const eligible = positions.filter(p => p.isBuy && p.leverage === 1 && p.isCFD !== true && p.assetClass !== 'cfd');
   const units = eligible.reduce((s, p) => s + p.units, 0);
   const annual = !eligible.length ? 0 : validNumber(rule.annualPerShare) && eligible.every(p => validNumber(p.units)) && rule.source.trim() && rule.asOf
-    ? euros(units * rule.annualPerShare, rule.currency, fx) : null;
+    ? euros(units * rule.annualPerShare, rule.currency, fx, rates) : null;
   return { id: `dividend:${symbol}`, label: symbol, kind: 'dividend', capitalEur: euros(positionCapital(eligible), 'USD', fx),
     annualGross: annual, annualNet: netIncome(annual, rule.taxPct), source: rule.source, asOf: rule.asOf,
     reason: !eligible.length ? 'Nessuna posizione long senza leva eleggibile; CFD esclusi' : annual === null ? 'Completa dividendo annuo per quota, valuta, fonte e data' : 'Stima annua sulle quote attuali; distribuzioni e possesso futuro possono cambiare', };

@@ -78,6 +78,7 @@ export function GuardrailsEditor({ config, onSaved }: Props) {
         rebalanceDayOfMonth: draft.rebalanceDayOfMonth,
         rebalanceHour: draft.rebalanceHour,
         rebalanceMinute: draft.rebalanceMinute,
+        scheduleRecoveryMinutes: draft.scheduleRecoveryMinutes ?? 60,
         maxOrdersPerRun: draft.maxOrdersPerRun,
         maxOrdersPerDay: draft.maxOrdersPerDay,
         minOrderUsd: draft.minOrderUsd,
@@ -183,8 +184,8 @@ export function GuardrailsEditor({ config, onSaved }: Props) {
             )}
 
             {draft.cadence === 'monthly' && (
-              <Field label="Giorno del mese" help="Da 1 a 28, per evitare mesi corti.">
-                <Input type="number" min={1} max={28} value={draft.rebalanceDayOfMonth}
+              <Field label="Giorno del mese" help="Da 1 a 31. Nei mesi più corti si usa l’ultimo giorno del mese.">
+                <Input type="number" min={1} max={31} value={draft.rebalanceDayOfMonth}
                   onChange={(event) => set('rebalanceDayOfMonth', Number(event.target.value))} />
               </Field>
             )}
@@ -194,15 +195,14 @@ export function GuardrailsEditor({ config, onSaved }: Props) {
                 onChange={(event) => set('rebalanceHour', Number(event.target.value))} />
             </Field>
 
-            <Field label="Minuto" help="Il Worker controlla la pianificazione ogni 15 minuti.">
-              <Select value={String(draft.rebalanceMinute)} onValueChange={(value) => set('rebalanceMinute', Number(value))}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  {[0, 15, 30, 45].map((minute) => (
-                    <SelectItem key={minute} value={String(minute)}>:{String(minute).padStart(2, '0')}</SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+            <Field label="Minuto" help="Il Worker controlla le scadenze ogni minuto.">
+              <Input type="number" min={0} max={59} step={1} value={draft.rebalanceMinute}
+                onChange={(event) => set('rebalanceMinute', Number(event.target.value))} />
+            </Field>
+
+            <Field label="Recupero (minuti)" help="Da 1 a 180. Se il cron salta o la pipeline è occupata, si riprova entro questa finestra. Una run già avviata non viene ripetuta.">
+              <Input type="number" min={1} max={180} step={1} value={draft.scheduleRecoveryMinutes ?? 60}
+                onChange={(event) => set('scheduleRecoveryMinutes', Number(event.target.value))} />
             </Field>
 
             <Field label="Budget strategico (EUR)" help="È il budget scelto durante l’onboarding per progettare la strategia. Durante le run, importi, grafici e ordini usano invece il capitale reale letto direttamente dal mirror eToro.">

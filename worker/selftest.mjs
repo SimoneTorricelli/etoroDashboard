@@ -551,7 +551,7 @@ const external = {
   diagnostics: [],
 };
 
-test('scheduler: il rebalance scatta soltanto al quarto d’ora configurato', () => {
+test('scheduler: il rebalance coincide con il minuto configurato', () => {
   const weekly = {
     ...DEFAULT_CONFIG,
     cadence: 'weekly',
@@ -607,13 +607,13 @@ test('scheduler: Europe/Rome segue ora legale e sopprime il secondo orario dupli
   assert.equal(decideKind(sundayAtTwoThirty, secondAutumn), null);
 });
 
-test('config: rebalanceMinute accetta soltanto i quarti d’ora del cron', () => {
-  for (const minute of [0, 15, 30, 45]) {
+test('config: rebalanceMinute accetta ogni minuto intero', () => {
+  for (const minute of [0, 1, 14, 15, 30, 31, 45, 59]) {
     const result = sanitizeConfigPatch({ rebalanceMinute: minute });
     assert.equal(result.patch.rebalanceMinute, minute);
     assert.deepEqual(result.rejected, []);
   }
-  for (const minute of [-1, 1, 14, 31, 59, 15.5, 'non valido']) {
+  for (const minute of [-1, 60, 15.5, null, true, '', 'non valido']) {
     const result = sanitizeConfigPatch({ rebalanceMinute: minute });
     assert.equal(result.patch.rebalanceMinute, undefined);
     assert.ok(result.rejected.some((item) => item.startsWith('rebalanceMinute:')));

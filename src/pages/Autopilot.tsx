@@ -1,3 +1,4 @@
+import { SchedulerPanel } from '@/components/autopilot/SchedulerPanel';
 /**
  * Autopilot (/autopilot) — pannello di controllo dell'agente server-side.
  *
@@ -1063,6 +1064,8 @@ export default function Autopilot() {
 
               {/* ---------------------------------------------- Panoramica */}
               <TabsContent value="panoramica" className="space-y-4 pt-4">
+                <SchedulerPanel scheduler={state.scheduler} frozen={state.config.frozen}
+                  onOpenRun={(id) => { setActiveTab('storico'); void openRun(id); }} />
                 {!hasRun && (
                   <Card>
                     <CardHeader className="pb-3">
