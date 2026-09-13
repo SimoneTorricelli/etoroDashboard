@@ -5,6 +5,7 @@ import { build } from 'esbuild';
 import { incomeReference, dividendReference, parseDividendReference, parseDividendStatistics, parseEcbRates } from '../worker/lib/income-reference.js';
 import { fundReference, parseFundReference } from '../worker/lib/income-funds.js';
 import { fundFixture, goldFixture, statisticsFixture } from './fixtures/income-reference.mjs';
+import { freeSearch, freeData } from './fixtures/income-free.mjs';
 import worker from '../worker/index.js';
 async function load(path) {
   const result = await build({ entryPoints: [fileURLToPath(new URL(path, import.meta.url))], bundle: true, write: false, platform: 'node', format: 'esm', logLevel: 'silent' });
@@ -110,9 +111,10 @@ test('statistics confirms a non-payer by identity, explicit statement and no div
   assert.equal(parseDividendStatistics(statisticsFixture(), 'CLSK', ref).annualPerShare, 0);
   for (const html of [statisticsFixture().replaceAll('does not appear to pay', 'may pay'), statisticsFixture().replace('value:"n/a"', 'value:"$2"'), statisticsFixture().replace('ticker:"CLSK"', 'ticker:"MSFT"'), statisticsFixture().replace('name:"CleanSpark"', 'name:"Other"'), statisticsFixture().replace('/clsk/statistics/', '/other/statistics/')]) assert.throws(() => parseDividendStatistics(html, 'CLSK', ref));
 });
-test('statistics fallback is only for a missing dividend page, never failed fetch or malformed amounts', async () => {
+test('free provider refuses upstream failure or malformed data without fabricating a fallback', async () => {
   const request = new Request('https://local/api/income/dividend?symbol=CLSK'); const calls = [];
-  const result = await incomeReference(request, {}, async url => { calls.push(url); return url.endsWith('/dividend/') ? new Response(null, { status: 404 }) : new Response(statisticsFixture()); });
+  const identity = { symbol: 'CLSK', exchange: 'XNAS', isin: 'US18452B2097' };
+  const result = await incomeReference(request, {}, async url => { calls.push(url); return Response.json(url.includes('?') ? freeSearch(identity) : freeData(identity, true)); });
   assert.equal(result.status, 200); assert.equal((await result.json()).method, 'no_current_distribution'); assert.equal(calls.length, 2);
   for (const status of [301, 302, 307, 308, 403, 429, 500]) {
     let count = 0; const response = await incomeReference(request, {}, async () => { count++; return new Response(null, { status, headers: { location: 'https://elsewhere.example/' } }); });
@@ -137,7 +139,7 @@ test('gold ETC requires explicit issuer distribution None and exact product iden
 test('issuer route fetches one fixed URL and uses a new cache generation for the redirect fix', async () => {
   const calls = []; const keys = []; const symbol = 'CNDX.L';
   const response = await incomeReference(new Request(`https://local/api/income/dividend?symbol=${symbol}&kind=etf`), { STATE: { get: async key => { keys.push(key); return null; }, put: async key => { keys.push(key); } } }, async (url, opts) => { calls.push(url); assert.equal(opts.redirect, 'manual'); return new Response(fundFixture()); });
-  assert.equal(response.status, 200); assert.deepEqual(calls, [fundReference(symbol).url]); assert.ok(keys.every(key => key.startsWith('income:dividend:v4:')));
+  assert.equal(response.status, 200); assert.deepEqual(calls, [fundReference(symbol).url]); assert.ok(keys.every(key => key.startsWith('income:dividend:v6:')));
 });
 test('annual published amount is not guessed from one payment; payout currency differs from quote', () => {
   const d = parseDividendReference(fixture(), 'AAPL', dividendReference('AAPL'));
@@ -162,11 +164,21 @@ test('ECB reference rejects stale, future and incomplete rates', () => {
 test('public handler uses fixed host without account headers, optional cache, bounded response', async () => {
   const request = new Request('https://local/api/income/dividend?symbol=AAPL', { headers: { authorization: 'private-token' } });
   const env = { STATE: { get: async () => null, put: async () => { throw new Error('KV unavailable'); } } };
-  const response = await incomeReference(request, env, async (url, options) => { assert.equal(url, dividendReference('AAPL').url); assert.equal(options.redirect, 'manual'); assert.ok(!JSON.stringify(options).includes('private-token')); return new Response(fixture()); });
-  assert.equal(response.status, 200); assert.equal((await response.json()).annualPerShare, 1.08);
+  const response = await incomeReference(request, env, async (url, options) => { assert.ok(url.startsWith('https://api.divvydiary.com/symbols')); assert.equal(options.redirect, 'manual'); assert.ok(!JSON.stringify(options).includes('private-token')); return Response.json(url.includes('?') ? freeSearch() : freeData()); });
+  assert.equal(response.status, 200); assert.equal((await response.json()).annualPerShare, 1.06);
   assert.equal((await incomeReference(request, {}, async () => new Response('x'.repeat(600001)))).status, 502);
   assert.equal((await incomeReference(request, {}, async () => new Response('', { status: 403 }))).status, 502);
   assert.equal((await incomeReference(new Request(request, { method: 'POST' }), {})).status, 405);
+});
+test('access denials and rate limits remain unknown and have a distinct diagnostic', async () => {
+  const request = new Request('https://local/api/income/dividend?symbol=AAPL');
+  for (const [status, code] of [[403, 'upstream_access_denied'], [406, 'upstream_access_denied'], [429, 'upstream_rate_limited'], [503, 'upstream_unavailable']]) {
+    const response = await incomeReference(request, {}, async () => new Response(null, { status }));
+    const body = await response.json(); assert.equal(response.status, 502); assert.equal(body.code, code); assert.equal(body.annualPerShare, undefined);
+    assert.equal(p.referenceFailure(body, 502).code, code);
+    assert.equal(p.referenceFailure({ error: body.error }, 502).code, code);
+  }
+  assert.equal(p.referenceFailure({ error: 'Mercato non coperto' }, 400).code, 'upstream_unavailable');
 });
 test('worker route returns cached reference without trading proxy, database or secrets', async () => {
   const cached = { symbol: 'AAPL', annualPerShare: 1.08, asOf: Date.now() };
@@ -179,7 +191,7 @@ test('automatic fetch covers all symbols with two-request bound, isolates failur
   const output = new Map(); const instruments = Array.from({ length: 35 }, (_, i) => ({ symbol: `T${i}`, kind: 'stock' }));
   try {
     globalThis.fetch = async url => { calls++; active++; maximum = Math.max(active, maximum); await new Promise(resolve => setTimeout(resolve, 1)); active--; const symbol = new URL(url).searchParams.get('symbol');
-      return symbol === 'T2' ? Response.json({ error: 'Temporarily unavailable' }, { status: 502 }) : Response.json({ symbol, annualPerShare: 1, currency: 'USD', status: 'available', asOf: Date.now(), source: 'https://stockanalysis.com/stocks/example/dividend/', rows: [] }); };
+      return symbol === 'T2' ? Response.json({ error: 'Temporarily unavailable' }, { status: 502 }) : Response.json({ symbol, annualPerShare: 1, currency: 'USD', status: 'available', asOf: Date.now(), source: 'https://divvydiary.com/en/US0378331005', rows: [] }); };
     await p.fetchAutomaticDividends(instruments, { proxyUrl: 'https://local' }, new AbortController().signal, (symbol, result) => output.set(symbol, result));
     assert.equal(output.size, 35); assert.equal(calls, 35); assert.ok(maximum <= 2); assert.equal(output.get('T2').data, null); assert.ok(output.get('T2').error); assert.equal(output.get('T34').data.annualPerShare, 1);
     calls = 0; await p.fetchAutomaticDividends(instruments.filter(i => i.symbol !== 'T2'), { proxyUrl: 'https://local' }, new AbortController().signal, () => {}); assert.equal(calls, 0);

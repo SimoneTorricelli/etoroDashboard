@@ -1,5 +1,6 @@
 /** Public market references. Fixed hosts, no credentials, no arbitrary URLs. */
 import { fundReference, parseFundReference } from './income-funds.js';
+import { freeReference, freeDividend } from './income-free.js';
 const TTL = 12 * 3600;
 const FX_URL = 'https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml';
 const MARKETS = { MI: 'bit', DE: 'etr', L: 'lon', PA: 'epa', MC: 'bme', AS: 'ams', NV: 'ams', T: 'tyo', BR: 'ebr', LS: 'eli', ST: 'sto', CO: 'cph', HE: 'hel', OL: 'osl', SW: 'swx', HK: 'hkg', TO: 'tsx', AX: 'asx' };
@@ -141,28 +142,29 @@ export async function incomeReference(request, env, fetcher = fetch) {
   if (request.method !== 'GET') return Response.json({ error: 'Metodo non consentito' }, { status: 405 });
   const url = new URL(request.url); const isFx = url.pathname.endsWith('/fx');
   let ref; let fund; const symbol = url.searchParams.get('symbol') ?? '';
-  try { if (!isFx) { ref = dividendReference(symbol, url.searchParams.get('kind') ?? 'stock'); fund = fundReference(symbol); if (fund) ref = fund; } }
+  try { if (!isFx) {
+    const kind = url.searchParams.get('kind') ?? 'stock';
+    fund = fundReference(symbol);
+    ref = freeReference(symbol, kind, fund?.isin);
+    if (fund?.provider === 'iShares / BlackRock') ref = fund;
+    else fund = null;
+  } }
   catch (error) { return Response.json({ error: error.message }, { status: 400 }); }
   // New generation also invalidates cached runtime errors from the old fetch.
-  const key = isFx ? 'income:ecb:v2' : `income:dividend:v4:${symbol}:${ref.url}`;
+  const key = isFx ? 'income:ecb:v2' : `income:dividend:v6:${symbol}:${ref.url}`;
   try {
     let cached = null; try { cached = await env.STATE?.get(key, 'json'); } catch { /* Cache is optional. */ }
     if (cached && Date.now() - cached.asOf < (cached.error ? 600 : TTL) * 1000) {
       return Response.json(cached, { status: cached.error ? 502 : 200 });
     }
-    let result;
-    try {
-      const text = await boundedText(isFx ? FX_URL : ref.url, isFx ? 50000 : fund ? 5000000 : 600000, fetcher);
-      result = isFx ? parseEcbRates(text) : fund ? parseFundReference(text, symbol, fund) : parseDividendReference(text, symbol, ref);
-    } catch (error) {
-      if (isFx || fund || error.status !== 404) throw error;
-      const statistics = { ...ref, url: ref.url.replace(/\/dividend\/$/, '/statistics/') };
-      result = parseDividendStatistics(await boundedText(statistics.url, 900000, fetcher), symbol, statistics);
-    }
+    const result = isFx ? parseEcbRates(await boundedText(FX_URL, 50000, fetcher))
+      : fund ? parseFundReference(await boundedText(fund.url, 5000000, fetcher), symbol, fund)
+        : await freeDividend(symbol, ref, async url => JSON.parse(await boundedText(url, 600000, fetcher)), Date.now(), url => boundedText(url, 600000, fetcher));
     try { await env.STATE?.put(key, JSON.stringify(result), { expirationTtl: TTL }); } catch { /* Still return the fetched data. */ }
     return Response.json(result, { headers: { 'cache-control': 'public, max-age=1800' } });
   } catch (error) {
-    const result = { error: error.message || 'Recupero automatico temporaneamente non disponibile', symbol, asOf: Date.now(), source: ref?.url ?? FX_URL };
+    const code = [403, 406].includes(error.status) ? 'upstream_access_denied' : error.status === 429 ? 'upstream_rate_limited' : 'upstream_unavailable';
+    const result = { error: error.message || 'Recupero automatico temporaneamente non disponibile', code, symbol, asOf: Date.now(), source: ref?.url ?? FX_URL };
     try { await env.STATE?.put(key, JSON.stringify(result), { expirationTtl: 600 }); } catch { /* Best effort. */ }
     return Response.json(result, { status: 502, headers: { 'cache-control': 'no-store' } });
   }

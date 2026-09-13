@@ -10,13 +10,25 @@ export interface AutomaticDividend {
   frequency: string | null; method: string; rows: IncomeDividend[];
 }
 export interface ReferenceFx { rates: Record<string, number>; date: string; source: string; asOf: number; }
-export interface DividendLookup { loading: boolean; data: AutomaticDividend | null; error: string; }
+export interface DividendLookup { loading: boolean; data: AutomaticDividend | null; error: string; code?: string; }
+class ReferenceError extends Error {
+  code: string;
+  constructor(message: string, code: string) { super(message); this.code = code; }
+}
+export function referenceFailure(body: { error?: string; code?: string }, status: number) {
+  // Recognize errors already cached by the previous Worker release too.
+  const upstream = body.error?.match(/^Fonte momentaneamente non disponibile \(HTTP (\d{3})\)$/)?.[1];
+  const code = body.code || (['403', '406'].includes(upstream ?? '') ? 'upstream_access_denied' : upstream === '429' ? 'upstream_rate_limited' : 'upstream_unavailable');
+  if (code === 'upstream_access_denied') return new ReferenceError('Il sito della fonte rifiuta il collegamento automatico dal server.', code);
+  if (code === 'upstream_rate_limited') return new ReferenceError('La fonte ha limitato le richieste automatiche. Il dato resta in attesa.', code);
+  return new ReferenceError(body.error || `Fonte non disponibile (${status})`, code);
+}
 function validReference(data: AutomaticDividend | null, symbol: string): data is AutomaticDividend {
   return !!data && data.symbol === symbol && Number.isFinite(data.annualPerShare) && data.annualPerShare >= 0
     && /^[A-Z]{3}$/.test(data.currency) && Array.isArray(data.rows) && Number.isFinite(data.asOf)
     && data.asOf <= Date.now() + 300000 && Date.now() - data.asOf < TTL
     && ['available', 'no_history'].includes(data.status) && typeof data.source === 'string'
-    && ['https://stockanalysis.com/', 'https://www.ishares.com/', 'https://www.invesco.com/'].some(host => data.source.startsWith(host));
+    && ['https://divvydiary.com/', 'https://www.ishares.com/', 'https://www.mufg.jp/english/ir/stock/dividend/'].some(host => data.source.startsWith(host));
 }
 function referenceBase(settings: LiveSettings) {
   return (import.meta.env?.DEV ? window.location.origin : settings.proxyUrl || window.location.origin).replace(/\/+$/, '');
@@ -25,7 +37,7 @@ async function referenceJson(url: string, signal: AbortSignal) {
   const response = await fetch(url, { signal });
   if (!response.headers.get('content-type')?.includes('application/json')) throw new Error('Il collegamento automatico richiede il Worker aggiornato.');
   const body = await response.json();
-  if (!response.ok) throw new Error(body.error || `Fonte non disponibile (${response.status})`);
+  if (!response.ok) throw referenceFailure(body, response.status);
   return body;
 }
 export async function fetchReferenceFx(settings: LiveSettings, signal: AbortSignal): Promise<ReferenceFx> {
@@ -42,7 +54,7 @@ export async function fetchAutomaticDividends(
   async function consume() {
     while (queue.length && !signal.aborted) {
       const item = queue.shift()!;
-      const key = `torino.income.reference.v2:${item.kind}:${item.symbol}`;
+      const key = `torino.income.reference.v3:${item.kind}:${item.symbol}`;
       try {
         let data: AutomaticDividend | null = null;
         if (!force) try {
@@ -57,7 +69,7 @@ export async function fetchAutomaticDividends(
         try { localStorage.setItem(key, JSON.stringify(data)); } catch { /* Optional public cache. */ }
         if (!signal.aborted) onResult(item.symbol, { data, loading: false, error: '' });
       } catch (error) {
-        if (!signal.aborted) onResult(item.symbol, { data: null, loading: false, error: error instanceof Error ? error.message : 'Recupero temporaneamente non disponibile' });
+        if (!signal.aborted) onResult(item.symbol, { data: null, loading: false, error: error instanceof Error ? error.message : 'Recupero temporaneamente non disponibile', code: error instanceof ReferenceError ? error.code : undefined });
       }
     }
   }
