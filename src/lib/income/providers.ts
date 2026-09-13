@@ -16,7 +16,7 @@ function validReference(data: AutomaticDividend | null, symbol: string): data is
     && /^[A-Z]{3}$/.test(data.currency) && Array.isArray(data.rows) && Number.isFinite(data.asOf)
     && data.asOf <= Date.now() + 300000 && Date.now() - data.asOf < TTL
     && ['available', 'no_history'].includes(data.status) && typeof data.source === 'string'
-    && data.source.startsWith('https://stockanalysis.com/');
+    && ['https://stockanalysis.com/', 'https://www.ishares.com/', 'https://www.invesco.com/'].some(host => data.source.startsWith(host));
 }
 function referenceBase(settings: LiveSettings) {
   return (import.meta.env?.DEV ? window.location.origin : settings.proxyUrl || window.location.origin).replace(/\/+$/, '');

@@ -2,7 +2,9 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 import { build } from 'esbuild';
-import { incomeReference, dividendReference, parseDividendReference, parseEcbRates } from '../worker/lib/income-reference.js';
+import { incomeReference, dividendReference, parseDividendReference, parseDividendStatistics, parseEcbRates } from '../worker/lib/income-reference.js';
+import { fundReference, parseFundReference } from '../worker/lib/income-funds.js';
+import { fundFixture, goldFixture, statisticsFixture } from './fixtures/income-reference.mjs';
 import worker from '../worker/index.js';
 async function load(path) {
   const result = await build({ entryPoints: [fileURLToPath(new URL(path, import.meta.url))], bundle: true, write: false, platform: 'node', format: 'esm', logLevel: 'silent' });
@@ -87,6 +89,56 @@ test('reference locks market identity and never sends an unknown suffix to the U
   assert.throws(() => parseDividendReference(fixture({ ticker: 'MSFT' }), 'AAPL', dividendReference('AAPL')), /Identità/);
   assert.throws(() => parseDividendReference(fixture().replace('/stocks/aapl/', '/stocks/msft/'), 'AAPL', dividendReference('AAPL')), /quotazione/);
 });
+test('eToro Japan, Amsterdam and US suffixes preserve exact market and payout currency', () => {
+  for (const [symbol, ticker, exchange, currency, annual] of [['6758.T', '6758', 'tyo', 'JPY', '35.00 JPY'], ['ASML.NV', 'ASML', 'ams', 'EUR', '€7.50'], ['CVX.US', 'CVX', null, 'USD', '$7.12']]) {
+    const ref = dividendReference(symbol); assert.equal(ref.exchange, exchange); assert.equal(ref.ticker, ticker);
+    const parsed = parseDividendReference(fixture({ symbol, ticker, currency, annual }), symbol, ref);
+    assert.equal(parsed.symbol, symbol); assert.equal(parsed.currency, currency); assert.ok(parsed.annualPerShare > 0);
+  }
+  for (const symbol of ['AAPL.US.US', 'ENEL.MI.US', 'ABC.UNKNOWN.US']) assert.throws(() => dividendReference(symbol));
+});
+test('explicit no payments in last year permits old history but rejects contradictions', () => {
+  const ref = dividendReference('AMD'); const now = Date.parse('2026-09-13');
+  const html = fixture({ symbol: 'AMD', annual: 'n/a', history: '{dt:"1995-04-27",amt:"0.005"}' }).replace('Published annual dividend.', 'AMD has not paid any dividends in the past year and the next ex-dividend date is unknown.');
+  const parsed = parseDividendReference(html, 'AMD', ref, now);
+  assert.equal(parsed.annualPerShare, 0); assert.equal(parsed.method, 'no_payments_last_year');
+  assert.throws(() => parseDividendReference(html.replace('1995-04-27', '2026-08-01'), 'AMD', ref, now), /conflitto/);
+  assert.throws(() => parseDividendReference(html.replace('annual:"n/a"', 'annual:"$1"'), 'AMD', ref, now), /conflitto/);
+});
+test('statistics confirms a non-payer by identity, explicit statement and no dividend per share', () => {
+  const ref = { ...dividendReference('CLSK'), url: 'https://stockanalysis.com/stocks/clsk/statistics/' };
+  assert.equal(parseDividendStatistics(statisticsFixture(), 'CLSK', ref).annualPerShare, 0);
+  for (const html of [statisticsFixture().replaceAll('does not appear to pay', 'may pay'), statisticsFixture().replace('value:"n/a"', 'value:"$2"'), statisticsFixture().replace('ticker:"CLSK"', 'ticker:"MSFT"'), statisticsFixture().replace('name:"CleanSpark"', 'name:"Other"'), statisticsFixture().replace('/clsk/statistics/', '/other/statistics/')]) assert.throws(() => parseDividendStatistics(html, 'CLSK', ref));
+});
+test('statistics fallback is only for a missing dividend page, never failed fetch or malformed amounts', async () => {
+  const request = new Request('https://local/api/income/dividend?symbol=CLSK'); const calls = [];
+  const result = await incomeReference(request, {}, async url => { calls.push(url); return url.endsWith('/dividend/') ? new Response(null, { status: 404 }) : new Response(statisticsFixture()); });
+  assert.equal(result.status, 200); assert.equal((await result.json()).method, 'no_current_distribution'); assert.equal(calls.length, 2);
+  for (const status of [301, 302, 307, 308, 403, 429, 500]) {
+    let count = 0; const response = await incomeReference(request, {}, async () => { count++; return new Response(null, { status, headers: { location: 'https://elsewhere.example/' } }); });
+    assert.equal(response.status, 502); assert.equal(count, 1);
+  }
+  let count = 0; const invalid = await incomeReference(request, {}, async () => { count++; return new Response('<html>Unavailable</html>'); });
+  assert.equal(invalid.status, 502); assert.equal(count, 1);
+});
+test('accumulating ETFs require the current issuer policy, exact ISIN, product and listing', () => {
+  for (const symbol of ['CNDX.L', 'CBU0.L', 'DTLA.L', 'CSP1.L', '2B76.DE']) {
+    const parsed = parseFundReference(fundFixture(symbol), symbol, fundReference(symbol));
+    assert.equal(parsed.annualPerShare, 0); assert.equal(parsed.method, 'accumulating'); assert.equal(parsed.currency, 'USD');
+  }
+  const symbol = 'CNDX.L'; const ref = fundReference(symbol);
+  for (const html of [fundFixture(symbol, { isin: { value: 'WRONG' } }), fundFixture(symbol, { useOfProfitsCode: { value: 'Distributing' } }), fundFixture(symbol).replace('CNDX.L', 'CNX1.L'), fundFixture(symbol).replaceAll('253741', '253743'), '<html>Accumulating IE00B53SZB19 CNDX.L</html>']) assert.throws(() => parseFundReference(html, symbol, ref));
+});
+test('gold ETC requires explicit issuer distribution None and exact product identity', () => {
+  const ref = fundReference('8PSG.DE'); assert.equal(parseFundReference(goldFixture(), '8PSG.DE', ref).method, 'non_distributing');
+  for (const html of [goldFixture().replace('None', 'Monthly'), goldFixture().replace(ref.isin, 'XS2183935274'), goldFixture().replace('physical-gold-etc.html', 'physical-gold-eur-hedged-etc.html')]) assert.throws(() => parseFundReference(html, '8PSG.DE', ref));
+  assert.equal(fundReference('UNKNOWN.DE'), null);
+});
+test('issuer route fetches one fixed URL and uses a new cache generation for the redirect fix', async () => {
+  const calls = []; const keys = []; const symbol = 'CNDX.L';
+  const response = await incomeReference(new Request(`https://local/api/income/dividend?symbol=${symbol}&kind=etf`), { STATE: { get: async key => { keys.push(key); return null; }, put: async key => { keys.push(key); } } }, async (url, opts) => { calls.push(url); assert.equal(opts.redirect, 'manual'); return new Response(fundFixture()); });
+  assert.equal(response.status, 200); assert.deepEqual(calls, [fundReference(symbol).url]); assert.ok(keys.every(key => key.startsWith('income:dividend:v4:')));
+});
 test('annual published amount is not guessed from one payment; payout currency differs from quote', () => {
   const d = parseDividendReference(fixture(), 'AAPL', dividendReference('AAPL'));
   assert.equal(d.annualPerShare, 1.08); assert.equal(d.rows.length, 1); assert.equal(d.rows[0].amountPerShare, .27);
@@ -110,7 +162,7 @@ test('ECB reference rejects stale, future and incomplete rates', () => {
 test('public handler uses fixed host without account headers, optional cache, bounded response', async () => {
   const request = new Request('https://local/api/income/dividend?symbol=AAPL', { headers: { authorization: 'private-token' } });
   const env = { STATE: { get: async () => null, put: async () => { throw new Error('KV unavailable'); } } };
-  const response = await incomeReference(request, env, async (url, options) => { assert.equal(url, dividendReference('AAPL').url); assert.equal(options.redirect, 'error'); assert.ok(!JSON.stringify(options).includes('private-token')); return new Response(fixture()); });
+  const response = await incomeReference(request, env, async (url, options) => { assert.equal(url, dividendReference('AAPL').url); assert.equal(options.redirect, 'manual'); assert.ok(!JSON.stringify(options).includes('private-token')); return new Response(fixture()); });
   assert.equal(response.status, 200); assert.equal((await response.json()).annualPerShare, 1.08);
   assert.equal((await incomeReference(request, {}, async () => new Response('x'.repeat(600001)))).status, 502);
   assert.equal((await incomeReference(request, {}, async () => new Response('', { status: 403 }))).status, 502);
