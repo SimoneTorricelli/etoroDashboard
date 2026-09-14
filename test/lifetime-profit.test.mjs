@@ -3,105 +3,115 @@ import test from 'node:test';
 import { readFile } from 'node:fs/promises';
 import ts from 'typescript';
 
-const source = await readFile(new URL('../src/lib/finance/lifetime-profit.ts', import.meta.url), 'utf8');
+const source = await readFile(new URL('../src/lib/data/EtoroProfitHistory.ts', import.meta.url), 'utf8');
 const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText;
-const moduleUrl = `data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`;
-const { calculateLifetimeProfit: calculate, validateProfitHistory: validate, parseProfitAmount } = await import(moduleUrl);
-const today = '2026-09-14';
-const row = (through, deposits, withdrawals, equity, unrealized = null, adjustments = 0) => ({ through, deposits, withdrawals, equity, unrealized, adjustments, source: 'Estratto eToro' });
-const history = years => ({ version: 1, startYear: 2023, sinceInception: true, openingEquity: 0, openingUnrealized: 0, years });
+const { fetchEtoroProfitHistory: fetchHistory, mergeProfitHistory, parseProfitTrades, parseOpenProfit, profitByYear, profitByMonth } = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`);
+const now = Date.parse('2026-09-14T12:00:00Z');
+const once = rows => { let called = false; return async () => { if (called) return []; called = true; return rows; }; };
+const trade = (id, profit = 1, extra = {}) => ({ positionId: id, closeTimestamp: '2026-06-01T12:00:00Z', netProfit: profit, orderId: id, units: 1, ...extra });
 
-test('reinvestment and withdrawal do not erase or double-count earned profits', () => {
-  const points = calculate(history([
-    row('2023-12-31', 10000, 0, 12000, 0),
-    row('2024-12-31', 0, 1000, 11000, 0),
-    row('2025-12-31', 0, 0, 13000, 2000),
-    row(today, 0, 0, 13000, 0), // Close and reinvest: equity unchanged, realized rises.
-  ]), today);
-  assert.deepEqual(points.map(p => p.cumulativeProfit), [2000, 2000, 4000, 4000]);
-  assert.deepEqual(points.map(p => p.annualProfit), [2000, 0, 2000, 0]);
-  assert.deepEqual(points.map(p => p.realizedProfit), [2000, 2000, 2000, 4000]);
+test('all-time request follows every page, including the terminal empty page', async () => {
+  const paths = [];
+  const history = await fetchHistory(async path => { paths.push(path); return paths.length === 1 ? Array.from({ length: 500 }, (_, i) => trade(i + 1)) : []; }, undefined, now);
+  assert.equal(history.trades.length, 500); assert.equal(history.rangeLimited, false);
+  assert.ok(paths[0].includes('minDate=2000-01-01')); assert.ok(paths[1].includes('page=2'));
 });
 
-test('return of capital, added capital and withdrawals exceeding contributions', () => {
-  assert.equal(calculate(history([row('2023-12-31', 10000, 4000, 6000)]), today)[0].cumulativeProfit, 0);
-  assert.equal(calculate(history([row('2023-12-31', 15000, 0, 15000)]), today)[0].cumulativeProfit, 0);
-  assert.equal(calculate(history([row('2023-12-31', 10000, 15000, 0, 0)]), today)[0].cumulativeProfit, 5000);
+test('pagination counts overlap once, preserves distinct partial closes and losses', async () => {
+  const first = Array.from({ length: 500 }, (_, i) => trade(i + 1));
+  let page = 0;
+  const history = await fetchHistory(async () => ++page === 1 ? first : page === 2 ? [first[0], trade(1, -20, { units: 0.5 }), trade(501, 50, { socialTradeId: 42 })] : [], undefined, now);
+  assert.equal(history.trades.length, 502);
+  const [year] = profitByYear(history);
+  assert.equal(year.profit, 530); assert.equal(year.manual, 480); assert.equal(year.copy, 50);
 });
 
-test('fees, losses, dividends and negative unrealized P&L reconcile without clamping', () => {
-  const point = calculate(history([row('2023-12-31', 10000, 1000, 8800, -500)]), today)[0];
-  assert.equal(point.cumulativeProfit, -200);
-  assert.equal(point.realizedProfit, 300); // +400 credited income minus 100 costs, -500 still open.
+test('reinvestment and withdrawals cannot erase realized gains or add returned capital', async () => {
+  const history = await fetchHistory(once([trade(1, 2000, { investment: 10000, closeTimestamp: '2023-05-01T12:00:00Z' }), trade(2, -500, { investment: 12000, closeTimestamp: '2025-05-01T12:00:00Z' })]), undefined, now);
+  assert.deepEqual(profitByYear(history).map(row => [row.year, row.profit, row.cumulative]), [[2023, 2000, 2000], [2024, 0, 2000], [2025, -500, 1500], [2026, 0, 1500]]);
 });
 
-test('external capital transfers and bonuses are neutralized in either direction', () => {
-  assert.equal(calculate(history([row('2023-12-31', 10000, 0, 12500, 0, 2000)]), today)[0].cumulativeProfit, 500);
-  assert.equal(calculate(history([row('2023-12-31', 10000, 0, 8500, 0, -2000)]), today)[0].cumulativeProfit, 500);
+test('net profits are used once: fees and mirror closed-profit totals are not added again', async () => {
+  const history = await fetchHistory(once([trade(1, 90, { fees: 10, socialTradeId: 42 })]), undefined, now);
+  assert.equal(profitByYear(history)[0].profit, 90);
 });
 
-test('partial history subtracts opening equity and change in unrealized profit', () => {
-  const point = calculate({ ...history([row('2023-12-31', 2000, 1000, 14500, 2300)]), sinceInception: false, openingEquity: 12000, openingUnrealized: 2000 }, today)[0];
-  assert.equal(point.cumulativeProfit, 1500);
-  assert.equal(point.realizedProfit, 1200);
+test('explicit date-range refusal falls back with visible limited coverage', async () => {
+  const paths = [];
+  const history = await fetchHistory(async path => {
+    paths.push(path);
+    if (paths.length === 1) throw new Error('eToro API 400: date range exceeds 365 days');
+    return paths.length === 2 ? [trade(1)] : [];
+  }, undefined, now);
+  assert.equal(history.rangeLimited, true); assert.equal(history.from, '2025-09-15');
+  assert.equal(paths.length, 3); assert.ok(paths[1].includes('minDate=2025-09-15&page=1'));
 });
 
-test('missing open P&L is unknown, including a missing baseline', () => {
-  assert.equal(calculate(history([row('2023-12-31', 100, 0, 110)]), today)[0].realizedProfit, null);
-  assert.equal(calculate({ ...history([row('2023-12-31', 100, 0, 110, 0)]), sinceInception: false, openingUnrealized: null }, today)[0].realizedProfit, null);
-});
-
-test('refuse incomplete, duplicated, invalid and future annual coverage', () => {
-  const bad = [
-    history([row('2024-12-31', 0, 0, 1)]),
-    history([row('2023-12-31', 0, 0, 1), row('2025-12-31', 0, 0, 1)]),
-    history([row('2023-12-31', 0, 0, 1), row('2023-12-31', 0, 0, 1)]),
-    history([row('2023-10-01', 0, 0, 1), row('2024-12-31', 0, 0, 1)]),
-    history([row('2023-02-30', 0, 0, 1)]),
-    { ...history([row('2026-09-15', 0, 0, 1)]), startYear: 2026 },
-    { ...history([row('2023-12-31', 0, 0, 1)]), openingEquity: 10 },
-    history([null]), history([{}]),
-  ];
-  for (const input of bad) { assert.ok(validate(input, today).length); assert.throws(() => calculate(input, today)); }
-});
-
-test('require explicit finite flows and source, reject tampered backups', () => {
-  for (const patch of [{ deposits: null }, { deposits: NaN }, { withdrawals: -10 }, { equity: Infinity }, { adjustments: '0' }, { source: '' }, { unrealized: undefined }]) {
-    assert.ok(validate(history([{ ...row('2023-12-31', 0, 0, 0, 0), ...patch }]), today).length);
+test('auth, quota, network and unrelated bad requests never produce a misleading fallback', async () => {
+  for (const message of ['eToro API 401: unauthorized', 'eToro API 429: quota', 'network offline', 'eToro API 400: missing header']) {
+    let calls = 0;
+    await assert.rejects(fetchHistory(async () => { calls++; throw new Error(message); }, undefined, now));
+    assert.equal(calls, 1);
   }
-  assert.ok(validate({ ...history([]), version: 99 }, today).length);
-  assert.ok(validate(null, today).length);
 });
 
-test('chronological results and the annual/cumulative identity survive shuffled input', () => {
-  const points = calculate(history([row('2024-12-31', 500, 700, 1100), row('2023-12-31', 1000, 0, 1200)]), today);
-  assert.deepEqual(points.map(p => p.year), [2023, 2024]);
-  assert.equal(points.reduce((sum, p) => sum + p.annualProfit, 0), points.at(-1).cumulativeProfit);
+test('fail closed when pagination repeats, changes data or fails midway', async () => {
+  const first = Array.from({ length: 500 }, (_, i) => trade(i + 1));
+  await assert.rejects(fetchHistory(async () => first, undefined, now), /stessa pagina/);
+  let page = 0;
+  await assert.rejects(fetchHistory(async () => ++page === 1 ? first : [trade(1, 9)], undefined, now), /cambiato/);
+  page = 0;
+  await assert.rejects(fetchHistory(async () => { if (++page === 1) return first; throw new Error('timeout'); }, undefined, now), /timeout/);
 });
 
-test('money inputs accept comma decimals and grouped formats, never guess malformed amounts', () => {
-  for (const [raw, expected] of [['1.234,56', 1234.56], ['1,234.56', 1234.56], ['1234,5', 1234.5], ['-100,25', -100.25], ['0', 0], [' $ 25.00 ', 25]]) assert.equal(parseProfitAmount(raw), expected);
-  for (const raw of ['', '1,234', '1.234', '12,34,56', 'Infinity', '1e5', '1,2.3', 'abc']) assert.ok(Number.isNaN(parseProfitAmount(raw)), raw);
+test('abort prevents further pages and publishing a partially read result', async () => {
+  const controller = new AbortController(); let calls = 0;
+  await assert.rejects(fetchHistory(async () => { calls++; controller.abort(); return [trade(1)]; }, controller.signal, now), { name: 'AbortError' });
+  assert.equal(calls, 1);
 });
 
-const storageSource = await readFile(new URL('../src/lib/finance/profit-storage.ts', import.meta.url), 'utf8');
-const storageCompiled = ts.transpileModule(storageSource, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText.replace("'./lifetime-profit'", JSON.stringify(moduleUrl));
-const { loadProfitHistory, saveProfitHistory } = await import(`data:text/javascript;base64,${Buffer.from(storageCompiled).toString('base64')}`);
-test('storage round trip is scoped, validates data and preserves corrupt originals', () => {
-  const values = new Map();
-  globalThis.localStorage = { getItem: key => values.get(key) ?? null, setItem: (key, value) => values.set(key, value) };
-  const data = history([row('2023-12-31', 10000, 1000, 11000, 0)]);
-  saveProfitHistory('account-a', data);
-  assert.deepEqual(loadProfitHistory('account-a').history, data);
-  assert.equal(loadProfitHistory('account-b').history.years.length, 0);
-  values.set('corrupt', '{broken');
-  assert.ok(loadProfitHistory('corrupt').error);
-  assert.equal(values.get('corrupt'), '{broken');
-  assert.throws(() => saveProfitHistory('account-a', history([row('2023-12-31', NaN, 0, 0)])));
-  assert.deepEqual(loadProfitHistory('account-a').history, data);
+test('malformed and missing values are not converted into zero profits', () => {
+  for (const patch of [{ netProfit: null }, { netProfit: '' }, { netProfit: true }, { netProfit: Infinity }, { closeTimestamp: null }, { closeTimestamp: '2027-01-01' }, { positionId: null }]) {
+    assert.throws(() => parseProfitTrades([trade(1, 1, patch)], now));
+  }
+  assert.throws(() => parseProfitTrades({ error: 'Unauthorized' }, now));
+  assert.equal(parseProfitTrades({ items: [trade(1, 0)] }, now).trades[0].profit, 0);
 });
-test('storage failures surface rather than claiming successful persistence', () => {
-  globalThis.localStorage = { getItem() { throw new Error('Blocked'); }, setItem() { throw new Error('Quota'); } };
-  assert.ok(loadProfitHistory('account').error);
-  assert.throws(() => saveProfitHistory('account', history([])), /Quota/);
+
+test('empty history is a verified empty result, not a fabricated point', async () => {
+  const history = await fetchHistory(async () => [], undefined, now);
+  assert.equal(history.trades.length, 0); assert.deepEqual(profitByYear(history), []);
+});
+
+test('current open profit excludes closed mirror results and duplicate positions', () => {
+  const position = { positionId: 1, unrealizedPnL: { pnL: 25 } };
+  assert.equal(parseOpenProfit({ clientPortfolio: { positions: [position], mirrors: [{ positions: [position, { positionId: 2, unrealizedPnL: { pnL: -10 } }], closedPositionsNetProfit: 1000 }] } }), 15);
+  assert.equal(parseOpenProfit({ positions: [], mirrors: [] }), 0);
+  assert.equal(parseOpenProfit({ positions: [{}], mirrors: [] }), null);
+  assert.equal(parseOpenProfit({ positions: [], mirrors: [{}] }), null);
+  assert.equal(parseOpenProfit({ error: 'unauthorized' }), null);
+  assert.equal(parseOpenProfit({ positions: [position, { positionId: 1, unrealizedPnL: { pnL: 100 } }], mirrors: [] }), null);
+});
+
+test('monthly chart carries earned gains through inactive months and year boundaries', async () => {
+  const history = await fetchHistory(once([trade(1, 100, { closeTimestamp: '2025-12-10T12:00:00Z' }), trade(2, -40, { closeTimestamp: '2026-02-10T12:00:00Z' })]), undefined, now);
+  const months = profitByMonth(history);
+  assert.deepEqual(months.slice(0, 3), [{ label: '2025-12', cumulative: 100 }, { label: '2026-01', cumulative: 100 }, { label: '2026-02', cumulative: 60 }]);
+  assert.equal(months.at(-1).label, '2026-09'); assert.equal(months.at(-1).cumulative, 60);
+});
+
+test('short broker pages do not truncate the history', async () => {
+  let page = 0;
+  const history = await fetchHistory(async () => ++page <= 3 ? [trade(page)] : [], undefined, now);
+  assert.equal(page, 4); assert.equal(history.trades.length, 3);
+});
+
+test('incremental sync preserves older gains, applies corrections and never upgrades limited coverage', async () => {
+  const old = await fetchHistory(once([trade(1, 100, { closeTimestamp: '2025-05-01T12:00:00Z' }), trade(2, 20, { closeTimestamp: '2026-09-14T10:00:00Z' })]), undefined, now);
+  const next = await fetchHistory(once([trade(2, 25, { closeTimestamp: '2026-09-14T10:00:00Z' })]), undefined, now, undefined, '2026-09-13');
+  const merged = mergeProfitHistory(old, next);
+  assert.equal(merged.trades.length, 2); assert.equal(profitByYear(merged).at(-1).cumulative, 125);
+  assert.equal(mergeProfitHistory({ ...old, rangeLimited: true }, next).rangeLimited, true);
+  assert.equal(mergeProfitHistory(old, { ...next, trades: [old.trades[0], ...next.trades] }).trades.length, 2);
+  assert.throws(() => mergeProfitHistory(old, { ...next, from: '2026-10-01' }), /non continuo/);
 });

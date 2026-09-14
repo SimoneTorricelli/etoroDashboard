@@ -19,6 +19,7 @@ import type {
   Quote,
   ClosedTrade,
 } from './types';
+import type { AutomaticProfitHistory } from './EtoroProfitHistory';
 
 export type ProviderEvent = 'quotes' | 'portfolio' | 'pnl' | 'status' | 'log';
 
@@ -46,6 +47,7 @@ export interface DataProvider {
   getCandles(instrumentId: number, interval: CandleInterval, count: number, signal?: AbortSignal): Promise<Candle[]>;
   getHistoricalClosingPrices(): Promise<HistoricalClosingPrice[]>;
   getTradeHistory(): Promise<ClosedTrade[]>;
+  getProfitHistory(signal?: AbortSignal, onProgress?: (count: number, pages: number) => void, full?: boolean): Promise<AutomaticProfitHistory>;
   searchInstruments(query: string): Promise<Instrument[]>;
   /** Catalogo completo degli strumenti noti al provider. */
   listInstruments(): Instrument[];

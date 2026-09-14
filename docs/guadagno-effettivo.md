@@ -1,27 +1,30 @@
-# Guadagno effettivo
+# Guadagno effettivo automatico
 
-La homepage distingue il P&L del portafoglio eToro dal risultato economico del conto trading USD nel periodo coperto dagli estratti.
+La homepage legge automaticamente lo storico reale eToro, senza moduli di inserimento, riepiloghi manuali o importazioni richieste all’utente. Il precedente archivio manuale non viene più usato né modificato.
 
-`guadagno = equity finale − equity iniziale + prelievi cumulati − versamenti cumulati − altri apporti netti`
+## Dati e calcolo
 
-Reinvestimenti, chiusure e nuovi acquisti non sono flussi esterni. Dividendi, interessi, commissioni e imposte già registrati nel conto si riflettono nell’equity: non vengono sommati una seconda volta. Trasferimenti di titoli e bonus di capitale si registrano tra gli altri apporti netti. Le spese e imposte fuori conto non sono incluse. Il perimetro esclude i conti eToro Money: i trasferimenti tra Money e trading attraversano quindi il confine del conto analizzato.
+- `GET /api/v1/trading/info/trade/history`: richiesta dal 2000, `pageSize=500`, lettura di tutte le pagine fino alla prima pagina vuota, anche se la dimensione è limitata silenziosamente dal broker. La data iniziale precede l’attività della piattaforma; non viene confusa con la data di apertura del conto. La UI mostra la prima chiusura effettivamente ricevuta.
+- Se eToro rifiuta esplicitamente il range con 400/422, ripiega sui 364 giorni precedenti e rende evidente che il periodo è limitato. Errori di autenticazione, rete o quota non attivano un falso fallback riuscito.
+- Il risultato realizzato è la somma di `netProfit`, comprese le perdite. L’investimento iniziale non entra nel calcolo. Commissioni non sottratte una seconda volta. Gli utili restano nel risultato anche dopo reinvestimenti o prelievi, perché resta la chiusura che li ha generati.
+- Le chiusure parziali sono distinte tramite posizione, timestamp, ordine e unità. Le sovrapposizioni tra pagine sono deduplicate; conflitti, pagine ripetute, dati invalidi o interruzioni impediscono di pubblicare un totale parziale come riuscito.
+- `GET /api/v1/trading/info/real/pnl`: somma esclusivamente il P&L delle posizioni aperte manuali e dei mirror, senza aggiungere `closedPositionsNetProfit` già presente nello storico. Dati mancanti restano non disponibili.
+- Grafico mensile/annuale dei profitti realizzati cumulati e tabella annuale manuali/copy. Il P&L aperto attuale non viene retrodatato.
 
-Il risultato già realizzato è `guadagno − P&L aperto finale + P&L aperto iniziale`. Un P&L aperto sconosciuto lascia questo risultato non disponibile. Il P&L di portafoglio restituito dall’API può includere profitti mirror chiusi: non viene usato come P&L aperto. Lo snapshot usa solo posizioni manuali e `activeUnrealizedPnl` dei copy.
+Sincronizzazione ogni cinque minuti mentre la homepage è aperta, cache pagine di un minuto tramite RequestManager, abort alla navigazione/cambio conto. Dopo la prima lettura completa, il provider conserva lo storico in memoria e rilegge l’intervallo recente, con un giorno di sovrapposizione: le operazioni di quell’intervallo vengono sostituite per recepire correzioni senza duplicati. Il pulsante Aggiorna richiede una nuova lettura completa. Una pagina già in volo è condivisa senza ereditare il segnale annullato da un remount React StrictMode. Il P&L aperto viene letto dallo stesso endpoint eToro a ogni sincronizzazione, senza usare aggregati mirror che potrebbero contenere profitti chiusi. Errori di aggiornamento rendono visibile la data della precedente sincronizzazione. Nessuna chiave viene registrata nel risultato o nei log.
 
-## Uso
+## Copertura e limite economico
 
-1. In homepage apri **Aggiungi storico** e indica l’anno iniziale. Se copri il conto dal primo versamento, seleziona la relativa casella: i valori iniziali sono zero. Altrimenti inserisci equity e, se noto, P&L aperto al 1° gennaio; il risultato è indicato come storico parziale.
-2. Aggiungi un riepilogo per ogni anno, con tutti i flussi dal 1° gennaio alla data finale. Per gli anni intermedi serve il 31 dicembre. Buchi, duplicati, importi mancanti e date future bloccano il salvataggio.
-3. Per l’ultimo anno puoi copiare equity e P&L aperto da uno snapshot eToro recente. Aggiorna manualmente i flussi fino alla medesima data e verifica prima di salvare. Il valore è uno snapshot persistito, non una serie live con flussi obsoleti.
-4. Il grafico mostra risultato cumulato e realizzato disponibile; la tabella contiene anche il risultato di ciascun periodo annuale. I prelievi sono esposti come flussi, senza inventare una ripartizione tra utili e capitale.
-5. Esporta/importa un backup JSON. L’importazione apre una bozza da verificare prima della sostituzione. I dati sono locali al browser, isolati tramite digest di proxy, ambiente e chiave utente. Cambiando questi parametri o dispositivo occorre reimportare il backup. Gli errori di storage non vengono ignorati.
+Il profitto delle operazioni NON certifica da solo il guadagno economico completo del conto. Dividendi, interessi, staking, bonus, commissioni e imposte fuori dai trade potrebbero non essere inclusi in `netProfit`. La UI lo indica vicino ai KPI. Le API Money/Cash sono relative al conto cash, non una prova del registro completo del conto trading: non vengono usate per inventare depositi/prelievi o contare due volte proventi.
 
-Il componente resta in USD anche con dashboard EUR: convertire tutta la storia al cambio odierno non misura il guadagno storico in euro. La linea collega osservazioni annuali e non rappresenta oscillazioni intra-annuali.
+La documentazione dei saldi limita la disponibilità ai dodici mesi recenti. Lo storico trade ha indicazioni restrittive sul lookback: l’app verifica la risposta effettiva e segnala i rifiuti. L’accettazione di una richiesta dal 2000 non prova da sola l’assenza di una troncatura silenziosa del broker; viene mostrata la prima data restituita, senza dichiarare una copertura dall’apertura.
 
-## Limite dei dati attuali
+Importi in USD, senza applicare retroattivamente il cambio odierno. Non è una misura del risultato storico in EUR o del profitto fiscale.
 
-Il provider esistente richiede 365 giorni di saldi; il data hub legge movimenti Cash limitati e non prova la copertura completa dei flussi del conto trading. Queste serie non vengono usate per inventare uno storico dall’apertura. Gli anni provengono dai riepiloghi verificati dall’utente; non è stato aggiunto un parser automatico dell’estratto conto.
+## Sviluppo e verifiche
 
-Riferimenti: [equity eToro](https://api-portal.etoro.com/guides/calculate-equity), [P&L eToro](https://api-portal.etoro.com/guides/calculate-profit-loss), [estratto conto](https://www.etoro.com/documents/accountstatement).
+L’anteprima Vite dispone di un relay locale limitato a due endpoint GET (storico chiusure e P&L reale), destinazione fissa public-api.etoro.com, controllo dell’origine e timeout. Non espone azioni di trading e non modifica il proxy di produzione.
 
-Verifiche: `npm run test:profit`, `npm run build`; lint sui file modificati. I test verificano reinvestimenti, ritorno di capitale, versamenti aggiuntivi, prelievi superiori ai versamenti, perdite e costi, apporti esterni, baseline parziali, copertura cronologica, importi locali e persistenza.
+`npm run test:profit` verifica paginazione, deduplica, chiusure parziali, reinvestimenti, perdite, copy, range negati, autenticazione, errori a metà lettura, cancellazione, campi mancanti e aggregazioni temporali. `npm run build` verifica i tipi e la build.
+
+Fonti: [storico trade](https://api-portal.etoro.com/api-reference/trading--real/list-trading-history), [saldi storici](https://api-portal.etoro.com/api-reference/balances/get-historical-balances-by-account-type), [movimenti Cash](https://api-portal.etoro.com/api-reference/cash-accounts/list-cash-account-transactions-paginated).

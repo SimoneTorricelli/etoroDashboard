@@ -12,6 +12,8 @@
 import { ProviderEmitter } from './DataProvider';
 import type { DataProvider } from './DataProvider';
 import { RateLimitError, RequestManager } from './RequestManager';
+import { fetchEtoroProfitHistory, mergeProfitHistory, parseOpenProfit } from './EtoroProfitHistory';
+import type { AutomaticProfitHistory } from './EtoroProfitHistory';
 import type { LiveSettings } from '../settings';
 import type {
   Candle,
@@ -98,6 +100,7 @@ export class LiveDataProvider implements DataProvider {
   private accountSnapshotPromise: Promise<AccountSnapshot> | null = null;
   private lastQuotes = new Map<number, Quote>();
   private closedTrades: ClosedTrade[] = [];
+  private profitHistory: AutomaticProfitHistory | null = null;
 
   constructor(settings: LiveSettings) {
     this.settings = settings;
@@ -118,7 +121,9 @@ export class LiveDataProvider implements DataProvider {
   }
 
   private async api<T>(path: string, init?: RequestInit, options: ApiOptions = {}): Promise<T> {
-    const base = this.settings.proxyUrl.replace(/\/+$/, '');
+    const base = import.meta.env.DEV && (path.startsWith('api/v1/trading/info/trade/history?') || path === 'api/v1/trading/info/real/pnl')
+      ? `${window.location.origin}/__etoro-readonly`
+      : this.settings.proxyUrl.replace(/\/+$/, '');
     const url = `${base}/${path.replace(/^\/+/, '')}`;
     const method = String(init?.method ?? 'GET').toUpperCase();
     const key = `${method}:${path}`;
@@ -1052,6 +1057,23 @@ export class LiveDataProvider implements DataProvider {
       mirrorId: Number(row['mirrorId'] ?? row['MirrorId'] ?? row['mirrorID'] ?? row['MirrorID'] ?? 0) || undefined,
     }));
     return this.closedTrades;
+  }
+
+  async getProfitHistory(signal?: AbortSignal, onProgress?: (count: number, pages: number) => void, full = false) {
+    // Keep a shared in-flight page alive across StrictMode remounts. The reader
+    // checks its own cancellation before/after each page and never publishes it.
+    const previous = full ? null : this.profitHistory;
+    const from = previous ? new Date(previous.asOf - 86_400_000).toISOString().slice(0, 10) : undefined;
+    const fetched = await fetchEtoroProfitHistory((path) => this.api<unknown>(path, { signal: AbortSignal.timeout(30_000) }, {
+      ttlMs: 60_000, priority: 'history',
+    }), signal, Date.now(), onProgress, from);
+    const history = previous ? mergeProfitHistory(previous, fetched) : fetched;
+    signal?.throwIfAborted();
+    const body = await this.api<unknown>('api/v1/trading/info/real/pnl', { signal: AbortSignal.timeout(30_000) }, { ttlMs: ACCOUNT_TTL_MS, priority: 'account' }).catch(() => null);
+    signal?.throwIfAborted();
+    const result = { ...history, openPnl: parseOpenProfit(body), openPnlAsOf: Date.now() };
+    this.profitHistory = result;
+    return result;
   }
 
   async searchInstruments(query: string): Promise<Instrument[]> {
