@@ -13,6 +13,7 @@
     "test:scheduler": "node --test test/scheduler.test.mjs",
     "test:income": "node --test test/income.test.mjs test/income-upgrade.test.mjs test/income-free.test.mjs",
     "test:income:runtime": "node --test test/income-runtime.test.mjs",
+    "test:profit": "node --test test/lifetime-profit.test.mjs",
     "db:migrate": "wrangler d1 execute torino --remote --file=worker/schema.sql",
     "db:migrate:local": "wrangler d1 execute torino --local --file=worker/schema.sql",
     "worker:dev": "wrangler dev",

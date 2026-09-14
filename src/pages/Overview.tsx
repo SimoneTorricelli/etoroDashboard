@@ -32,6 +32,7 @@ import { Skeleton } from '@/components/shared/Skeleton';
 import { TickValue } from '@/components/shared/TickValue';
 import { FreshnessBadge } from '@/components/shared/FreshnessBadge';
 import { CopyPortfolioTable } from '@/components/portfolio/CopyPortfolioTable';
+import { LifetimeProfitCard } from '@/components/portfolio/LifetimeProfitCard';
 import { enrichLookThroughPositions } from '@/components/portfolio/analytics';
 import type { Candle, EquityPoint, PnlSummary, Portfolio, Position, PriceAlert } from '@/lib/data/types';
 import { externalCryptoSymbol } from '@/lib/data/ExternalPriceProvider';
@@ -181,12 +182,17 @@ export default function Overview() {
   /* ── Empty state: Live senza connessione e nessun dato ──────────── */
   if (!loading && !portfolio) {
     return (
-      <EmptyState
-        headline="Il tuo terminale è pronto"
-        copy="Configura chiavi e proxy per collegare il tuo account eToro reale. Nessun dato simulato verrà mostrato."
-        actionLabel="Configura la connessione"
-        onAction={() => navigate('/impostazioni')}
-      />
+      <div className="grid grid-cols-12 gap-4">
+        <div className="col-span-12">
+          <EmptyState
+            headline="Il tuo terminale è pronto"
+            copy="Configura chiavi e proxy per collegare il tuo account eToro reale. Nessun dato simulato verrà mostrato."
+            actionLabel="Configura la connessione"
+            onAction={() => navigate('/impostazioni')}
+          />
+        </div>
+        <LifetimeProfitCard />
+      </div>
     );
   }
 
@@ -249,7 +255,7 @@ export default function Overview() {
           info={pnl ? `${pnl.sourceLabel}. Aggiornato ${new Date(pnl.asOf).toLocaleString('it-IT')}.` : 'Dato non ancora disponibile.'}
         />
         <KpiCard
-          label="P&L Totale"
+          label="P&L portafoglio"
           value={pnl ? formatSignedCurrency(fromUsd(pnl.totalPnl), cur) : '—'}
           numericValue={pnl ? fromUsd(pnl.totalPnl) : undefined}
           formatValue={(value) => formatSignedCurrency(value, cur)}
@@ -266,6 +272,8 @@ export default function Overview() {
           currency={cur}
         />
       </div>
+
+      <LifetimeProfitCard />
 
       {/* ROW 2 — P&L chart + Suggerimenti */}
       <motion.div {...stagger(1)} className="card-surface density-pad col-span-12 p-5 lg:col-span-8">
